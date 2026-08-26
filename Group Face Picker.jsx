@@ -1,0 +1,1642 @@
+#target photoshop
+
+var GFP_NAME = "Group Face Picker";
+var GFP_VERSION = "0.5.3";
+var GFP_DEFAULT_HOST = "127.0.0.1";
+var GFP_DEFAULT_PORT_SEND = 6420;
+var GFP_DEFAULT_PORT_LISTEN = 6421;
+var GFP_API_HOST = GFP_DEFAULT_HOST;
+var GFP_API_PORT_SEND = GFP_DEFAULT_PORT_SEND;
+var GFP_API_PORT_LISTEN = GFP_DEFAULT_PORT_LISTEN;
+var GFP_API_TIMEOUT = 10000;
+var GFP_JOB_TIMEOUT = 60 * 60 * 1000;
+var GFP_PENDING_JOB_ID = "";
+var GFP_PENDING_JOB_RESULT = null;
+var GFP_PENDING_JOB_ERROR = null;
+var GFP_PENDING_SETTINGS_JOB_ID = "";
+var GFP_PENDING_SETTINGS_RESULT = null;
+var GFP_PENDING_SETTINGS_ERROR = null;
+var GFP_SETTINGS_APPLY_HOST = "";
+var GFP_SETTINGS_APPLY_PORT = 0;
+var GFP_SERVER_START_OK = false;
+var GFP_SERVER_START_ERROR = "";
+var GFP_SERVER_START_TIMEOUT = 120000;
+var GFP_LAST_SERVER_LAUNCHER = "";
+var GFP_S2T = stringIDToTypeID;
+var GFP_SETTINGS = gfpLoadConfig();
+gfpApplyConfig(GFP_SETTINGS);
+
+try {
+    gfpMain();
+} catch (e) {
+    alert(gfpErrorText(e), GFP_NAME, true);
+}
+
+function gfpMain() {
+    if (!app.documents.length) {
+        throw new Error("Откройте групповую фотографию и выделите лицо ребёнка.");
+    }
+
+    var ping = gfpEnsureServerAvailable();
+    if (!ping || ping.type != "answer") {
+        var startupDetails = GFP_LAST_SERVER_LAUNCHER ? ("\n\nПроверенный путь автозапуска:\n" + GFP_LAST_SERVER_LAUNCHER) : "";
+        if (confirm("Python-сервер не запущен или недоступен по текущему адресу. Автоматический запуск не удался." + startupDetails + "\n\nОткрыть настройки подключения?")) {
+            gfpShowSettingsDialog();
+            return;
+        }
+        throw new Error("Python-сервер недоступен. Запустите run_server.bat вручную и повторите запуск скрипта.");
+    }
+    if (ping.message && ping.message.version && String(ping.message.version) != GFP_VERSION) {
+        throw new Error("Версия запущенного Python-сервера (" + String(ping.message.version) + ") не совпадает с версией JSX (" + GFP_VERSION + ").\n\nПерезапустите run_server.bat из этой же папки скрипта. Старый процесс сервера может оставаться запущенным после обновления файлов.");
+    }
+
+    gfpRememberServerLauncherFromResponse(ping);
+
+    var state = gfpReadPhotoshopState();
+    var response = gfpApiRequest({
+        command: "select",
+        source_path: state.sourcePath,
+        source_xmp: state.sourceXmp,
+        doc_width: state.docWidth,
+        doc_height: state.docHeight,
+        selection: state.selection
+    }, GFP_API_TIMEOUT);
+
+    if (!response) {
+        throw new Error("Python-сервер не ответил.");
+    }
+    if (response.type == "error") {
+        throw new Error(response.message);
+    }
+
+    var result = null;
+    if (response.type == "job") {
+        GFP_PENDING_JOB_ID = String(response.message.job_id || "");
+        GFP_PENDING_JOB_RESULT = null;
+        GFP_PENDING_JOB_ERROR = null;
+        if (!GFP_PENDING_JOB_ID) {
+            throw new Error("Сервер не вернул идентификатор анализа.");
+        }
+        app.doForcedProgress("Подготовка превью лиц", "gfpPollSelectionJob();");
+        if (GFP_PENDING_JOB_ERROR) {
+            throw new Error(GFP_PENDING_JOB_ERROR);
+        }
+        result = GFP_PENDING_JOB_RESULT;
+    } else if (response.type == "answer") {
+        result = response.message;
+    }
+
+    if (!result || !result.previews || !result.previews.items || !result.query_id) {
+        throw new Error("Сервер вернул неполный результат анализа.");
+    }
+
+    var payload = {
+        app_name: GFP_NAME,
+        version: GFP_VERSION,
+        query_id: result.query_id,
+        previews: result.previews,
+        matches: result.matches,
+        target: {
+            document_id: state.documentId,
+            source_path: state.sourcePath,
+            doc_width: state.docWidth,
+            doc_height: state.docHeight,
+            selection: state.selection,
+            selection_mask: state.selectionMask,
+            quick_mask: state.quickMask
+        }
+    };
+
+    var selectedIndex = -1;
+    try {
+        selectedIndex = gfpShowDialog(payload);
+        if (selectedIndex >= 0) {
+            gfpInsertCandidate(payload, selectedIndex);
+        }
+    } finally {
+        gfpApiFire({ command: "release_query", query_id: payload.query_id });
+    }
+}
+
+function gfpPollSelectionJob() {
+    var started = (new Date()).getTime();
+    for (;;) {
+        if ((new Date()).getTime() - started > GFP_JOB_TIMEOUT) {
+            GFP_PENDING_JOB_ERROR = "Превышено время ожидания анализа и подготовки превью.";
+            return false;
+        }
+
+        var response = gfpApiRequest({ command: "job_status", job_id: GFP_PENDING_JOB_ID }, 8000);
+        if (!response) {
+            GFP_PENDING_JOB_ERROR = "Python-сервер перестал отвечать во время подготовки превью.";
+            return false;
+        }
+        if (response.type == "error") {
+            GFP_PENDING_JOB_ERROR = String(response.message || "Ошибка анализа.");
+            return false;
+        }
+
+        var status = response.message || {};
+        var progress = Math.max(0, Math.min(1, Number(status.progress) || 0));
+        app.updateProgress(Math.round(progress * 1000), 1000);
+        app.changeProgressText(String(status.text || "Подготовка превью лиц..."));
+
+        if (status.status == "done") {
+            GFP_PENDING_JOB_RESULT = status.result;
+            app.updateProgress(1000, 1000);
+            return true;
+        }
+        if (status.status == "error") {
+            GFP_PENDING_JOB_ERROR = String(status.error || "Ошибка анализа.");
+            return false;
+        }
+        $.sleep(120);
+    }
+}
+
+function gfpReadPhotoshopState() {
+    var doc = app.activeDocument;
+    var sourceFile = null;
+
+    try {
+        sourceFile = doc.fullName;
+    } catch (e) {
+        sourceFile = null;
+    }
+
+    if (!sourceFile || !sourceFile.exists) {
+        throw new Error("Активный документ должен быть открыт из существующего файла на диске.");
+    }
+
+    var quickMaskActive = gfpGetBooleanDocumentProperty("quickMask");
+    var quickMaskOuterBounds = null;
+    if (quickMaskActive) {
+        // Поведение повторяет img2img helper: если Quick Mask была включена
+        // поверх исходного выделения, до clearEvent его bounds задают внешний
+        // прямоугольник фрагмента. После clearEvent текущая selection содержит
+        // уже фактическую (в том числе непрямоугольную) форму маски слоя.
+        try {
+            quickMaskOuterBounds = doc.selection.bounds;
+        } catch (quickMaskBoundsError) {
+            quickMaskOuterBounds = null;
+        }
+        gfpQuickMask("clearEvent");
+    }
+
+    var actualBounds = null;
+    try {
+        actualBounds = doc.selection.bounds;
+    } catch (selectionBoundsError) {
+        actualBounds = null;
+    }
+
+    if (!actualBounds || actualBounds.length < 4) {
+        throw new Error("Сначала выделите лицо прямоугольным выделением или через быструю маску.");
+    }
+
+    var bounds = quickMaskOuterBounds && quickMaskOuterBounds.length >= 4 ? quickMaskOuterBounds : actualBounds;
+    var selection = {
+        left: Math.round(bounds[0].as("px")),
+        top: Math.round(bounds[1].as("px")),
+        right: Math.round(bounds[2].as("px")),
+        bottom: Math.round(bounds[3].as("px"))
+    };
+
+    if (selection.right <= selection.left || selection.bottom <= selection.top) {
+        throw new Error("Выделение пустое.");
+    }
+
+    return {
+        documentId: gfpGetDocumentId(),
+        sourcePath: sourceFile.fsName,
+        sourceXmp: gfpIsRawPath(sourceFile.fsName) ? gfpReadDocumentXmp(doc) : "",
+        docWidth: Math.round(doc.width.as("px")),
+        docHeight: Math.round(doc.height.as("px")),
+        selection: selection,
+        selectionMask: true,
+        quickMask: quickMaskActive
+    };
+}
+
+function gfpIsRawPath(path) {
+    var name = String(path || "").toLowerCase();
+    return /\.(cr2|cr3|nef|arw|dng|raf|rw2|orf)$/.test(name);
+}
+
+function gfpReadDocumentXmp(doc) {
+    try {
+        if (doc && doc.xmpMetadata && doc.xmpMetadata.rawData) {
+            return String(doc.xmpMetadata.rawData);
+        }
+    } catch (e) {
+    }
+    return "";
+}
+
+function gfpGetDocumentId() {
+    var property = GFP_S2T("documentID");
+    var ref = new ActionReference();
+    ref.putProperty(GFP_S2T("property"), property);
+    ref.putEnumerated(GFP_S2T("document"), GFP_S2T("ordinal"), GFP_S2T("targetEnum"));
+    return executeActionGet(ref).getInteger(property);
+}
+
+function gfpGetBooleanDocumentProperty(name) {
+    var property = GFP_S2T(name);
+    var ref = new ActionReference();
+    ref.putProperty(GFP_S2T("property"), property);
+    ref.putEnumerated(GFP_S2T("document"), GFP_S2T("ordinal"), GFP_S2T("targetEnum"));
+    try {
+        return executeActionGet(ref).getBoolean(property);
+    } catch (e) {
+        return false;
+    }
+}
+
+function gfpQuickMask(eventName) {
+    var ref = new ActionReference();
+    ref.putProperty(GFP_S2T("property"), GFP_S2T("quickMask"));
+    ref.putEnumerated(GFP_S2T("document"), GFP_S2T("ordinal"), GFP_S2T("targetEnum"));
+    var desc = new ActionDescriptor();
+    desc.putReference(GFP_S2T("null"), ref);
+    executeAction(GFP_S2T(eventName), desc, DialogModes.NO);
+}
+
+function gfpShowDialog(payload) {
+    var items = payload.previews && payload.previews.items ? payload.previews.items : [];
+    if (!items.length || items.length != payload.matches.length) {
+        throw new Error("Сервер не вернул корректный набор превью.");
+    }
+
+    var selectedIndex = -1;
+    var lastClickIndex = -1;
+    var lastClickTime = 0;
+    var previewButtons = [];
+    var columns = Math.max(1, Number(payload.previews.columns) || 1);
+    var thumbWidth = Math.max(32, Number(payload.previews.thumb_width) || 96);
+    var buttonSize = thumbWidth + 8;
+    var contentWidth = Math.max(420, columns * (buttonSize + 4));
+
+    var w = new Window("dialog", String(payload.app_name) + " " + String(payload.version));
+    w.orientation = "column";
+    w.alignChildren = ["fill", "top"];
+    w.spacing = 7;
+    w.margins = 12;
+
+    var topRow = w.add("group");
+    topRow.orientation = "row";
+    topRow.alignChildren = ["fill", "center"];
+    topRow.spacing = 8;
+
+    var header = topRow.add("statictext");
+    header.text = "Найдено кадров: " + String(items.length);
+    header.preferredSize = [Math.max(260, contentWidth - 120), 20];
+
+    var settingsButton = topRow.add("button", undefined, "⚙");
+    settingsButton.preferredSize = [34, 24];
+    settingsButton.helpTip = "Настройки Group Face Picker";
+
+    var grid = w.add("group");
+    grid.orientation = "column";
+    grid.alignChildren = ["left", "top"];
+    grid.spacing = 4;
+    grid.margins = 0;
+
+    var row = null;
+    for (var i = 0; i < items.length; i++) {
+        if (i % columns == 0) {
+            row = grid.add("group");
+            row.orientation = "row";
+            row.alignChildren = ["left", "top"];
+            row.spacing = 4;
+            row.margins = 0;
+        }
+
+        var previewFile = new File(String(items[i].path));
+        if (!previewFile.exists) {
+            throw new Error("PNG-превью не найдено: " + previewFile.fsName);
+        }
+
+        // В Photoshop ScriptUI обычный image может отображаться, но не получать
+        // клики. iconbutton является настоящим интерактивным контролом и сам
+        // хранит индекс кадра, поэтому координаты мыши больше не используются.
+        // iconbutton использует отдельные изображения normal/disabled/pressed/rollover.
+        // Если передать только normal, Photoshop в некоторых версиях очищает
+        // картинку при hover/pressed. Один и тот же PNG для всех четырёх
+        // состояний оставляет превью неизменным при наведении и нажатии.
+        var matchInfo = payload.matches[i] || {};
+        var isActiveFile = matchInfo.is_active === true;
+        var cell = row.add("group");
+        cell.orientation = "column";
+        cell.alignChildren = ["center", "top"];
+        cell.spacing = 1;
+        cell.margins = 0;
+
+        var previewImage = ScriptUI.newImage(previewFile, previewFile, previewFile, previewFile);
+        var previewButton = cell.add("iconbutton", undefined, previewImage, { style: "button" });
+        previewButton.preferredSize = [buttonSize, buttonSize];
+        previewButton.minimumSize = previewButton.preferredSize;
+        previewButton.maximumSize = previewButton.preferredSize;
+        var similarity = Number(matchInfo.similarity);
+        var similarityText = isFinite(similarity) ? similarity.toFixed(3) : "—";
+        previewButton.helpTip = String(matchInfo.name || items[i].name || "") + "\nСходство: " + similarityText + (isActiveFile ? "\nТекущий открытый файл" : "");
+        previewButton.gfpIndex = i;
+        previewButton.onClick = function () {
+            gfpHandlePreviewClick(Number(this.gfpIndex));
+        };
+
+        var previewCaption = isActiveFile ? ("ТЕКУЩИЙ · " + similarityText) : similarityText;
+        var activeLabel = cell.add("statictext", undefined, previewCaption);
+        activeLabel.justify = "center";
+        activeLabel.helpTip = previewButton.helpTip;
+        activeLabel.preferredSize = [buttonSize, 16];
+        previewButtons.push(previewButton);
+    }
+
+    var status = w.add("statictext", undefined, "Выберите превью. Второй быстрый клик по выбранному кадру — вставить.", { multiline: true });
+    status.preferredSize = [contentWidth, 34];
+
+    var buttons = w.add("group");
+    buttons.orientation = "row";
+    buttons.alignChildren = ["center", "center"];
+    buttons.alignment = ["center", "top"];
+    buttons.spacing = 10;
+
+    var insertButton = buttons.add("button", undefined, "Вставить выбранное", { name: "ok" });
+    insertButton.enabled = false;
+    var cancelButton = buttons.add("button", undefined, "Отмена", { name: "cancel" });
+
+    function gfpSelectIndex(index) {
+        if (index < 0 || index >= payload.matches.length) {
+            selectedIndex = -1;
+            insertButton.enabled = false;
+            status.text = "Выберите превью. Второй быстрый клик по выбранному кадру — вставить.";
+            w.update();
+            return;
+        }
+        selectedIndex = index;
+        var isActiveFile = payload.matches[index] && payload.matches[index].is_active === true;
+        insertButton.enabled = !isActiveFile;
+        status.text = isActiveFile
+            ? "Текущий открытый файл — показан для сравнения и не вставляется сам в себя."
+            : "Выбран кадр " + String(index + 1) + " из " + String(payload.matches.length) + ".";
+        try {
+            previewButtons[index].active = true;
+        } catch (focusError) {
+        }
+        w.update();
+    }
+
+    function gfpHandlePreviewClick(index) {
+        if (index < 0 || index >= payload.matches.length) {
+            return;
+        }
+        var now = (new Date()).getTime();
+        var isDouble = lastClickIndex == index && now - lastClickTime <= 650;
+        lastClickIndex = index;
+        lastClickTime = now;
+        gfpSelectIndex(index);
+        var isActiveFile = payload.matches[index] && payload.matches[index].is_active === true;
+        if (isDouble && !isActiveFile) {
+            selectedIndex = index;
+            lastClickTime = 0;
+            w.close(1);
+        }
+    }
+
+    insertButton.onClick = function () {
+        if (selectedIndex >= 0 && !(payload.matches[selectedIndex] && payload.matches[selectedIndex].is_active === true)) {
+            w.close(1);
+        }
+    };
+    cancelButton.onClick = function () {
+        selectedIndex = -1;
+        w.close(2);
+    };
+    settingsButton.onClick = function () {
+        if (gfpShowSettingsDialog()) {
+            status.text = "Настройки сохранены. Параметры вставки применяются сразу к текущему набору превью.";
+            w.update();
+        }
+    };
+
+    w.center();
+    var dialogResult = w.show();
+    for (var ci = 0; ci < previewButtons.length; ci++) {
+        try {
+            previewButtons[ci].image = null;
+        } catch (imageError) {
+        }
+    }
+
+    if (dialogResult != 1) {
+        return -1;
+    }
+    return selectedIndex;
+}
+
+function gfpInsertCandidate(payload, index) {
+    if (index < 0 || index >= payload.matches.length) {
+        return;
+    }
+
+    var targetHistory = null;
+    var sourceDocument = null;
+    var sourceHistory = null;
+    var sourceWasAlreadyOpen = false;
+    var sourceOpenedByScript = false;
+
+    try {
+        var response = gfpApiRequest({
+            command: "prepare_crop",
+            query_id: payload.query_id,
+            index: index
+        }, 15000);
+
+        if (!response || response.type != "answer" || !response.message) {
+            throw new Error("Python-сервер не вернул координаты исходного фрагмента.");
+        }
+
+        var item = response.message;
+        var target = gfpSelectDocumentById(payload.target.document_id);
+        targetHistory = target.activeHistoryState;
+
+        if (Math.round(target.width.as("px")) != Number(payload.target.doc_width) || Math.round(target.height.as("px")) != Number(payload.target.doc_height)) {
+            throw new Error("Размер целевого документа изменился после анализа. Сделайте выделение заново и снова запустите JSX.");
+        }
+
+        // Не создаём временный duplicate документа. Донор является единственным
+        // дополнительным документом: для уже открытого донора состояние истории
+        // восстанавливается после crop/flatten, а открытый скриптом донор закрывается
+        // без сохранения сразу после копирования слоя в целевой документ.
+        sourceDocument = gfpFindOpenDocument(item.source_path);
+        sourceWasAlreadyOpen = !!sourceDocument;
+        if (!sourceDocument) {
+            sourceDocument = gfpOpenFile(new File(item.source_path));
+            sourceOpenedByScript = true;
+        }
+
+        var openedSourceWidth = Math.round(sourceDocument.width.as("px"));
+        var openedSourceHeight = Math.round(sourceDocument.height.as("px"));
+        var analysisSourceWidth = Number(item.source_width);
+        var analysisSourceHeight = Number(item.source_height);
+
+        app.activeDocument = sourceDocument;
+        sourceHistory = sourceDocument.activeHistoryState;
+
+        var expectedWidth = Number(payload.target.selection.right) - Number(payload.target.selection.left);
+        var expectedHeight = Number(payload.target.selection.bottom) - Number(payload.target.selection.top);
+        var crop = item.crop;
+        var cropLeft = Number(crop.left);
+        var cropTop = Number(crop.top);
+        var cropRight = Number(crop.right);
+        var cropBottom = Number(crop.bottom);
+        var faceScaleEnabled = item.face_scale_match === true;
+        var faceScale = 1.0;
+        var sourceCropWidth = expectedWidth;
+        var sourceCropHeight = expectedHeight;
+
+        // RAW всегда требует пересчёта после фактического открытия Camera Raw.
+        // При включённой подгонке масштаба тот же пересчёт выполняется для любого
+        // формата, чтобы коэффициент строился по реальному открытому документу.
+        if (item.is_raw || faceScaleEnabled) {
+            var kps = item.candidate_kps_normalized || [];
+            var offsets = item.target_eye_offsets || [];
+            if (kps.length < 2 || offsets.length < 2) {
+                throw new Error("Сервер не вернул геометрию глаз для вставки.");
+            }
+            var eye0x = Number(kps[0][0]) * openedSourceWidth;
+            var eye0y = Number(kps[0][1]) * openedSourceHeight;
+            var eye1x = Number(kps[1][0]) * openedSourceWidth;
+            var eye1y = Number(kps[1][1]) * openedSourceHeight;
+
+            if (faceScaleEnabled) {
+                if (kps.length < 5) {
+                    throw new Error("Для подгонки масштаба сервер не вернул все ключевые точки лица.");
+                }
+                var mouth0x = Number(kps[3][0]) * openedSourceWidth;
+                var mouth0y = Number(kps[3][1]) * openedSourceHeight;
+                var mouth1x = Number(kps[4][0]) * openedSourceWidth;
+                var mouth1y = Number(kps[4][1]) * openedSourceHeight;
+                var eyeWidth = gfpDistance(eye0x, eye0y, eye1x, eye1y);
+                var eyeMidX = (eye0x + eye1x) * 0.5;
+                var eyeMidY = (eye0y + eye1y) * 0.5;
+                var mouthMidX = (mouth0x + mouth1x) * 0.5;
+                var mouthMidY = (mouth0y + mouth1y) * 0.5;
+                var faceHeight = gfpDistance(eyeMidX, eyeMidY, mouthMidX, mouthMidY);
+                var targetFaceWidth = Number(item.target_face_width || 0);
+                var targetFaceHeight = Number(item.target_face_height || 0);
+                if (!(eyeWidth > 1) || !(faceHeight > 1) || !(targetFaceWidth > 1) || !(targetFaceHeight > 1)) {
+                    throw new Error("Не удалось надёжно рассчитать размер лица для масштабирования.");
+                }
+                faceScale = Math.max(targetFaceWidth / eyeWidth, targetFaceHeight / faceHeight);
+                if (!isFinite(faceScale) || faceScale < 0.25 || faceScale > 4.0) {
+                    throw new Error("Получен недопустимый коэффициент масштаба лица: " + String(faceScale));
+                }
+                sourceCropWidth = Math.max(1, Math.ceil(expectedWidth / faceScale));
+                sourceCropHeight = Math.max(1, Math.ceil(expectedHeight / faceScale));
+            }
+
+            cropLeft = Math.round(((eye0x - Number(offsets[0][0]) / faceScale) +
+                (eye1x - Number(offsets[1][0]) / faceScale)) * 0.5);
+            cropTop = Math.round(((eye0y - Number(offsets[0][1]) / faceScale) +
+                (eye1y - Number(offsets[1][1]) / faceScale)) * 0.5);
+            cropRight = cropLeft + sourceCropWidth;
+            cropBottom = cropTop + sourceCropHeight;
+            if (cropLeft < 0 || cropTop < 0 || cropRight > openedSourceWidth || cropBottom > openedSourceHeight) {
+                throw new Error(faceScaleEnabled
+                    ? "Подгонка масштаба требует фрагмент за пределами исходного кадра. Этот донор нельзя вставить с выбранным масштабом."
+                    : "После открытия RAW рассчитанный фрагмент выходит за границы документа.");
+            }
+        } else if (openedSourceWidth != analysisSourceWidth || openedSourceHeight != analysisSourceHeight) {
+            throw new Error("Размер открытого исходного кадра не совпадает с размером, использованным распознаванием.");
+        }
+
+        sourceDocument.crop([
+            UnitValue(cropLeft, "px"),
+            UnitValue(cropTop, "px"),
+            UnitValue(cropRight, "px"),
+            UnitValue(cropBottom, "px")
+        ]);
+
+        if (Math.round(sourceDocument.width.as("px")) != sourceCropWidth || Math.round(sourceDocument.height.as("px")) != sourceCropHeight) {
+            throw new Error("Внутренняя проверка crop не пройдена: Photoshop изменил размер исходного фрагмента.");
+        }
+
+        sourceDocument.flatten();
+        var insertedLayer = sourceDocument.activeLayer.duplicate(target, ElementPlacement.PLACEATBEGINNING);
+
+        if (sourceWasAlreadyOpen) {
+            sourceDocument.activeHistoryState = sourceHistory;
+            sourceHistory = null;
+            sourceDocument = null;
+        } else {
+            sourceDocument.close(SaveOptions.DONOTSAVECHANGES);
+            sourceDocument = null;
+            sourceOpenedByScript = false;
+            sourceHistory = null;
+        }
+
+        app.activeDocument = target;
+        target.activeLayer = insertedLayer;
+
+        var layerBounds = insertedLayer.bounds;
+        var layerLeft = gfpPx(layerBounds[0]);
+        var layerTop = gfpPx(layerBounds[1]);
+        var layerRight = gfpPx(layerBounds[2]);
+        var layerBottom = gfpPx(layerBounds[3]);
+        var layerWidth = Math.round(layerRight - layerLeft);
+        var layerHeight = Math.round(layerBottom - layerTop);
+
+        if (faceScaleEnabled && Math.abs(faceScale - 1.0) > 0.0005) {
+            // Равномерный масштаб — единственная дополнительная трансформация.
+            // Поворот не выполняется. TOPLEFT соответствует геометрии crop:
+            // offsets/scale были рассчитаны относительно его верхнего левого угла.
+            insertedLayer.resize(faceScale * 100.0, faceScale * 100.0, AnchorPosition.TOPLEFT);
+            layerBounds = insertedLayer.bounds;
+            layerLeft = gfpPx(layerBounds[0]);
+            layerTop = gfpPx(layerBounds[1]);
+            layerRight = gfpPx(layerBounds[2]);
+            layerBottom = gfpPx(layerBounds[3]);
+            layerWidth = Math.round(layerRight - layerLeft);
+            layerHeight = Math.round(layerBottom - layerTop);
+            // crop использует ceil(target/scale), поэтому после равномерного
+            // увеличения слой должен полностью перекрывать исходное выделение.
+            if (layerWidth < expectedWidth || layerHeight < expectedHeight) {
+                target.activeHistoryState = targetHistory;
+                targetHistory = null;
+                throw new Error("Photoshop округлил масштабированный слой меньше целевой области. Операция отменена.");
+            }
+        } else if (layerWidth != expectedWidth || layerHeight != expectedHeight) {
+            target.activeHistoryState = targetHistory;
+            targetHistory = null;
+            throw new Error("Photoshop изменил размер вставленного слоя. Операция отменена: масштабирование выключено.");
+        }
+
+        insertedLayer.translate(
+            UnitValue(Number(payload.target.selection.left) - layerLeft, "px"),
+            UnitValue(Number(payload.target.selection.top) - layerTop, "px")
+        );
+        insertedLayer.name = "Face from " + String(item.name);
+
+        if (payload.target.selection_mask) {
+            // Маска создаётся для любого исходного выделения. Для Quick Mask
+            // в целевом документе сохраняется точная непрямоугольная selection;
+            // для обычного marquee это прямоугольная selection. Переключение
+            // документов обычно её не меняет, но прямоугольник можно безопасно
+            // восстановить по сохранённым bounds, если Photoshop её потерял.
+            if (!gfpHasSelection(target)) {
+                if (payload.target.quick_mask) {
+                    throw new Error("Форма выделения Quick Mask была потеряна до создания маски слоя.");
+                }
+                gfpSetRectangleSelection(target, payload.target.selection);
+            }
+            target.activeLayer = insertedLayer;
+            gfpMakeSelectionMask();
+        }
+    } catch (insertError) {
+        try {
+            if (sourceDocument) {
+                app.activeDocument = sourceDocument;
+                if (sourceWasAlreadyOpen && sourceHistory) {
+                    sourceDocument.activeHistoryState = sourceHistory;
+                } else if (sourceOpenedByScript) {
+                    sourceDocument.close(SaveOptions.DONOTSAVECHANGES);
+                }
+            }
+        } catch (restoreSourceError) {
+        }
+        try {
+            if (targetHistory) {
+                var restoreTarget = gfpSelectDocumentById(payload.target.document_id);
+                restoreTarget.activeHistoryState = targetHistory;
+            }
+        } catch (restoreTargetError) {
+        }
+        throw insertError;
+    }
+}
+
+function gfpOpenFile(pth) {
+    var file = pth instanceof File ? pth : new File(String(pth));
+    var desc = new ActionDescriptor();
+    desc.putPath(GFP_S2T("target"), file);
+    desc.putBoolean(GFP_S2T("forceNotify"), false);
+    executeAction(GFP_S2T("open"), desc, DialogModes.NO);
+    return app.activeDocument;
+}
+
+function gfpDistance(x1, y1, x2, y2) {
+    var dx = Number(x2) - Number(x1);
+    var dy = Number(y2) - Number(y1);
+    return Math.sqrt(dx * dx + dy * dy);
+}
+
+function gfpHasSelection(doc) {
+    app.activeDocument = doc;
+    try {
+        var bounds = doc.selection.bounds;
+        return !!(bounds && bounds.length >= 4);
+    } catch (e) {
+        return false;
+    }
+}
+
+function gfpMakeSelectionMask() {
+    var desc = new ActionDescriptor();
+    desc.putClass(GFP_S2T("new"), GFP_S2T("channel"));
+    var ref = new ActionReference();
+    ref.putEnumerated(GFP_S2T("channel"), GFP_S2T("channel"), GFP_S2T("mask"));
+    desc.putReference(GFP_S2T("at"), ref);
+    desc.putEnumerated(GFP_S2T("using"), GFP_S2T("userMask"), GFP_S2T("revealSelection"));
+    executeAction(GFP_S2T("make"), desc, DialogModes.NO);
+}
+
+function gfpSelectDocumentById(documentId) {
+    var ref = new ActionReference();
+    ref.putIdentifier(GFP_S2T("document"), Number(documentId));
+    var desc = new ActionDescriptor();
+    desc.putReference(GFP_S2T("null"), ref);
+    executeAction(GFP_S2T("select"), desc, DialogModes.NO);
+    return app.activeDocument;
+}
+
+function gfpSetRectangleSelection(doc, rect) {
+    app.activeDocument = doc;
+    doc.selection.select([
+        [Number(rect.left), Number(rect.top)],
+        [Number(rect.right), Number(rect.top)],
+        [Number(rect.right), Number(rect.bottom)],
+        [Number(rect.left), Number(rect.bottom)]
+    ], SelectionType.REPLACE, 0, false);
+}
+
+function gfpSamePath(left, right) {
+    try {
+        return String(new File(left).fsName).toLowerCase() == String(new File(right).fsName).toLowerCase();
+    } catch (pathError) {
+        return String(left).toLowerCase() == String(right).toLowerCase();
+    }
+}
+
+function gfpFindOpenDocument(path) {
+    for (var di = 0; di < app.documents.length; di++) {
+        try {
+            if (gfpSamePath(app.documents[di].fullName.fsName, path)) {
+                return app.documents[di];
+            }
+        } catch (docPathError) {
+        }
+    }
+    return null;
+}
+
+function gfpPx(value) {
+    try {
+        return Number(value.as("px"));
+    } catch (unitError) {
+        return Number(value);
+    }
+}
+
+function gfpApiRequest(payload, timeout) {
+    return gfpApiRequestTo(GFP_API_HOST, GFP_API_PORT_SEND, payload, timeout);
+}
+
+function gfpApiRequestTo(host, port, payload, timeout) {
+    payload.reply_port = GFP_API_PORT_LISTEN;
+    var listener = new Socket();
+    if (!listener.listen(GFP_API_PORT_LISTEN, "UTF-8")) {
+        throw new Error("Не удалось открыть локальный порт ответа " + GFP_API_PORT_LISTEN + ". Возможно, другой экземпляр скрипта ещё выполняется.");
+    }
+
+    var sender = new Socket();
+    if (!sender.open(String(host) + ":" + String(port), "UTF-8")) {
+        listener.close();
+        return null;
+    }
+
+    sender.writeln(gfpObjectToJSON(payload));
+    sender.close();
+
+    var started = (new Date()).getTime();
+    for (;;) {
+        if ((new Date()).getTime() - started > timeout) {
+            listener.close();
+            return null;
+        }
+
+        var answer = listener.poll();
+        if (answer != null) {
+            var line = answer.readln();
+            answer.close();
+            listener.close();
+            try {
+                return eval("(" + line + ")");
+            } catch (e) {
+                throw new Error("Некорректный ответ Python-сервера: " + e.message);
+            }
+        }
+        $.sleep(5);
+    }
+}
+
+function gfpApiFire(payload) {
+    try {
+        payload.no_reply = true;
+        var sender = new Socket();
+        if (sender.open(GFP_API_HOST + ":" + GFP_API_PORT_SEND, "UTF-8")) {
+            sender.writeln(gfpObjectToJSON(payload));
+            sender.close();
+        }
+    } catch (e) {
+    }
+}
+
+
+function gfpClientStateFile() {
+    // img2img helper stores its .desc file in app.preferencesFolder. Keep the
+    // remembered run_server.bat path in the same Photoshop preferences folder.
+    return new File(app.preferencesFolder + "/gfp_client_state.json");
+}
+
+function gfpLoadClientState() {
+    var file = gfpClientStateFile();
+    if (!file.exists) {
+        return { server_launcher_path: "", server_host: "", server_port: 0 };
+    }
+    try {
+        file.encoding = "UTF-8";
+        if (!file.open("r")) {
+            return { server_launcher_path: "", server_host: "", server_port: 0 };
+        }
+        var content = file.read();
+        file.close();
+        var state = content ? eval("(" + content + ")") : {};
+        return {
+            server_launcher_path: String(state.server_launcher_path || ""),
+            server_host: String(state.server_host || ""),
+            server_port: Number(state.server_port || 0)
+        };
+    } catch (e) {
+        try { file.close(); } catch (_) {}
+        return { server_launcher_path: "", server_host: "", server_port: 0 };
+    }
+}
+
+function gfpSaveClientState(state) {
+    var file = gfpClientStateFile();
+    var temp = new File(file.fsName + ".tmp");
+    temp.encoding = "UTF-8";
+    if (!temp.open("w")) {
+        return false;
+    }
+    try {
+        temp.write(gfpObjectToJSON({
+            server_launcher_path: String(state.server_launcher_path || ""),
+            server_host: String(state.server_host || ""),
+            server_port: Number(state.server_port || 0)
+        }));
+    } finally {
+        temp.close();
+    }
+    try {
+        if (file.exists) {
+            file.remove();
+        }
+        if (!temp.rename(file.name)) {
+            if (!temp.copy(file.fsName)) {
+                temp.remove();
+                return false;
+            }
+            temp.remove();
+        }
+        var verify = gfpLoadClientState();
+        return String(verify.server_launcher_path || "") == String(state.server_launcher_path || "") &&
+            String(verify.server_host || "") == String(state.server_host || "") &&
+            Number(verify.server_port || 0) == Number(state.server_port || 0);
+    } catch (e) {
+        try { temp.remove(); } catch (_) {}
+        return false;
+    }
+}
+
+function gfpRememberServerLauncherFromResponse(response) {
+    try {
+        if (!response || response.type != "answer" || !response.message || !response.message.run_server_path) {
+            return;
+        }
+        var path = String(response.message.run_server_path);
+        var launcher = new File(path);
+        if (!launcher.exists || String(launcher.name).toLowerCase() != "run_server.bat") {
+            return;
+        }
+        var state = gfpLoadClientState();
+        if (String(state.server_launcher_path || "") != launcher.fsName || String(state.server_host || "") != String(GFP_API_HOST) || Number(state.server_port || 0) != Number(GFP_API_PORT_SEND)) {
+            gfpSaveClientState({
+                server_launcher_path: launcher.fsName,
+                server_host: GFP_API_HOST,
+                server_port: GFP_API_PORT_SEND
+            });
+        }
+    } catch (e) {
+    }
+}
+
+function gfpFindServerLauncher(state) {
+    var candidates = [];
+    var remembered = state && state.server_launcher_path ? String(state.server_launcher_path) : "";
+    if (remembered) candidates.push(new File(remembered));
+    // Fallback for the usual portable layout where JSX and run_server.bat are
+    // kept together. This also lets a fresh local install autostart before the
+    // first successful ping has written client_state.
+    try {
+        var scriptFile = new File($.fileName);
+        candidates.push(new File(scriptFile.parent.fsName + "/run_server.bat"));
+    } catch (_) {
+    }
+    for (var i = 0; i < candidates.length; i++) {
+        try {
+            if (candidates[i].exists && String(candidates[i].name).toLowerCase() == "run_server.bat") {
+                return candidates[i];
+            }
+        } catch (_) {
+        }
+    }
+    return null;
+}
+
+function gfpEnsureServerAvailable() {
+    var ping = null;
+    try {
+        ping = gfpApiRequest({ command: "ping" }, 2500);
+    } catch (e) {
+        ping = null;
+    }
+    if (ping && ping.type == "answer") {
+        gfpRememberServerLauncherFromResponse(ping);
+        return ping;
+    }
+
+    var state = gfpLoadClientState();
+    var rememberedPath = String(state.server_launcher_path || "");
+    var stateMatches = String(state.server_host || "") == String(GFP_API_HOST) &&
+        Number(state.server_port || 0) == Number(GFP_API_PORT_SEND);
+    if (rememberedPath && !stateMatches) {
+        // Never launch a remembered executable that belongs to another server
+        // address/port configuration.
+        return null;
+    }
+    if (!rememberedPath && String(GFP_API_HOST).toLowerCase() != "127.0.0.1" && String(GFP_API_HOST).toLowerCase() != "localhost") {
+        // A fresh remote configuration cannot be started by executing a local
+        // BAT whose relationship to that remote host is unknown.
+        return null;
+    }
+    var launcher = gfpFindServerLauncher(stateMatches ? state : null);
+    if (!launcher) {
+        return null;
+    }
+    GFP_LAST_SERVER_LAUNCHER = launcher.fsName;
+    var launchResult = null;
+    try {
+        launchResult = launcher.execute();
+    } catch (launchError) {
+        return null;
+    }
+    // Match the proven img2img-helper pattern: only an explicit false means
+    // that the OS rejected File.execute(). Some Photoshop/ExtendScript builds
+    // do not reliably return a strict boolean true on successful hand-off.
+    if (launchResult === false) {
+        GFP_SERVER_START_ERROR = "File.execute() вернул false для: " + launcher.fsName;
+        return null;
+    }
+
+    GFP_SERVER_START_OK = false;
+    GFP_SERVER_START_ERROR = "";
+    try {
+        app.doForcedProgress("Запуск Group Face Picker server", "gfpPollServerStartup();");
+    } catch (progressError) {
+        GFP_SERVER_START_ERROR = gfpErrorText(progressError);
+    }
+    if (!GFP_SERVER_START_OK) {
+        return null;
+    }
+    try {
+        ping = gfpApiRequest({ command: "ping" }, 3000);
+    } catch (finalPingError) {
+        ping = null;
+    }
+    if (ping && ping.type == "answer") {
+        gfpRememberServerLauncherFromResponse(ping);
+        return ping;
+    }
+    return null;
+}
+
+function gfpPollServerStartup() {
+    var startedAt = (new Date()).getTime();
+    for (;;) {
+        var elapsed = (new Date()).getTime() - startedAt;
+        if (elapsed > GFP_SERVER_START_TIMEOUT) {
+            GFP_SERVER_START_ERROR = "Превышено время ожидания запуска Python-сервера." +
+                (GFP_LAST_SERVER_LAUNCHER ? (" Путь: " + GFP_LAST_SERVER_LAUNCHER) : "");
+            return false;
+        }
+        var ping = null;
+        try {
+            ping = gfpApiRequest({ command: "ping" }, 1200);
+        } catch (e) {
+            ping = null;
+        }
+        if (ping && ping.type == "answer") {
+            GFP_SERVER_START_OK = true;
+            gfpRememberServerLauncherFromResponse(ping);
+            app.updateProgress(1000, 1000);
+            app.changeProgressText("Python-сервер готов.");
+            return true;
+        }
+        var progress = Math.min(950, Math.round((elapsed / GFP_SERVER_START_TIMEOUT) * 950));
+        app.updateProgress(progress, 1000);
+        app.changeProgressText("Ожидание запуска Python-сервера...");
+        $.sleep(350);
+    }
+}
+
+function gfpDefaultConfig() {
+    return {
+        server_host: GFP_DEFAULT_HOST,
+        server_port: GFP_DEFAULT_PORT_SEND,
+        preview_size: 96,
+        cache_ttl_hours: 48,
+        match_threshold: 0.28,
+        compute_mode: "auto",
+        scan_threads: 2,
+        preview_threads: 2,
+        analysis_quality: "balanced",
+        group_boundary_search: false,
+        face_scale_match: false
+    };
+}
+
+function gfpConfigFile() {
+    var scriptFile = new File($.fileName);
+    return new File(scriptFile.parent.fsName + "/gfp_config.json");
+}
+
+function gfpNormalizeConfig(raw) {
+    var cfg = gfpDefaultConfig();
+    if (raw) {
+        for (var key in raw) {
+            if (raw.hasOwnProperty(key)) {
+                cfg[key] = raw[key];
+            }
+        }
+    }
+    cfg.server_host = String(cfg.server_host || GFP_DEFAULT_HOST);
+    cfg.server_port = Number(cfg.server_port || GFP_DEFAULT_PORT_SEND);
+    if (!isFinite(cfg.server_port) || cfg.server_port < 1 || cfg.server_port > 65535) {
+        cfg.server_port = GFP_DEFAULT_PORT_SEND;
+    }
+    cfg.preview_size = Number(cfg.preview_size || 96);
+    cfg.preview_size = Math.max(64, Math.min(320, Math.round(cfg.preview_size / 8) * 8));
+    cfg.cache_ttl_hours = Number(cfg.cache_ttl_hours || 48);
+    cfg.cache_ttl_hours = Math.max(12, Math.min(168, Math.round(cfg.cache_ttl_hours)));
+    cfg.match_threshold = Number(cfg.match_threshold || 0.28);
+    cfg.match_threshold = Math.max(0.10, Math.min(0.60, cfg.match_threshold));
+    cfg.compute_mode = String(cfg.compute_mode || "auto").toLowerCase();
+    if (cfg.compute_mode != "auto" && cfg.compute_mode != "cpu" && cfg.compute_mode != "gpu") {
+        cfg.compute_mode = "auto";
+    }
+    cfg.scan_threads = Math.round(Number(cfg.scan_threads || 2));
+    cfg.scan_threads = Math.max(1, Math.min(4, cfg.scan_threads));
+    cfg.preview_threads = Math.round(Number(cfg.preview_threads || 2));
+    cfg.preview_threads = Math.max(1, Math.min(8, cfg.preview_threads));
+    cfg.analysis_quality = String(cfg.analysis_quality || "balanced").toLowerCase();
+    if (cfg.analysis_quality != "fast" && cfg.analysis_quality != "balanced" && cfg.analysis_quality != "accurate") {
+        cfg.analysis_quality = "balanced";
+    }
+    cfg.group_boundary_search = cfg.group_boundary_search === true;
+    cfg.face_scale_match = cfg.face_scale_match === true;
+    return cfg;
+}
+
+function gfpLoadConfig() {
+    var file = gfpConfigFile();
+    if (!file.exists) {
+        return gfpDefaultConfig();
+    }
+    try {
+        file.encoding = "UTF-8";
+        if (!file.open("r")) {
+            return gfpDefaultConfig();
+        }
+        var content = file.read();
+        file.close();
+        if (!content) {
+            return gfpDefaultConfig();
+        }
+        return gfpNormalizeConfig(eval("(" + content + ")"));
+    } catch (e) {
+        try { file.close(); } catch (_) {}
+        return gfpDefaultConfig();
+    }
+}
+
+function gfpSaveConfig(config) {
+    var file = gfpConfigFile();
+    var temp = new File(file.fsName + ".tmp");
+    var cfg = gfpNormalizeConfig(config);
+    temp.encoding = "UTF-8";
+    if (!temp.open("w")) {
+        throw new Error("Не удалось сохранить временный файл настроек: " + temp.fsName);
+    }
+    try {
+        temp.write(gfpObjectToJSON(cfg));
+    } finally {
+        temp.close();
+    }
+    if (file.exists && !file.remove()) {
+        try { temp.remove(); } catch (_) {}
+        throw new Error("Не удалось заменить файл настроек: " + file.fsName);
+    }
+    if (!temp.rename(file.name)) {
+        if (!temp.copy(file.fsName)) {
+            try { temp.remove(); } catch (_) {}
+            throw new Error("Не удалось завершить сохранение настроек: " + file.fsName);
+        }
+        try { temp.remove(); } catch (_) {}
+    }
+    var verified = gfpLoadConfig();
+    if (!gfpSameConfigValues(cfg, verified)) {
+        throw new Error("Проверка локального файла настроек не пройдена.");
+    }
+    return verified;
+}
+
+function gfpApplyConfig(config) {
+    GFP_SETTINGS = gfpNormalizeConfig(config);
+    GFP_API_HOST = String(GFP_SETTINGS.server_host);
+    GFP_API_PORT_SEND = Number(GFP_SETTINGS.server_port);
+}
+
+function gfpDropdownItemValue(item) {
+    if (item === null || item === undefined) return "";
+    try {
+        if (item.controlValue !== undefined) return String(item.controlValue);
+    } catch (_) {
+    }
+    try { return String(item.text || ""); } catch (_) { return ""; }
+}
+
+function gfpPopulateValueDropdown(control, definitions) {
+    if (!control) return control;
+    definitions = definitions instanceof Array ? definitions : [];
+    for (var i = 0; i < definitions.length; i++) {
+        var def = definitions[i] || {};
+        var item = control.add("item", String(def.label || def.value || ""));
+        item.controlValue = String(def.value || "");
+    }
+    return control;
+}
+
+function gfpRestoreValueDropdown(control, savedValue, fallbackValue) {
+    if (!control || !control.items) return "";
+    var wanted = String(savedValue === undefined || savedValue === null ? "" : savedValue);
+    var fallback = String(fallbackValue === undefined || fallbackValue === null ? "" : fallbackValue);
+    var selected = null;
+    var i;
+    for (i = 0; i < control.items.length; i++) {
+        if (gfpDropdownItemValue(control.items[i]) == wanted) {
+            selected = control.items[i];
+            break;
+        }
+    }
+    if (!selected && fallback) {
+        for (i = 0; i < control.items.length; i++) {
+            if (gfpDropdownItemValue(control.items[i]) == fallback) {
+                selected = control.items[i];
+                break;
+            }
+        }
+    }
+    if (!selected && control.items.length) selected = control.items[0];
+    control.selection = selected;
+    return gfpReadValueDropdown(control, fallback);
+}
+
+function gfpReadValueDropdown(control, fallbackValue) {
+    if (control && control.selection !== null && control.selection !== undefined) {
+        var value = gfpDropdownItemValue(control.selection);
+        if (value) return value;
+    }
+    return String(fallbackValue === undefined || fallbackValue === null ? "" : fallbackValue);
+}
+
+function gfpShowSettingsDialog() {
+    var localCurrent = gfpLoadConfig();
+    var current = localCurrent;
+    var oldHost = GFP_API_HOST;
+    var oldPort = GFP_API_PORT_SEND;
+    var liveEngine = null;
+    try {
+        var live = gfpApiRequestTo(oldHost, oldPort, { command: "get_settings" }, 3000);
+        if (live && live.type == "answer" && live.message && live.message.settings) {
+            gfpRememberServerLauncherFromResponse(live);
+            if (live.message.version && String(live.message.version) != GFP_VERSION) {
+                throw new Error("Запущен Python-сервер версии " + String(live.message.version) + ", а JSX имеет версию " + GFP_VERSION + ". Перезапустите run_server.bat перед изменением настроек.");
+            }
+            var serverSettings = live.message.settings;
+            current = gfpNormalizeConfig(serverSettings);
+            liveEngine = live.message.engine || null;
+            // Работающий сервер является источником истины. Синхронизируем
+            // локальный JSON сразу, чтобы повторное открытие окна в этом же
+            // сеансе Photoshop показывало именно реально активные значения.
+            gfpSaveConfig(current);
+            gfpApplyConfig(current);
+            oldHost = GFP_API_HOST;
+            oldPort = GFP_API_PORT_SEND;
+        }
+    } catch (liveError) {
+        if (liveError && liveError.message && String(liveError.message).indexOf("Перезапустите run_server.bat") >= 0) {
+            alert(String(liveError.message), GFP_NAME, true);
+            return false;
+        }
+    }
+
+    var w = new Window("dialog", GFP_NAME + " — настройки");
+    w.orientation = "column";
+    w.alignChildren = ["fill", "top"];
+    w.spacing = 8;
+    w.margins = 12;
+
+    function addLabeledEdit(parent, labelText, valueText, editWidth) {
+        var group = parent.add("group");
+        group.orientation = "row";
+        group.alignChildren = ["left", "center"];
+        group.spacing = 8;
+        var label = group.add("statictext", undefined, labelText);
+        label.preferredSize = [230, 20];
+        var edit = group.add("edittext", undefined, valueText);
+        edit.preferredSize = [editWidth || 220, 24];
+        return edit;
+    }
+
+    var serverPanel = w.add("panel", undefined, "Сервер");
+    serverPanel.orientation = "column";
+    serverPanel.alignChildren = ["fill", "top"];
+    serverPanel.margins = 10;
+    var edServerHost = addLabeledEdit(serverPanel, "Адрес сервера", String(current.server_host), 220);
+    var edPort = addLabeledEdit(serverPanel, "Порт сервера", String(current.server_port), 100);
+    var serverHint = serverPanel.add("statictext", undefined,
+        "Локально: 127.0.0.1. Для работы по сети укажите IP или имя компьютера, на котором запущен Python-сервер.",
+        { multiline: true });
+    serverHint.preferredSize = [470, 36];
+    var rememberedLauncher = gfpLoadClientState();
+    var launcherHint = serverPanel.add("statictext", undefined,
+        rememberedLauncher.server_launcher_path ?
+            ("Автозапуск: " + String(rememberedLauncher.server_launcher_path)) :
+            "Автозапуск: путь к run_server.bat ещё не запомнен.",
+        { multiline: true });
+    launcherHint.preferredSize = [470, 32];
+
+    var performancePanel = w.add("panel", undefined, "Производительность распознавания");
+    performancePanel.orientation = "column";
+    performancePanel.alignChildren = ["fill", "top"];
+    performancePanel.margins = 10;
+
+    var modeRow = performancePanel.add("group");
+    modeRow.orientation = "row";
+    modeRow.alignChildren = ["left", "center"];
+    var modeLabel = modeRow.add("statictext", undefined, "Режим вычислений");
+    modeLabel.preferredSize = [230, 20];
+    var dlMode = modeRow.add("dropdownlist", undefined);
+    dlMode.preferredSize = [180, 24];
+    gfpPopulateValueDropdown(dlMode, [
+        { label: "Авто", value: "auto" },
+        { label: "CPU", value: "cpu" },
+        { label: "GPU", value: "gpu" }
+    ]);
+    gfpRestoreValueDropdown(dlMode, current.compute_mode, "auto");
+
+    var qualityRow = performancePanel.add("group");
+    qualityRow.orientation = "row";
+    qualityRow.alignChildren = ["left", "center"];
+    var qualityLabel = qualityRow.add("statictext", undefined, "Скорость / мелкие лица");
+    qualityLabel.preferredSize = [230, 20];
+    var dlQuality = qualityRow.add("dropdownlist", undefined);
+    dlQuality.preferredSize = [180, 24];
+    gfpPopulateValueDropdown(dlQuality, [
+        { label: "Быстро — 640", value: "fast" },
+        { label: "Баланс — 800", value: "balanced" },
+        { label: "Точно — 1024", value: "accurate" }
+    ]);
+    gfpRestoreValueDropdown(dlQuality, current.analysis_quality, "balanced");
+
+    var threadsRow = performancePanel.add("group");
+    threadsRow.orientation = "row";
+    threadsRow.alignChildren = ["fill", "center"];
+    var threadsLabel = threadsRow.add("statictext", undefined, "Потоки анализа файлов");
+    threadsLabel.preferredSize = [230, 20];
+    var slThreads = threadsRow.add("slider", undefined, Number(current.scan_threads), 1, 4);
+    slThreads.preferredSize = [180, 20];
+    var stThreads = threadsRow.add("statictext", undefined, String(current.scan_threads));
+    stThreads.preferredSize = [36, 20];
+    function updateThreadsLabel() {
+        var v = Math.max(1, Math.min(4, Math.round(Number(slThreads.value))));
+        slThreads.value = v;
+        stThreads.text = String(v);
+    }
+    slThreads.onChanging = updateThreadsLabel;
+    slThreads.onChange = updateThreadsLabel;
+    updateThreadsLabel();
+
+    var previewThreadsRow = performancePanel.add("group");
+    previewThreadsRow.orientation = "row";
+    previewThreadsRow.alignChildren = ["fill", "center"];
+    var previewThreadsLabel = previewThreadsRow.add("statictext", undefined, "Потоки создания превью");
+    previewThreadsLabel.preferredSize = [230, 20];
+    var slPreviewThreads = previewThreadsRow.add("slider", undefined, Number(current.preview_threads), 1, 8);
+    slPreviewThreads.preferredSize = [180, 20];
+    var stPreviewThreads = previewThreadsRow.add("statictext", undefined, String(current.preview_threads));
+    stPreviewThreads.preferredSize = [36, 20];
+    function updatePreviewThreadsLabel() {
+        var v = Math.max(1, Math.min(8, Math.round(Number(slPreviewThreads.value))));
+        slPreviewThreads.value = v;
+        stPreviewThreads.text = String(v);
+    }
+    slPreviewThreads.onChanging = updatePreviewThreadsLabel;
+    slPreviewThreads.onChange = updatePreviewThreadsLabel;
+    updatePreviewThreadsLabel();
+
+    var perfHint = performancePanel.add("statictext", undefined,
+        "Быстрый режим заметно ускоряет детекцию, но может пропускать очень маленькие лица. " +
+        "Потоки анализа обрабатывают разные кадры через InsightFace. Потоки превью собирают PNG из уже сохранённых миниатюр лиц; можно использовать до 8 потоков.",
+        { multiline: true });
+    perfHint.preferredSize = [470, 48];
+
+    if (liveEngine && liveEngine.provider) {
+        var engineStatus = performancePanel.add("statictext", undefined,
+            "Сейчас: " + String(liveEngine.provider) + ", detector " + String(liveEngine.det_size || "?") + " px");
+        engineStatus.preferredSize = [470, 20];
+    }
+
+    var previewPanel = w.add("panel", undefined, "Интерфейс");
+    previewPanel.orientation = "column";
+    previewPanel.alignChildren = ["fill", "top"];
+    previewPanel.margins = 10;
+    var previewInfo = previewPanel.add("statictext", undefined, "Размер квадратного превью", { multiline: true });
+    previewInfo.preferredSize = [460, 20];
+    var previewRow = previewPanel.add("group");
+    previewRow.orientation = "row";
+    previewRow.alignChildren = ["fill", "center"];
+    var slPreview = previewRow.add("slider", undefined, Number(current.preview_size), 64, 320);
+    slPreview.preferredSize = [340, 20];
+    var stPreview = previewRow.add("statictext", undefined, String(current.preview_size) + " px");
+    stPreview.preferredSize = [70, 20];
+    function updatePreviewLabel() {
+        var v = Math.max(64, Math.min(320, Math.round(Number(slPreview.value) / 8) * 8));
+        slPreview.value = v;
+        stPreview.text = String(v) + " px";
+    }
+    slPreview.onChanging = updatePreviewLabel;
+    slPreview.onChange = updatePreviewLabel;
+    updatePreviewLabel();
+
+    var insertPanel = w.add("panel", undefined, "Вставка");
+    insertPanel.orientation = "column";
+    insertPanel.alignChildren = ["fill", "top"];
+    insertPanel.margins = 10;
+    var chFaceScaleMatch = insertPanel.add("checkbox", undefined, "Подгонять масштаб лица");
+    chFaceScaleMatch.value = current.face_scale_match === true;
+    chFaceScaleMatch.helpTip = "Равномерно подгоняет размер лица до лица в текущем кадре. Масштаб оценивается только по геометрии лица; поворот не применяется. По умолчанию выключено.";
+    var faceScaleHint = insertPanel.add("statictext", undefined,
+        "Сравниваются две независимые пропорции лица и применяется больший коэффициент. Масштаб равномерный, без поворота; положение по-прежнему совмещается по глазам.",
+        { multiline: true });
+    faceScaleHint.preferredSize = [470, 34];
+
+    var cachePanel = w.add("panel", undefined, "Кэш и поиск");
+    cachePanel.orientation = "column";
+    cachePanel.alignChildren = ["fill", "top"];
+    cachePanel.margins = 10;
+    var edCacheTtl = addLabeledEdit(cachePanel, "Срок жизни кэша анализа, часов", String(current.cache_ttl_hours), 80);
+    var chGroupBoundarySearch = cachePanel.add("checkbox", undefined, "Поиск границ группы");
+    chGroupBoundarySearch.value = current.group_boundary_search === true;
+    chGroupBoundarySearch.helpTip = "Включено: анализ начинается от открытого кадра и останавливается после уверенной смены состава группы. Выключено: все поддерживаемые файлы папки считаются одной группой.";
+    var boundaryHint = cachePanel.add("statictext", undefined,
+        "Если в папке гарантированно только одна группа, отключение поиска границ немного ускоряет первичный анализ.",
+        { multiline: true });
+    boundaryHint.preferredSize = [470, 32];
+    var thresholdRow = cachePanel.add("group");
+    thresholdRow.orientation = "row";
+    thresholdRow.alignChildren = ["fill", "center"];
+    var thresholdText = thresholdRow.add("statictext", undefined, "Порог совпадения лица");
+    thresholdText.preferredSize = [230, 20];
+    var slThreshold = thresholdRow.add("slider", undefined, Math.round(Number(current.match_threshold) * 100), 10, 60);
+    slThreshold.preferredSize = [220, 20];
+    var stThreshold = thresholdRow.add("statictext", undefined, String(Math.round(Number(current.match_threshold) * 100)) + "%");
+    stThreshold.preferredSize = [60, 20];
+    function updateThresholdLabel() {
+        var v = Math.round(Number(slThreshold.value));
+        slThreshold.value = v;
+        stThreshold.text = String(v) + "%";
+    }
+    slThreshold.onChanging = updateThresholdLabel;
+    slThreshold.onChange = updateThresholdLabel;
+    updateThresholdLabel();
+
+    var note = w.add("statictext", undefined,
+        "Все параметры сервер пытается применить сразу. Изменение адреса сервера или порта требует перезапуска run_server.bat. " +
+        "При работе по сети исходные фотографии должны быть доступны Python-серверу по тому же пути (лучше UNC-путь).",
+        { multiline: true });
+    note.preferredSize = [490, 42];
+
+    var buttons = w.add("group");
+    buttons.orientation = "row";
+    buttons.alignment = ["center", "top"];
+    var ok = buttons.add("button", undefined, "Сохранить", { name: "ok" });
+    var cancel = buttons.add("button", undefined, "Отмена", { name: "cancel" });
+
+    var resultConfig = null;
+    ok.onClick = function () {
+        var selectedComputeMode = gfpReadValueDropdown(dlMode, current.compute_mode || "auto");
+        var selectedAnalysisQuality = gfpReadValueDropdown(dlQuality, current.analysis_quality || "balanced");
+        resultConfig = gfpNormalizeConfig({
+            server_host: edServerHost.text,
+            server_port: Number(edPort.text),
+            preview_size: Number(slPreview.value),
+            cache_ttl_hours: Number(edCacheTtl.text),
+            match_threshold: Number(slThreshold.value) / 100.0,
+            compute_mode: selectedComputeMode,
+            scan_threads: Number(slThreads.value),
+            preview_threads: Number(slPreviewThreads.value),
+            analysis_quality: selectedAnalysisQuality,
+            group_boundary_search: chGroupBoundarySearch.value === true,
+            face_scale_match: chFaceScaleMatch.value === true
+        });
+        w.close(1);
+    };
+    cancel.onClick = function () {
+        w.close(2);
+    };
+
+    w.center();
+    var dialogResult = w.show();
+    if (dialogResult != 1 || !resultConfig) {
+        return false;
+    }
+
+    var serverResponse = null;
+    var serverAvailable = false;
+    try {
+        var test = gfpApiRequestTo(oldHost, oldPort, { command: "ping" }, 2000);
+        serverAvailable = !!(test && test.type == "answer");
+    } catch (testError) {
+        serverAvailable = false;
+    }
+
+    if (serverAvailable) {
+        GFP_SETTINGS_APPLY_HOST = oldHost;
+        GFP_SETTINGS_APPLY_PORT = oldPort;
+        GFP_PENDING_SETTINGS_RESULT = null;
+        GFP_PENDING_SETTINGS_ERROR = null;
+        try {
+            serverResponse = gfpApiRequestTo(oldHost, oldPort, { command: "set_settings", settings: resultConfig }, 10000);
+            if (serverResponse && serverResponse.type == "job" && serverResponse.message && serverResponse.message.job_id) {
+                GFP_PENDING_SETTINGS_JOB_ID = String(serverResponse.message.job_id);
+                app.doForcedProgress("Применение настроек Group Face Picker", "gfpPollSettingsJob();");
+                if (GFP_PENDING_SETTINGS_ERROR) {
+                    // Если сервер отклонил изменение (например, принудительный
+                    // GPU недоступен), возвращаем локальный JSON к реально
+                    // активным серверным значениям.
+                    try {
+                        var rollback = gfpApiRequestTo(oldHost, oldPort, { command: "get_settings" }, 3000);
+                        if (rollback && rollback.type == "answer" && rollback.message && rollback.message.settings) {
+                            var rollbackConfig = gfpNormalizeConfig(rollback.message.settings);
+                            gfpSaveConfig(rollbackConfig);
+                            gfpApplyConfig(rollbackConfig);
+                        }
+                    } catch (_) {
+                    }
+                    alert("Настройки не применены:\n\n" + GFP_PENDING_SETTINGS_ERROR, GFP_NAME, true);
+                    return false;
+                }
+                serverResponse = { type: "answer", message: GFP_PENDING_SETTINGS_RESULT };
+            } else if (serverResponse && serverResponse.type == "error") {
+                alert("Настройки не применены:\n\n" + String(serverResponse.message || "Ошибка сервера."), GFP_NAME, true);
+                return false;
+            }
+        } catch (applyError) {
+            alert("Не удалось применить настройки на работающем сервере:\n\n" + gfpErrorText(applyError), GFP_NAME, true);
+            return false;
+        }
+
+        // Не доверяем только факту завершения job: перечитываем настройки с
+        // сервера и сохраняем именно то, что он реально принял.
+        var authoritative = null;
+        try {
+            var verify = gfpApiRequestTo(oldHost, oldPort, { command: "get_settings" }, 3000);
+            if (verify && verify.type == "answer" && verify.message && verify.message.settings) {
+                authoritative = gfpNormalizeConfig(verify.message.settings);
+            }
+        } catch (verifyError) {
+        }
+        if (!authoritative && serverResponse && serverResponse.type == "answer" && serverResponse.message && serverResponse.message.settings) {
+            authoritative = gfpNormalizeConfig(serverResponse.message.settings);
+        }
+        if (!authoritative) {
+            alert("Сервер завершил применение настроек, но не удалось перечитать сохранённые значения.", GFP_NAME, true);
+            return false;
+        }
+        if (!gfpSameConfigValues(resultConfig, authoritative)) {
+            alert("Сервер не подтвердил выбранные значения настроек. Ничего не будет скрыто: откройте настройки ещё раз — там будут показаны фактически сохранённые значения.", GFP_NAME, true);
+            return false;
+        }
+
+        // Проверка live det_size выполняется сервером атомарно внутри
+        // set_settings до того, как job получает статус done.
+
+        gfpSaveConfig(authoritative);
+        var restartRequired = !!(serverResponse && serverResponse.type == "answer" && serverResponse.message && serverResponse.message.restart_required);
+        if (restartRequired) {
+            // Текущий процесс всё ещё слушает старый адрес. Не переключаем
+            // соединение посреди сеанса, иначе release_query и последующие
+            // запросы к нему перестанут работать. Новый адрес будет загружен
+            // при следующем запуске JSX после перезапуска сервера.
+            GFP_SETTINGS = authoritative;
+            GFP_API_HOST = oldHost;
+            GFP_API_PORT_SEND = oldPort;
+            alert("Настройки сохранены. Все параметры, которые можно изменить на работающем сервере, уже применены.\n\nНовый адрес сервера или порт будет использован после перезапуска run_server.bat.", GFP_NAME, true);
+        } else {
+            gfpApplyConfig(authoritative);
+        }
+        return true;
+    }
+
+    // Сервер недоступен: сохраняем локальную конфигурацию атомарно для
+    // следующего запуска локального сервера. Для удалённого сервера эти
+    // значения нужно будет отправить, когда он снова станет доступен.
+    gfpSaveConfig(resultConfig);
+    gfpApplyConfig(resultConfig);
+    alert("Настройки сохранены локально. Python-сервер сейчас недоступен.\n\nЕсли сервер находится на этом компьютере, они будут прочитаны при его следующем запуске. Если сервер удалённый — сохраните настройки ещё раз после восстановления соединения.", GFP_NAME, true);
+    return true;
+}
+
+function gfpSameConfigValues(a, b) {
+    var left = gfpNormalizeConfig(a);
+    var right = gfpNormalizeConfig(b);
+    var keys = ["server_host", "server_port", "preview_size", "cache_ttl_hours", "match_threshold", "compute_mode", "scan_threads", "preview_threads", "analysis_quality", "group_boundary_search", "face_scale_match"];
+    for (var i = 0; i < keys.length; i++) {
+        var key = keys[i];
+        if (String(left[key]) != String(right[key])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function gfpPollSettingsJob() {
+    var started = (new Date()).getTime();
+    for (;;) {
+        if ((new Date()).getTime() - started > GFP_JOB_TIMEOUT) {
+            GFP_PENDING_SETTINGS_ERROR = "Превышено время ожидания применения настроек.";
+            return false;
+        }
+        var response = gfpApiRequestTo(GFP_SETTINGS_APPLY_HOST, GFP_SETTINGS_APPLY_PORT,
+            { command: "job_status", job_id: GFP_PENDING_SETTINGS_JOB_ID }, 8000);
+        if (!response) {
+            GFP_PENDING_SETTINGS_ERROR = "Python-сервер перестал отвечать при применении настроек.";
+            return false;
+        }
+        if (response.type == "error") {
+            GFP_PENDING_SETTINGS_ERROR = String(response.message || "Ошибка применения настроек.");
+            return false;
+        }
+        var status = response.message || {};
+        var progress = Math.max(0, Math.min(1, Number(status.progress) || 0));
+        app.updateProgress(Math.round(progress * 1000), 1000);
+        app.changeProgressText(String(status.text || "Применение настроек..."));
+        if (status.status == "done") {
+            GFP_PENDING_SETTINGS_RESULT = status.result;
+            app.updateProgress(1000, 1000);
+            return true;
+        }
+        if (status.status == "error") {
+            GFP_PENDING_SETTINGS_ERROR = String(status.error || "Ошибка применения настроек.");
+            return false;
+        }
+        $.sleep(120);
+    }
+}
+
+function gfpObjectToJSON(obj) {
+    if (obj === null || obj === undefined) {
+        return "null";
+    }
+
+    var objType = typeof obj;
+    if (objType == "string") {
+        return "\"" + gfpJsString(obj) + "\"";
+    }
+    if (objType == "number") {
+        return isFinite(obj) ? String(obj) : "null";
+    }
+    if (objType == "boolean") {
+        return obj ? "true" : "false";
+    }
+    if (obj instanceof Array) {
+        var arr = [];
+        for (var i = 0; i < obj.length; i++) {
+            arr.push(gfpObjectToJSON(obj[i]));
+        }
+        return "[" + arr.join(",") + "]";
+    }
+
+    var result = [];
+    for (var key in obj) {
+        if (obj.hasOwnProperty(key)) {
+            result.push("\"" + gfpJsString(key) + "\":" + gfpObjectToJSON(obj[key]));
+        }
+    }
+    return "{" + result.join(",") + "}";
+}
+
+function gfpJsString(value) {
+    var text = String(value);
+    var result = "";
+    for (var i = 0; i < text.length; i++) {
+        var ch = text.charAt(i);
+        var code = text.charCodeAt(i);
+        if (ch == "\\") {
+            result += "\\\\";
+        } else if (ch == "\"") {
+            result += "\\\"";
+        } else if (ch == "\r") {
+            result += "\\r";
+        } else if (ch == "\n") {
+            result += "\\n";
+        } else if (ch == "\t") {
+            result += "\\t";
+        } else if (ch == "\f") {
+            result += "\\f";
+        } else if (code < 32 || code > 126) {
+            var hex = code.toString(16);
+            while (hex.length < 4) {
+                hex = "0" + hex;
+            }
+            result += "\\u" + hex;
+        } else {
+            result += ch;
+        }
+    }
+    return result;
+}
+
+function gfpErrorText(value) {
+    if (value === null || value === undefined) {
+        return "Неизвестная ошибка.";
+    }
+    if (value.message !== undefined) {
+        return String(value.message) + (value.line ? "\n\nСтрока JSX: " + value.line : "");
+    }
+    return String(value);
+}

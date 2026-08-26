@@ -1,0 +1,10 @@
+runtime/cache/*
+runtime/logs/*
+runtime/venv/*
+runtime/python/*
+runtime/uv/*
+runtime/downloads/*
+models/insightface/*
+!runtime/.gitkeep
+!models/.gitkeep
+gfp_config.json
