@@ -17,7 +17,7 @@
 
 var GFP_NAME = "Group Face Picker";
 var GFP_UUID = "9a189321-e07f-40ff-8394-156a4bd48cf5";
-var GFP_VERSION = "0.5.4";
+var GFP_VERSION = "0.5.5";
 var GFP_DEFAULT_HOST = "127.0.0.1";
 var GFP_DEFAULT_PORT_SEND = 6420;
 var GFP_DEFAULT_PORT_LISTEN = 6421;
@@ -1063,6 +1063,16 @@ function gfpDefaultConfig() {
 }
 
 function gfpConfigFile() {
+    // Пользовательский JSX-конфиг нельзя хранить рядом со скриптом: если JSX
+    // установлен в Photoshop/Presets/Scripts, эта папка находится в Program Files
+    // и обычный пользователь Windows не имеет права создавать там .tmp/.json.
+    // app.preferencesFolder предназначен именно для пользовательских данных Photoshop.
+    return new File(app.preferencesFolder + "/gfp_config.json");
+}
+
+function gfpLegacyConfigFile() {
+    // Совместимость со старым размещением. Читаем прежний файл рядом с JSX,
+    // если новый файл в preferences ещё не создан, но никогда больше туда не пишем.
     var scriptFile = new File($.fileName);
     return new File(scriptFile.parent.fsName + "/gfp_config.json");
 }
@@ -1107,7 +1117,12 @@ function gfpNormalizeConfig(raw) {
 function gfpLoadConfig() {
     var file = gfpConfigFile();
     if (!file.exists) {
-        return gfpDefaultConfig();
+        var legacy = gfpLegacyConfigFile();
+        if (legacy.exists) {
+            file = legacy;
+        } else {
+            return gfpDefaultConfig();
+        }
     }
     try {
         file.encoding = "UTF-8";
@@ -1556,12 +1571,12 @@ function gfpShowSettingsDialog() {
         return true;
     }
 
-    // Сервер недоступен: сохраняем локальную конфигурацию атомарно для
-    // следующего запуска локального сервера. Для удалённого сервера эти
-    // значения нужно будет отправить, когда он снова станет доступен.
+    // Сервер недоступен: сохраняем пользовательскую копию в preferences Photoshop.
+    // Адрес/порт будут доступны уже при следующем запуске JSX. Остальные серверные
+    // параметры нужно подтвердить повторным сохранением после восстановления связи.
     gfpSaveConfig(resultConfig);
     gfpApplyConfig(resultConfig);
-    alert("Настройки сохранены локально. Python-сервер сейчас недоступен.\n\nЕсли сервер находится на этом компьютере, они будут прочитаны при его следующем запуске. Если сервер удалённый — сохраните настройки ещё раз после восстановления соединения.", GFP_NAME, true);
+    alert("Настройки подключения и локальная копия сохранены в настройках Photoshop. Python-сервер сейчас недоступен.\n\nПосле восстановления соединения откройте настройки и нажмите «Сохранить» ещё раз, чтобы сервер подтвердил и применил серверные параметры.", GFP_NAME, true);
     return true;
 }
 
