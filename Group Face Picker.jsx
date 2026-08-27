@@ -1,7 +1,23 @@
 #target photoshop
+/*
+// BEGIN__HARVEST_EXCEPTION_ZSTRING
+<javascriptresource>
+<name>Group Face Picker (use SHIFT to view settings)</name>
+<eventid>9a189321-e07f-40ff-8394-156a4bd48cf5</eventid>
+<terminology><![CDATA[<< /Version 1
+                       /Events <<
+                       /9a189321-e07f-40ff-8394-156a4bd48cf5 [(Group Face Picker) <<
+                       /gfpActionMarker [(action marker) /boolean]
+                       >>]
+                        >>
+                     >> ]]></terminology>
+</javascriptresource>
+// END__HARVEST_EXCEPTION_ZSTRING
+*/
 
 var GFP_NAME = "Group Face Picker";
-var GFP_VERSION = "0.5.3";
+var GFP_UUID = "9a189321-e07f-40ff-8394-156a4bd48cf5";
+var GFP_VERSION = "0.5.4";
 var GFP_DEFAULT_HOST = "127.0.0.1";
 var GFP_DEFAULT_PORT_SEND = 6420;
 var GFP_DEFAULT_PORT_LISTEN = 6421;
@@ -23,13 +39,41 @@ var GFP_SERVER_START_ERROR = "";
 var GFP_SERVER_START_TIMEOUT = 120000;
 var GFP_LAST_SERVER_LAUNCHER = "";
 var GFP_S2T = stringIDToTypeID;
+var GFP_KEYBOARD_STATE = ScriptUI.environment.keyboardState;
+var GFP_SHIFT_LAUNCH = !!(GFP_KEYBOARD_STATE && GFP_KEYBOARD_STATE.shiftKey);
 var GFP_SETTINGS = gfpLoadConfig();
 gfpApplyConfig(GFP_SETTINGS);
 
 try {
-    gfpMain();
+    // Как в img2img helper: Shift действует только на текущий запуск.
+    // Для Group Face Picker это короткий путь непосредственно к настройкам;
+    // основной поиск/вставка в этот запуск не выполняются.
+    if (GFP_SHIFT_LAUNCH) {
+        gfpShowSettingsDialog();
+    } else {
+        gfpMain();
+    }
 } catch (e) {
     alert(gfpErrorText(e), GFP_NAME, true);
+} finally {
+    // Наличие playbackParameters заставляет Photoshop записывать запуск как
+    // собственное Script Event в Actions, а не как безымянный Javascript шаг.
+    gfpWritePlaybackParameters();
+}
+
+function gfpWritePlaybackParameters() {
+    try {
+        var desc = new ActionDescriptor();
+        desc.putBoolean(GFP_S2T("gfpActionMarker"), GFP_UUID.length > 0);
+        // Это тот же Photoshop-механизм, который затем доступен для чтения как
+        // app.playbackParameters. Используем проверенную ExtendScript-форму
+        // присваивания, применяемую при записи параметров Script Event.
+        playbackParameters = desc;
+        return true;
+    } catch (e) {
+        // Ошибка записи Action-параметра не должна ломать основную функцию.
+        return false;
+    }
 }
 
 function gfpMain() {
