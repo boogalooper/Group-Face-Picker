@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 APP_NAME = "Group Face Picker"
-VERSION = "0.5.5"
+VERSION = "0.5.6"
 SETTINGS_SCHEMA_VERSION = 6
 SERVER_INSTANCE_ID = uuid.uuid4().hex[:12]
 CACHE_VERSION = 11
@@ -109,6 +109,21 @@ CONFIG_LOCK = threading.RLock()
 _RUNTIME_CONFIG: Optional[Dict[str, Any]] = None
 
 
+def _config_bool(value: Any, default: bool) -> bool:
+    """Normalize legacy bool/string/0/1 values deterministically."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "1", "yes", "on"}:
+            return True
+        if text in {"false", "0", "no", "off", ""}:
+            return False
+    return bool(default)
+
+
 def _config_with_defaults(data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     raw = dict(DEFAULT_CONFIG)
     if isinstance(data, dict):
@@ -151,8 +166,8 @@ def _config_with_defaults(data: Optional[Dict[str, Any]] = None) -> Dict[str, An
     analysis_quality = str(raw.get("analysis_quality") or DEFAULT_ANALYSIS_QUALITY).strip().lower()
     if analysis_quality not in ANALYSIS_DET_SIZES:
         analysis_quality = DEFAULT_ANALYSIS_QUALITY
-    group_boundary_search = bool(raw.get("group_boundary_search", DEFAULT_GROUP_BOUNDARY_SEARCH))
-    face_scale_match = bool(raw.get("face_scale_match", DEFAULT_FACE_SCALE_MATCH))
+    group_boundary_search = _config_bool(raw.get("group_boundary_search", DEFAULT_GROUP_BOUNDARY_SEARCH), DEFAULT_GROUP_BOUNDARY_SEARCH)
+    face_scale_match = _config_bool(raw.get("face_scale_match", DEFAULT_FACE_SCALE_MATCH), DEFAULT_FACE_SCALE_MATCH)
     return {
         "server_host": server_host,
         "server_port": server_port,

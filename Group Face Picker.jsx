@@ -17,7 +17,7 @@
 
 var GFP_NAME = "Group Face Picker";
 var GFP_UUID = "9a189321-e07f-40ff-8394-156a4bd48cf5";
-var GFP_VERSION = "0.5.5";
+var GFP_VERSION = "0.5.6";
 var GFP_DEFAULT_HOST = "127.0.0.1";
 var GFP_DEFAULT_PORT_SEND = 6420;
 var GFP_DEFAULT_PORT_LISTEN = 6421;
@@ -839,8 +839,8 @@ function gfpApiFire(payload) {
 
 
 function gfpClientStateFile() {
-    // img2img helper stores its .desc file in app.preferencesFolder. Keep the
-    // remembered run_server.bat path in the same Photoshop preferences folder.
+    // Путь локального launcher относится только к клиенту Photoshop и хранится
+    // отдельно от рабочего gfp_config.json Python-сервера.
     return new File(app.preferencesFolder + "/gfp_client_state.json");
 }
 
@@ -859,7 +859,7 @@ function gfpLoadClientState() {
         var state = content ? eval("(" + content + ")") : {};
         return {
             server_launcher_path: String(state.server_launcher_path || ""),
-            server_host: String(state.server_host || ""),
+            server_host: gfpTrimString(state.server_host || ""),
             server_port: Number(state.server_port || 0)
         };
     } catch (e) {
@@ -878,7 +878,7 @@ function gfpSaveClientState(state) {
     try {
         temp.write(gfpObjectToJSON({
             server_launcher_path: String(state.server_launcher_path || ""),
-            server_host: String(state.server_host || ""),
+            server_host: gfpTrimString(state.server_host || ""),
             server_port: Number(state.server_port || 0)
         }));
     } finally {
@@ -1063,18 +1063,58 @@ function gfpDefaultConfig() {
 }
 
 function gfpConfigFile() {
-    // Пользовательский JSX-конфиг нельзя хранить рядом со скриптом: если JSX
-    // установлен в Photoshop/Presets/Scripts, эта папка находится в Program Files
-    // и обычный пользователь Windows не имеет права создавать там .tmp/.json.
-    // app.preferencesFolder предназначен именно для пользовательских данных Photoshop.
+    // Это только клиентская копия настроек Photoshop: адрес подключения и
+    // последнее подтверждённое состояние сервера. Python-сервер по-прежнему
+    // хранит свой рабочий gfp_config.json рядом с group_face_server.py.
+    // Разные имена файлов исключают два конкурирующих «gfp_config.json».
+    return new File(app.preferencesFolder + "/gfp_client_config.json");
+}
+
+function gfpConfigBackupFile() {
+    var file = gfpConfigFile();
+    return new File(file.fsName + ".bak");
+}
+
+function gfpPreviousPreferencesConfigFile() {
+    // Предыдущее пользовательское размещение. Используется только как источник
+    // однократной миграции, когда gfp_client_config.json ещё не создан.
     return new File(app.preferencesFolder + "/gfp_config.json");
 }
 
 function gfpLegacyConfigFile() {
-    // Совместимость со старым размещением. Читаем прежний файл рядом с JSX,
-    // если новый файл в preferences ещё не создан, но никогда больше туда не пишем.
+    // Самое старое размещение рядом с JSX. Если JSX установлен в Presets/Scripts,
+    // этот файл может находиться в защищённой папке; только читаем, не пишем.
     var scriptFile = new File($.fileName);
     return new File(scriptFile.parent.fsName + "/gfp_config.json");
+}
+
+function gfpLegacyServerConfigFile() {
+    // Если JSX уже был установлен отдельно от сервера, старый рабочий конфиг
+    // можно найти по ранее запомненному run_server.bat.
+    try {
+        var state = gfpLoadClientState();
+        var launcherPath = String(state.server_launcher_path || "");
+        if (!launcherPath) return null;
+        var launcher = new File(launcherPath);
+        if (!launcher.exists) return null;
+        return new File(launcher.parent.fsName + "/gfp_config.json");
+    } catch (_) {
+        return null;
+    }
+}
+
+function gfpTrimString(value) {
+    return String(value === undefined || value === null ? "" : value).replace(/^\s+|\s+$/g, "");
+}
+
+function gfpBooleanValue(value, fallbackValue) {
+    if (value === true) return true;
+    if (value === false) return false;
+    if (typeof value == "number") return value != 0;
+    var text = gfpTrimString(value).toLowerCase();
+    if (text == "true" || text == "1" || text == "yes" || text == "on") return true;
+    if (text == "false" || text == "0" || text == "no" || text == "off" || text == "") return false;
+    return fallbackValue === true;
 }
 
 function gfpNormalizeConfig(raw) {
@@ -1086,7 +1126,7 @@ function gfpNormalizeConfig(raw) {
             }
         }
     }
-    cfg.server_host = String(cfg.server_host || GFP_DEFAULT_HOST);
+    cfg.server_host = gfpTrimString(cfg.server_host || GFP_DEFAULT_HOST) || GFP_DEFAULT_HOST;
     cfg.server_port = Number(cfg.server_port || GFP_DEFAULT_PORT_SEND);
     if (!isFinite(cfg.server_port) || cfg.server_port < 1 || cfg.server_port > 65535) {
         cfg.server_port = GFP_DEFAULT_PORT_SEND;
@@ -1097,7 +1137,7 @@ function gfpNormalizeConfig(raw) {
     cfg.cache_ttl_hours = Math.max(12, Math.min(168, Math.round(cfg.cache_ttl_hours)));
     cfg.match_threshold = Number(cfg.match_threshold || 0.28);
     cfg.match_threshold = Math.max(0.10, Math.min(0.60, cfg.match_threshold));
-    cfg.compute_mode = String(cfg.compute_mode || "auto").toLowerCase();
+    cfg.compute_mode = gfpTrimString(cfg.compute_mode || "auto").toLowerCase();
     if (cfg.compute_mode != "auto" && cfg.compute_mode != "cpu" && cfg.compute_mode != "gpu") {
         cfg.compute_mode = "auto";
     }
@@ -1105,46 +1145,64 @@ function gfpNormalizeConfig(raw) {
     cfg.scan_threads = Math.max(1, Math.min(4, cfg.scan_threads));
     cfg.preview_threads = Math.round(Number(cfg.preview_threads || 2));
     cfg.preview_threads = Math.max(1, Math.min(8, cfg.preview_threads));
-    cfg.analysis_quality = String(cfg.analysis_quality || "balanced").toLowerCase();
+    cfg.analysis_quality = gfpTrimString(cfg.analysis_quality || "balanced").toLowerCase();
     if (cfg.analysis_quality != "fast" && cfg.analysis_quality != "balanced" && cfg.analysis_quality != "accurate") {
         cfg.analysis_quality = "balanced";
     }
-    cfg.group_boundary_search = cfg.group_boundary_search === true;
-    cfg.face_scale_match = cfg.face_scale_match === true;
+    cfg.group_boundary_search = gfpBooleanValue(cfg.group_boundary_search, false);
+    cfg.face_scale_match = gfpBooleanValue(cfg.face_scale_match, false);
     return cfg;
 }
 
-function gfpLoadConfig() {
-    var file = gfpConfigFile();
-    if (!file.exists) {
-        var legacy = gfpLegacyConfigFile();
-        if (legacy.exists) {
-            file = legacy;
-        } else {
-            return gfpDefaultConfig();
-        }
-    }
+function gfpReadConfigFile(file) {
+    if (!file || !file.exists) return null;
     try {
         file.encoding = "UTF-8";
-        if (!file.open("r")) {
-            return gfpDefaultConfig();
-        }
+        if (!file.open("r")) return null;
         var content = file.read();
         file.close();
-        if (!content) {
-            return gfpDefaultConfig();
-        }
+        if (!content) return null;
         return gfpNormalizeConfig(eval("(" + content + ")"));
     } catch (e) {
         try { file.close(); } catch (_) {}
+        return null;
+    }
+}
+
+function gfpLoadConfig() {
+    var primary = gfpConfigFile();
+    if (primary.exists) {
+        var current = gfpReadConfigFile(primary);
+        if (current) return current;
+        // Если новый файл существует, но повреждён, старый migration-source
+        // не должен внезапно «воскреснуть». Сначала используем его backup.
+        var backup = gfpReadConfigFile(gfpConfigBackupFile());
+        if (backup) return backup;
         return gfpDefaultConfig();
     }
+
+    // Миграция выполняется только при реальном отсутствии нового файла:
+    // сначала берём более новое пользовательское размещение в preferences
+    // Photoshop, затем старый файл рядом с JSX.
+    var candidates = [gfpPreviousPreferencesConfigFile(), gfpLegacyServerConfigFile(), gfpLegacyConfigFile()];
+    for (var i = 0; i < candidates.length; i++) {
+        var migrated = gfpReadConfigFile(candidates[i]);
+        if (!migrated) continue;
+        try {
+            return gfpSaveConfig(migrated);
+        } catch (_) {
+            return migrated;
+        }
+    }
+    return gfpDefaultConfig();
 }
 
 function gfpSaveConfig(config) {
     var file = gfpConfigFile();
+    var backup = gfpConfigBackupFile();
     var temp = new File(file.fsName + ".tmp");
     var cfg = gfpNormalizeConfig(config);
+    try { if (temp.exists) temp.remove(); } catch (_) {}
     temp.encoding = "UTF-8";
     if (!temp.open("w")) {
         throw new Error("Не удалось сохранить временный файл настроек: " + temp.fsName);
@@ -1154,19 +1212,38 @@ function gfpSaveConfig(config) {
     } finally {
         temp.close();
     }
-    if (file.exists && !file.remove()) {
-        try { temp.remove(); } catch (_) {}
-        throw new Error("Не удалось заменить файл настроек: " + file.fsName);
-    }
-    if (!temp.rename(file.name)) {
-        if (!temp.copy(file.fsName)) {
+
+    // Сохраняем последнюю рабочую клиентскую копию до замены primary.
+    if (file.exists) {
+        try { if (backup.exists) backup.remove(); } catch (_) {}
+        if (!file.copy(backup.fsName)) {
             try { temp.remove(); } catch (_) {}
-            throw new Error("Не удалось завершить сохранение настроек: " + file.fsName);
+            throw new Error("Не удалось создать резервную копию настроек: " + backup.fsName);
         }
+        if (!file.remove()) {
+            try { temp.remove(); } catch (_) {}
+            throw new Error("Не удалось заменить файл настроек: " + file.fsName);
+        }
+    }
+
+    var installed = temp.rename(file.name);
+    if (!installed) {
+        installed = temp.copy(file.fsName);
         try { temp.remove(); } catch (_) {}
     }
-    var verified = gfpLoadConfig();
-    if (!gfpSameConfigValues(cfg, verified)) {
+    if (!installed) {
+        try {
+            if (!file.exists && backup.exists) backup.copy(file.fsName);
+        } catch (_) {}
+        throw new Error("Не удалось завершить сохранение настроек: " + file.fsName);
+    }
+
+    var verified = gfpReadConfigFile(file);
+    if (!verified || !gfpSameConfigValues(cfg, verified)) {
+        try {
+            if (file.exists) file.remove();
+            if (backup.exists) backup.copy(file.fsName);
+        } catch (_) {}
         throw new Error("Проверка локального файла настроек не пройдена.");
     }
     return verified;
@@ -1244,16 +1321,20 @@ function gfpShowSettingsDialog() {
             if (live.message.version && String(live.message.version) != GFP_VERSION) {
                 throw new Error("Запущен Python-сервер версии " + String(live.message.version) + ", а JSX имеет версию " + GFP_VERSION + ". Перезапустите run_server.bat перед изменением настроек.");
             }
-            var serverSettings = live.message.settings;
+            var serverSettings = gfpNormalizeConfig(live.message.settings);
             current = gfpNormalizeConfig(serverSettings);
             liveEngine = live.message.engine || null;
-            // Работающий сервер является источником истины. Синхронизируем
-            // локальный JSON сразу, чтобы повторное открытие окна в этом же
-            // сеансе Photoshop показывало именно реально активные значения.
+            // Сервер является источником истины для рабочих параметров, но адрес,
+            // по которому Photoshop уже успешно к нему подключился, остаётся
+            // клиентским endpoint. Это важно для удалённого сервера, который
+            // может слушать 0.0.0.0, а Photoshop подключается к его LAN-IP.
+            current.server_host = localCurrent.server_host;
+            current.server_port = localCurrent.server_port;
             gfpSaveConfig(current);
             gfpApplyConfig(current);
             oldHost = GFP_API_HOST;
             oldPort = GFP_API_PORT_SEND;
+            live.message.settings = serverSettings;
         }
     } catch (liveError) {
         if (liveError && liveError.message && String(liveError.message).indexOf("Перезапустите run_server.bat") >= 0) {
@@ -1486,6 +1567,7 @@ function gfpShowSettingsDialog() {
 
     var serverResponse = null;
     var serverAvailable = false;
+    var configForServer = gfpNormalizeConfig(resultConfig);
     try {
         var test = gfpApiRequestTo(oldHost, oldPort, { command: "ping" }, 2000);
         serverAvailable = !!(test && test.type == "answer");
@@ -1494,12 +1576,25 @@ function gfpShowSettingsDialog() {
     }
 
     if (serverAvailable) {
+        // Если пользователь не менял endpoint подключения, не подменяем bind
+        // адрес удалённого Python-сервера его LAN-IP/именем из клиентского поля.
+        // Это устраняет конфликт «0.0.0.0 на сервере ↔ LAN-IP у Photoshop».
+        try {
+            if (live && live.message && live.message.settings &&
+                String(resultConfig.server_host) == String(localCurrent.server_host) &&
+                Number(resultConfig.server_port) == Number(localCurrent.server_port)) {
+                var liveBind = gfpNormalizeConfig(live.message.settings);
+                configForServer.server_host = liveBind.server_host;
+                configForServer.server_port = liveBind.server_port;
+            }
+        } catch (_) {
+        }
         GFP_SETTINGS_APPLY_HOST = oldHost;
         GFP_SETTINGS_APPLY_PORT = oldPort;
         GFP_PENDING_SETTINGS_RESULT = null;
         GFP_PENDING_SETTINGS_ERROR = null;
         try {
-            serverResponse = gfpApiRequestTo(oldHost, oldPort, { command: "set_settings", settings: resultConfig }, 10000);
+            serverResponse = gfpApiRequestTo(oldHost, oldPort, { command: "set_settings", settings: configForServer }, 10000);
             if (serverResponse && serverResponse.type == "job" && serverResponse.message && serverResponse.message.job_id) {
                 GFP_PENDING_SETTINGS_JOB_ID = String(serverResponse.message.job_id);
                 app.doForcedProgress("Применение настроек Group Face Picker", "gfpPollSettingsJob();");
@@ -1511,6 +1606,8 @@ function gfpShowSettingsDialog() {
                         var rollback = gfpApiRequestTo(oldHost, oldPort, { command: "get_settings" }, 3000);
                         if (rollback && rollback.type == "answer" && rollback.message && rollback.message.settings) {
                             var rollbackConfig = gfpNormalizeConfig(rollback.message.settings);
+                            rollbackConfig.server_host = localCurrent.server_host;
+                            rollbackConfig.server_port = localCurrent.server_port;
                             gfpSaveConfig(rollbackConfig);
                             gfpApplyConfig(rollbackConfig);
                         }
@@ -1546,7 +1643,7 @@ function gfpShowSettingsDialog() {
             alert("Сервер завершил применение настроек, но не удалось перечитать сохранённые значения.", GFP_NAME, true);
             return false;
         }
-        if (!gfpSameConfigValues(resultConfig, authoritative)) {
+        if (!gfpSameConfigValues(configForServer, authoritative)) {
             alert("Сервер не подтвердил выбранные значения настроек. Ничего не будет скрыто: откройте настройки ещё раз — там будут показаны фактически сохранённые значения.", GFP_NAME, true);
             return false;
         }
@@ -1554,29 +1651,36 @@ function gfpShowSettingsDialog() {
         // Проверка live det_size выполняется сервером атомарно внутри
         // set_settings до того, как job получает статус done.
 
-        gfpSaveConfig(authoritative);
+        var localAuthoritative = gfpNormalizeConfig(authoritative);
+        localAuthoritative.server_host = resultConfig.server_host;
+        localAuthoritative.server_port = resultConfig.server_port;
+        gfpSaveConfig(localAuthoritative);
         var restartRequired = !!(serverResponse && serverResponse.type == "answer" && serverResponse.message && serverResponse.message.restart_required);
         if (restartRequired) {
             // Текущий процесс всё ещё слушает старый адрес. Не переключаем
             // соединение посреди сеанса, иначе release_query и последующие
             // запросы к нему перестанут работать. Новый адрес будет загружен
             // при следующем запуске JSX после перезапуска сервера.
-            GFP_SETTINGS = authoritative;
+            GFP_SETTINGS = localAuthoritative;
             GFP_API_HOST = oldHost;
             GFP_API_PORT_SEND = oldPort;
             alert("Настройки сохранены. Все параметры, которые можно изменить на работающем сервере, уже применены.\n\nНовый адрес сервера или порт будет использован после перезапуска run_server.bat.", GFP_NAME, true);
         } else {
-            gfpApplyConfig(authoritative);
+            gfpApplyConfig(localAuthoritative);
         }
         return true;
     }
 
-    // Сервер недоступен: сохраняем пользовательскую копию в preferences Photoshop.
-    // Адрес/порт будут доступны уже при следующем запуске JSX. Остальные серверные
-    // параметры нужно подтвердить повторным сохранением после восстановления связи.
-    gfpSaveConfig(resultConfig);
-    gfpApplyConfig(resultConfig);
-    alert("Настройки подключения и локальная копия сохранены в настройках Photoshop. Python-сервер сейчас недоступен.\n\nПосле восстановления соединения откройте настройки и нажмите «Сохранить» ещё раз, чтобы сервер подтвердил и применил серверные параметры.", GFP_NAME, true);
+    // Сервер недоступен: локально сохраняем только endpoint подключения.
+    // Производительность, кэш, качество анализа и вставка являются серверными
+    // настройками; сохранять их как «ожидающие» значения было бы вторым
+    // источником истины и после перезапуска давало бы конфликт конфигураций.
+    var offlineConfig = gfpLoadConfig();
+    offlineConfig.server_host = resultConfig.server_host;
+    offlineConfig.server_port = resultConfig.server_port;
+    gfpSaveConfig(offlineConfig);
+    gfpApplyConfig(offlineConfig);
+    alert("Python-сервер сейчас недоступен. Сохранены только адрес и порт подключения Photoshop.\n\nОстальные параметры не изменены: откройте настройки после восстановления соединения и сохраните их на работающем сервере.", GFP_NAME, true);
     return true;
 }
 
