@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("bootstrap-pip", "download-insightface", "tls-test")]
+    [ValidateSet("bootstrap-pip", "download-insightface")]
     [string]$Action,
 
     [string]$Python = ""
@@ -53,28 +53,6 @@ function Test-FileHash {
     }
 }
 
-function Test-WindowsTls {
-    Write-Host "Testing HTTPS through the Windows certificate store..."
-    $targets = @(
-        "https://pypi.org/pypi/pip/json",
-        "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip"
-    )
-    foreach ($uri in $targets) {
-        try {
-            $response = Invoke-WebRequest -Uri $uri -Method Head -UseBasicParsing -TimeoutSec 30
-            Write-Host "  OK  $uri"
-        } catch {
-            # Some endpoints do not like HEAD. Retry with a small normal request.
-            try {
-                $null = Invoke-WebRequest -Uri $uri -UseBasicParsing -TimeoutSec 30
-                Write-Host "  OK  $uri"
-            } catch {
-                Write-Host "  FAIL $uri"
-                throw $_
-            }
-        }
-    }
-}
 
 function Get-LatestUniversalWheel {
     param([Parameter(Mandatory = $true)][string]$Package)
@@ -210,7 +188,6 @@ try {
     switch ($Action) {
         "bootstrap-pip" { Bootstrap-Pip }
         "download-insightface" { Download-InsightFace }
-        "tls-test" { Test-WindowsTls }
     }
     exit 0
 } catch {

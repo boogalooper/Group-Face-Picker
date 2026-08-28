@@ -17,7 +17,7 @@
 
 var GFP_NAME = "Group Face Picker";
 var GFP_UUID = "9a189321-e07f-40ff-8394-156a4bd48cf5";
-var GFP_VERSION = "0.5.6";
+var GFP_VERSION = "0.5.7";
 var GFP_DEFAULT_HOST = "127.0.0.1";
 var GFP_DEFAULT_PORT_SEND = 6420;
 var GFP_DEFAULT_PORT_LISTEN = 6421;
@@ -97,73 +97,88 @@ function gfpMain() {
     gfpRememberServerLauncherFromResponse(ping);
 
     var state = gfpReadPhotoshopState();
-    var response = gfpApiRequest({
-        command: "select",
-        source_path: state.sourcePath,
-        source_xmp: state.sourceXmp,
-        doc_width: state.docWidth,
-        doc_height: state.docHeight,
-        selection: state.selection
-    }, GFP_API_TIMEOUT);
-
-    if (!response) {
-        throw new Error("Python-сервер не ответил.");
-    }
-    if (response.type == "error") {
-        throw new Error(response.message);
-    }
-
-    var result = null;
-    if (response.type == "job") {
-        GFP_PENDING_JOB_ID = String(response.message.job_id || "");
-        GFP_PENDING_JOB_RESULT = null;
-        GFP_PENDING_JOB_ERROR = null;
-        if (!GFP_PENDING_JOB_ID) {
-            throw new Error("Сервер не вернул идентификатор анализа.");
-        }
-        app.doForcedProgress("Подготовка превью лиц", "gfpPollSelectionJob();");
-        if (GFP_PENDING_JOB_ERROR) {
-            throw new Error(GFP_PENDING_JOB_ERROR);
-        }
-        result = GFP_PENDING_JOB_RESULT;
-    } else if (response.type == "answer") {
-        result = response.message;
-    }
-
-    if (!result || !result.previews || !result.previews.items || !result.query_id) {
-        throw new Error("Сервер вернул неполный результат анализа.");
-    }
-
-    var payload = {
-        app_name: GFP_NAME,
-        version: GFP_VERSION,
-        query_id: result.query_id,
-        previews: result.previews,
-        matches: result.matches,
-        target: {
-            document_id: state.documentId,
+    try {
+        var response = gfpApiRequest({
+            command: "select",
             source_path: state.sourcePath,
+            source_xmp: state.sourceXmp,
             doc_width: state.docWidth,
             doc_height: state.docHeight,
-            selection: state.selection,
-            selection_mask: state.selectionMask,
-            quick_mask: state.quickMask
-        }
-    };
+            selection: state.selection
+        }, GFP_API_TIMEOUT);
 
-    var selectedIndex = -1;
-    try {
-        selectedIndex = gfpShowDialog(payload);
-        if (selectedIndex >= 0) {
-            gfpInsertCandidate(payload, selectedIndex);
+        if (!response) {
+            throw new Error("Python-сервер не ответил.");
         }
-    } finally {
-        gfpApiFire({ command: "release_query", query_id: payload.query_id });
+        if (response.type == "error") {
+            throw new Error(response.message);
+        }
+
+        var result = null;
+        if (response.type == "job") {
+            GFP_PENDING_JOB_ID = String(response.message.job_id || "");
+            GFP_PENDING_JOB_RESULT = null;
+            GFP_PENDING_JOB_ERROR = null;
+            if (!GFP_PENDING_JOB_ID) {
+                throw new Error("Сервер не вернул идентификатор анализа.");
+            }
+            app.doForcedProgress("Подготовка превью лиц", "gfpPollSelectionJob();");
+            if (GFP_PENDING_JOB_ERROR) {
+                throw new Error(GFP_PENDING_JOB_ERROR);
+            }
+            result = GFP_PENDING_JOB_RESULT;
+        } else if (response.type == "answer") {
+            result = response.message;
+        }
+
+        if (!result || !result.previews || !result.previews.items || !result.query_id) {
+            throw new Error("Сервер вернул неполный результат анализа.");
+        }
+
+        var payload = {
+            app_name: GFP_NAME,
+            version: GFP_VERSION,
+            query_id: result.query_id,
+            previews: result.previews,
+            matches: result.matches,
+            target: {
+                document_id: state.documentId,
+                source_path: state.sourcePath,
+                doc_width: state.docWidth,
+                doc_height: state.docHeight,
+                selection: state.selection,
+                selection_mask: state.selectionMask,
+                quick_mask: state.quickMask
+            }
+        };
+
+        var selectedIndex = -1;
+        try {
+            selectedIndex = gfpShowDialog(payload);
+            if (selectedIndex >= 0) {
+                gfpInsertCandidate(payload, selectedIndex);
+            }
+        } finally {
+            gfpApiFire({ command: "release_query", query_id: payload.query_id });
+        }
+
+        // Reading an existing Quick Mask temporarily exits Quick Mask mode so
+        // Photoshop exposes the real selection. If the user cancels, return the
+        // document to the mode it had before the script was launched.
+        if (selectedIndex < 0) {
+            gfpRestoreQuickMaskState(state);
+        }
+    } catch (mainError) {
+        // Analysis/network/insertion failures must not leave a document that was
+        // originally in Quick Mask mode silently switched to standard mode.
+        gfpRestoreQuickMaskState(state);
+        throw mainError;
     }
 }
 
 function gfpPollSelectionJob() {
     var started = (new Date()).getTime();
+    var consecutiveNetworkFailures = 0;
     for (;;) {
         if ((new Date()).getTime() - started > GFP_JOB_TIMEOUT) {
             GFP_PENDING_JOB_ERROR = "Превышено время ожидания анализа и подготовки превью.";
@@ -172,9 +187,16 @@ function gfpPollSelectionJob() {
 
         var response = gfpApiRequest({ command: "job_status", job_id: GFP_PENDING_JOB_ID }, 8000);
         if (!response) {
-            GFP_PENDING_JOB_ERROR = "Python-сервер перестал отвечать во время подготовки превью.";
-            return false;
+            consecutiveNetworkFailures++;
+            if (consecutiveNetworkFailures >= 2) {
+                GFP_PENDING_JOB_ERROR = "Python-сервер дважды подряд не ответил во время подготовки превью.";
+                return false;
+            }
+            app.changeProgressText("Временный сбой связи с сервером; повтор запроса...");
+            $.sleep(250);
+            continue;
         }
+        consecutiveNetworkFailures = 0;
         if (response.type == "error") {
             GFP_PENDING_JOB_ERROR = String(response.message || "Ошибка анализа.");
             return false;
@@ -214,52 +236,64 @@ function gfpReadPhotoshopState() {
 
     var quickMaskActive = gfpGetBooleanDocumentProperty("quickMask");
     var quickMaskOuterBounds = null;
-    if (quickMaskActive) {
-        // Поведение повторяет img2img helper: если Quick Mask была включена
-        // поверх исходного выделения, до clearEvent его bounds задают внешний
-        // прямоугольник фрагмента. После clearEvent текущая selection содержит
-        // уже фактическую (в том числе непрямоугольную) форму маски слоя.
-        try {
-            quickMaskOuterBounds = doc.selection.bounds;
-        } catch (quickMaskBoundsError) {
-            quickMaskOuterBounds = null;
-        }
-        gfpQuickMask("clearEvent");
-    }
-
-    var actualBounds = null;
+    var quickMaskWasCleared = false;
     try {
-        actualBounds = doc.selection.bounds;
-    } catch (selectionBoundsError) {
-        actualBounds = null;
+        if (quickMaskActive) {
+            // Поведение повторяет img2img helper: если Quick Mask была включена
+            // поверх исходного выделения, до clearEvent её bounds задают внешний
+            // прямоугольник фрагмента. После clearEvent текущая selection содержит
+            // уже фактическую (в том числе непрямоугольную) форму маски слоя.
+            try {
+                quickMaskOuterBounds = doc.selection.bounds;
+            } catch (quickMaskBoundsError) {
+                quickMaskOuterBounds = null;
+            }
+            gfpQuickMask("clearEvent");
+            quickMaskWasCleared = true;
+        }
+
+        var actualBounds = null;
+        try {
+            actualBounds = doc.selection.bounds;
+        } catch (selectionBoundsError) {
+            actualBounds = null;
+        }
+
+        if (!actualBounds || actualBounds.length < 4) {
+            throw new Error("Сначала выделите лицо прямоугольным выделением или через быструю маску.");
+        }
+
+        var bounds = quickMaskOuterBounds && quickMaskOuterBounds.length >= 4 ? quickMaskOuterBounds : actualBounds;
+        var selection = {
+            left: Math.round(bounds[0].as("px")),
+            top: Math.round(bounds[1].as("px")),
+            right: Math.round(bounds[2].as("px")),
+            bottom: Math.round(bounds[3].as("px"))
+        };
+
+        if (selection.right <= selection.left || selection.bottom <= selection.top) {
+            throw new Error("Выделение пустое.");
+        }
+
+        return {
+            documentId: gfpGetDocumentId(),
+            sourcePath: sourceFile.fsName,
+            sourceXmp: gfpIsRawPath(sourceFile.fsName) ? gfpReadDocumentXmp(doc) : "",
+            docWidth: Math.round(doc.width.as("px")),
+            docHeight: Math.round(doc.height.as("px")),
+            selection: selection,
+            selectionMask: true,
+            quickMask: quickMaskActive
+        };
+    } catch (stateError) {
+        if (quickMaskWasCleared) {
+            try {
+                gfpQuickMask("set");
+            } catch (restoreQuickMaskError) {
+            }
+        }
+        throw stateError;
     }
-
-    if (!actualBounds || actualBounds.length < 4) {
-        throw new Error("Сначала выделите лицо прямоугольным выделением или через быструю маску.");
-    }
-
-    var bounds = quickMaskOuterBounds && quickMaskOuterBounds.length >= 4 ? quickMaskOuterBounds : actualBounds;
-    var selection = {
-        left: Math.round(bounds[0].as("px")),
-        top: Math.round(bounds[1].as("px")),
-        right: Math.round(bounds[2].as("px")),
-        bottom: Math.round(bounds[3].as("px"))
-    };
-
-    if (selection.right <= selection.left || selection.bottom <= selection.top) {
-        throw new Error("Выделение пустое.");
-    }
-
-    return {
-        documentId: gfpGetDocumentId(),
-        sourcePath: sourceFile.fsName,
-        sourceXmp: gfpIsRawPath(sourceFile.fsName) ? gfpReadDocumentXmp(doc) : "",
-        docWidth: Math.round(doc.width.as("px")),
-        docHeight: Math.round(doc.height.as("px")),
-        selection: selection,
-        selectionMask: true,
-        quickMask: quickMaskActive
-    };
 }
 
 function gfpIsRawPath(path) {
@@ -304,6 +338,22 @@ function gfpQuickMask(eventName) {
     var desc = new ActionDescriptor();
     desc.putReference(GFP_S2T("null"), ref);
     executeAction(GFP_S2T(eventName), desc, DialogModes.NO);
+}
+
+
+function gfpRestoreQuickMaskState(state) {
+    if (!state || !state.quickMask) {
+        return;
+    }
+    try {
+        var target = gfpSelectDocumentById(state.documentId);
+        app.activeDocument = target;
+        if (!gfpGetBooleanDocumentProperty("quickMask")) {
+            gfpQuickMask("set");
+        }
+    } catch (e) {
+        // Restoration is best-effort and must never hide the original error.
+    }
 }
 
 function gfpShowDialog(payload) {
@@ -1699,6 +1749,7 @@ function gfpSameConfigValues(a, b) {
 
 function gfpPollSettingsJob() {
     var started = (new Date()).getTime();
+    var consecutiveNetworkFailures = 0;
     for (;;) {
         if ((new Date()).getTime() - started > GFP_JOB_TIMEOUT) {
             GFP_PENDING_SETTINGS_ERROR = "Превышено время ожидания применения настроек.";
@@ -1707,9 +1758,16 @@ function gfpPollSettingsJob() {
         var response = gfpApiRequestTo(GFP_SETTINGS_APPLY_HOST, GFP_SETTINGS_APPLY_PORT,
             { command: "job_status", job_id: GFP_PENDING_SETTINGS_JOB_ID }, 8000);
         if (!response) {
-            GFP_PENDING_SETTINGS_ERROR = "Python-сервер перестал отвечать при применении настроек.";
-            return false;
+            consecutiveNetworkFailures++;
+            if (consecutiveNetworkFailures >= 2) {
+                GFP_PENDING_SETTINGS_ERROR = "Python-сервер дважды подряд не ответил при применении настроек.";
+                return false;
+            }
+            app.changeProgressText("Временный сбой связи с сервером; повтор запроса настроек...");
+            $.sleep(250);
+            continue;
         }
+        consecutiveNetworkFailures = 0;
         if (response.type == "error") {
             GFP_PENDING_SETTINGS_ERROR = String(response.message || "Ошибка применения настроек.");
             return false;

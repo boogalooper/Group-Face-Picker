@@ -22,10 +22,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 APP_NAME = "Group Face Picker"
-VERSION = "0.5.6"
+VERSION = "0.5.7"
 SETTINGS_SCHEMA_VERSION = 6
 SERVER_INSTANCE_ID = uuid.uuid4().hex[:12]
-CACHE_VERSION = 11
+CACHE_VERSION = 12
 QUERY_TTL_SECONDS = 30 * 60
 JOB_TTL_SECONDS = 15 * 60
 CACHE_CLEANUP_INTERVAL_SECONDS = 15 * 60
@@ -271,7 +271,13 @@ def _face_scale_match() -> bool:
 
 
 def _analysis_signature() -> str:
-    return "quality=%s;det=%d;group-boundary=%d" % (_analysis_quality(), _det_size(), 1 if _group_boundary_search() else 0)
+    # Build the signature from one immutable config snapshot. This prevents a
+    # concurrent settings update from producing a mixed old/new signature.
+    config = _get_runtime_config()
+    quality = str(config.get("analysis_quality", DEFAULT_ANALYSIS_QUALITY))
+    det_size = int(ANALYSIS_DET_SIZES.get(quality, ANALYSIS_DET_SIZES[DEFAULT_ANALYSIS_QUALITY]))
+    group_boundary = bool(config.get("group_boundary_search", DEFAULT_GROUP_BOUNDARY_SEARCH))
+    return "quality=%s;det=%d;group-boundary=%d" % (quality, det_size, 1 if group_boundary else 0)
 
 
 CUDA_DLL_HANDLES: List[Any] = []
@@ -646,6 +652,9 @@ JOBS: Dict[str, Dict[str, Any]] = {}
 QUERY_LOCK = threading.RLock()
 QUERIES: Dict[str, QueryContext] = {}
 CACHE_CLEANUP_LOCK = threading.RLock()
+CACHE_IO_LOCK = threading.RLock()
+SETTINGS_APPLY_LOCK = threading.RLock()
+SELECTION_LOCK = threading.RLock()
 LAST_CACHE_CLEANUP = 0.0
 
 
@@ -871,17 +880,9 @@ def _read_detector_rgb(path: Path) -> Tuple[Any, int, int]:
     from PIL import Image
 
     det_size = _det_size()
-    if _is_raw_path(path):
-        preview, source_w, source_h = _read_raw_preview_with_dimensions(path)
-        try:
-            rgb = np.array(preview, dtype=np.uint8, copy=True)
-        finally:
-            try:
-                preview.close()
-            except Exception:
-                pass
-        return rgb, int(source_w), int(source_h)
-
+    # RAW files are handled explicitly in _analyze_image_record() so their
+    # embedded preview remains the analysis coordinate system. This reader is
+    # therefore intentionally limited to Pillow/PSD-compatible inputs.
     pillow_error: Optional[Exception] = None
     source = None
     try:
@@ -1181,7 +1182,7 @@ def _cleanup_disk_cache(force: bool = False) -> None:
     """Remove expired group caches and their cached face previews."""
     global LAST_CACHE_CLEANUP
     now = time.time()
-    with CACHE_CLEANUP_LOCK:
+    with CACHE_IO_LOCK, CACHE_CLEANUP_LOCK:
         if not force and now - LAST_CACHE_CLEANUP < CACHE_CLEANUP_INTERVAL_SECONDS:
             return
         LAST_CACHE_CLEANUP = now
@@ -1250,57 +1251,60 @@ def _cleanup_disk_cache(force: bool = False) -> None:
 
 
 def _save_group_index(index: GroupIndex) -> None:
-    if not index.members:
-        raise RuntimeError("Cannot save an empty group index")
-    cache_id = index.cache_id or _group_cache_id(Path(index.folder), index.members)
-    index.cache_id = cache_id
-    target, meta_target = _group_cache_paths(cache_id)
-    preview_dir = _group_preview_dir(cache_id)
-    # A changed file can rebuild the same first..last group range and therefore
-    # reuse the same cache_id. Recreate the face directory so resized PNG
-    # variants from the previous fingerprint can never survive the rebuild.
-    if preview_dir.exists():
-        shutil.rmtree(preview_dir)
-    preview_dir.mkdir(parents=True, exist_ok=True)
+    # Cache writes replace a shared preview directory and fixed temp files.
+    # Serialize mutations so concurrent jobs/cleanup cannot delete each other.
+    with CACHE_IO_LOCK:
+        if not index.members:
+            raise RuntimeError("Cannot save an empty group index")
+        cache_id = index.cache_id or _group_cache_id(Path(index.folder), index.members)
+        index.cache_id = cache_id
+        target, meta_target = _group_cache_paths(cache_id)
+        preview_dir = _group_preview_dir(cache_id)
+        # A changed file can rebuild the same first..last group range and therefore
+        # reuse the same cache_id. Recreate the face directory so resized PNG
+        # variants from the previous fingerprint can never survive the rebuild.
+        if preview_dir.exists():
+            shutil.rmtree(preview_dir)
+        preview_dir.mkdir(parents=True, exist_ok=True)
 
-    # Persist one small master JPEG per detected face. These files are the UI
-    # preview source for all later child selections, so original 20–60 MP/PSD/RAW
-    # files are never reopened just to build the chooser.
-    for image_pos, image in enumerate(index.images):
-        for face_pos, face in enumerate(image.faces):
-            master = preview_dir / ("%04d_%03d.jpg" % (image_pos, face_pos))
-            if face.preview_jpeg:
-                temp_master = master.with_suffix(master.suffix + ".tmp")
-                temp_master.write_bytes(face.preview_jpeg)
-                os.replace(str(temp_master), str(master))
-            elif not master.is_file() and face.preview_master_path:
-                old_master = Path(face.preview_master_path)
-                if old_master.is_file():
-                    shutil.copyfile(str(old_master), str(master))
-            if not master.is_file():
-                raise RuntimeError("Could not persist cached preview for %s face %d" % (image.name, face_pos))
-            face.preview_master_path = str(master)
-            face.preview_jpeg = b""
+        # Persist one small master JPEG per detected face. These files are the UI
+        # preview source for all later child selections, so original 20–60 MP/PSD/RAW
+        # files are never reopened just to build the chooser.
+        for image_pos, image in enumerate(index.images):
+            for face_pos, face in enumerate(image.faces):
+                master = preview_dir / ("%04d_%03d.jpg" % (image_pos, face_pos))
+                if face.preview_jpeg:
+                    temp_master = master.with_suffix(master.suffix + ".tmp")
+                    temp_master.write_bytes(face.preview_jpeg)
+                    os.replace(str(temp_master), str(master))
+                elif not master.is_file() and face.preview_master_path:
+                    old_master = Path(face.preview_master_path)
+                    if old_master.is_file():
+                        shutil.copyfile(str(old_master), str(master))
+                if not master.is_file():
+                    raise RuntimeError("Could not persist cached preview for %s face %d" % (image.name, face_pos))
+                face.preview_master_path = str(master)
+                face.preview_jpeg = b""
 
-    temp = target.with_name(target.name + ".tmp")
-    meta_temp = meta_target.with_name(meta_target.name + ".tmp")
-    payload = {"version": CACHE_VERSION, "index": index}
-    with temp.open("wb") as stream:
-        pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
-    metadata = {
-        "version": CACHE_VERSION,
-        "cache_id": cache_id,
-        "folder": index.folder,
-        "fingerprint": index.fingerprint,
-        "analysis_signature": _analysis_signature(),
-        "members": index.members,
-        "left_probe": index.left_probe,
-        "right_probe": index.right_probe,
-        "pickle": target.name,
-    }
-    meta_temp.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temp, target)
-    os.replace(meta_temp, meta_target)
+        temp = target.with_name(target.name + ".tmp")
+        meta_temp = meta_target.with_name(meta_target.name + ".tmp")
+        payload = {"version": CACHE_VERSION, "index": index}
+        with temp.open("wb") as stream:
+            pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
+        metadata = {
+            "version": CACHE_VERSION,
+            "cache_id": cache_id,
+            "folder": index.folder,
+            "fingerprint": index.fingerprint,
+            "analysis_signature": _analysis_signature(),
+            "members": index.members,
+            "left_probe": index.left_probe,
+            "right_probe": index.right_probe,
+            "pickle": target.name,
+        }
+        meta_temp.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp, target)
+        os.replace(meta_temp, meta_target)
 
 
 def _validate_group_layout(meta: Dict[str, Any], source_path: Path, files: List[Path]) -> bool:
@@ -1603,22 +1607,40 @@ def _group_change_stats(anchor_faces: List[FaceRecord], candidate_faces: List[Fa
     candidate_count = len(candidate_faces)
     if anchor_count <= 0:
         return {"matched": 0, "missing": 0, "new": candidate_count, "changed": candidate_count, "fraction": 1.0 if candidate_count else 0.0, "boundary": False, "strong": False}
-    pairs: List[Tuple[float, int, int]] = []
+
+    # Find a maximum-cardinality one-to-one identity matching. The previous
+    # global greedy sort could consume a candidate with the locally best score
+    # and thereby lose another valid pairing, falsely inflating roster changes.
     threshold = GROUP_IDENTITY_THRESHOLD
-    for ai, anchor in enumerate(anchor_faces):
+    edges: List[List[Tuple[float, int]]] = []
+    for anchor in anchor_faces:
+        row: List[Tuple[float, int]] = []
         for ci, candidate in enumerate(candidate_faces):
             similarity = _cosine(anchor.embedding, candidate.embedding)
             if similarity >= threshold:
-                pairs.append((similarity, ai, ci))
-    pairs.sort(reverse=True, key=lambda value: value[0])
-    used_a = set()
-    used_c = set()
-    for similarity, ai, ci in pairs:
-        if ai in used_a or ci in used_c:
-            continue
-        used_a.add(ai)
-        used_c.add(ci)
-    matched = len(used_a)
+                row.append((similarity, ci))
+        row.sort(reverse=True, key=lambda value: value[0])
+        edges.append(row)
+
+    matched_candidate: Dict[int, int] = {}
+
+    def augment(anchor_index: int, seen_candidates: set) -> bool:
+        for _similarity, candidate_index in edges[anchor_index]:
+            if candidate_index in seen_candidates:
+                continue
+            seen_candidates.add(candidate_index)
+            previous_anchor = matched_candidate.get(candidate_index)
+            if previous_anchor is None or augment(previous_anchor, seen_candidates):
+                matched_candidate[candidate_index] = anchor_index
+                return True
+        return False
+
+    # Start with the most constrained anchors. This is not required for
+    # correctness, but keeps the augmenting-path search small and deterministic.
+    anchor_order = sorted(range(anchor_count), key=lambda ai: (len(edges[ai]), ai))
+    for ai in anchor_order:
+        augment(ai, set())
+    matched = len(matched_candidate)
     missing = max(0, anchor_count - matched)
     new = max(0, candidate_count - matched)
     changed = max(missing, new)
@@ -1831,6 +1853,13 @@ def _build_group_index(folder: Path, source_path: Path, selection: Dict[str, int
             )
 
             if candidate_boundary or target_fallback_boundary:
+                # Unreadable files encountered before the first reliable
+                # boundary frame still belong to the contiguous current group.
+                # Once a boundary candidate exists, later unresolved probes are
+                # outside/unknown and must not extend the group past that probe.
+                if not pending_boundaries and unresolved:
+                    accepted_indices.extend(unresolved)
+                    unresolved = []
                 pending_boundaries.append((position, record, stats))
                 if immediate_boundary or target_fallback_boundary or len(pending_boundaries) >= GROUP_BOUNDARY_CONFIRM_FRAMES:
                     boundary_probe = str(files[pending_boundaries[0][0]])
@@ -2223,155 +2252,159 @@ def _render_previews(candidates: List[QueryCandidate], job_id: Optional[str] = N
 
 
 def _select_child(payload: Dict[str, Any], job_id: Optional[str] = None) -> Dict[str, Any]:
-    source_path = Path(str(payload.get("source_path") or "")).resolve()
-    if not source_path.is_file():
-        raise UserVisibleError("The active Photoshop document has no readable source file on disk.")
-    folder = source_path.parent
-    selection_raw = payload.get("selection") or {}
-    selection = {
-        key: int(round(float(selection_raw.get(key, 0))))
-        for key in ("left", "top", "right", "bottom")
-    }
-    if selection["right"] <= selection["left"] or selection["bottom"] <= selection["top"]:
-        raise UserVisibleError("The Photoshop selection is empty.")
-    doc_width = int(round(float(payload.get("doc_width") or 0)))
-    doc_height = int(round(float(payload.get("doc_height") or 0)))
-    if doc_width <= 0 or doc_height <= 0:
-        raise UserVisibleError("Could not read Photoshop document dimensions.")
+    # One selection job owns group-cache rebuild state at a time. Settings
+    # updates use the same outer lock so an analysis cannot mix two engine/config
+    # revisions midway through a group.
+    with SETTINGS_APPLY_LOCK, SELECTION_LOCK:
+        source_path = Path(str(payload.get("source_path") or "")).resolve()
+        if not source_path.is_file():
+            raise UserVisibleError("The active Photoshop document has no readable source file on disk.")
+        folder = source_path.parent
+        selection_raw = payload.get("selection") or {}
+        selection = {
+            key: int(round(float(selection_raw.get(key, 0))))
+            for key in ("left", "top", "right", "bottom")
+        }
+        if selection["right"] <= selection["left"] or selection["bottom"] <= selection["top"]:
+            raise UserVisibleError("The Photoshop selection is empty.")
+        doc_width = int(round(float(payload.get("doc_width") or 0)))
+        doc_height = int(round(float(payload.get("doc_height") or 0)))
+        if doc_width <= 0 or doc_height <= 0:
+            raise UserVisibleError("Could not read Photoshop document dimensions.")
 
-    index = _build_group_index(folder, source_path, selection, doc_width, doc_height, job_id=job_id)
-    if _is_raw_path(source_path):
-        cloned_xmp = _clone_source_xmp_to_group(source_path, index.members, str(payload.get("source_xmp") or ""))
-        if cloned_xmp and job_id:
-            _update_job(job_id, progress=0.74, status="running", text="Подготовлены XMP для RAW этой группы: %d" % cloned_xmp)
-    if job_id:
-        _update_job(job_id, progress=0.78, status="running", text="Поиск выбранного лица...")
-    reference_image, reference = _choose_reference(index, source_path, selection, doc_width, doc_height)
-    ref_emb = reference.embedding
-    source_norm = _norm_path(str(source_path))
-    candidates: List[QueryCandidate] = []
-    below_threshold = 0
-    outside_frame = 0
-
-    # Include the active source in the preview list as a visual reference. It is
-    # marked non-insertable in JSX, so the target document is never used as its
-    # own donor.
-    active_crop = _aligned_crop(reference, reference_image, reference, reference_image, selection, doc_width, doc_height)
-    if active_crop is None:
-        active_crop = (selection["left"], selection["top"], selection["right"], selection["bottom"])
-    candidates.append(
-        QueryCandidate(
-            source_path=reference_image.path,
-            name=reference_image.name,
-            width=reference_image.source_width,
-            height=reference_image.source_height,
-            analysis_width=reference_image.width,
-            analysis_height=reference_image.height,
-            face=reference,
-            similarity=1.0,
-            crop=active_crop,
-            is_active=True,
-        )
-    )
-
-    match_images = [image for image in index.images if _norm_path(image.path) != source_norm]
-    match_total = max(1, len(match_images))
-    for match_pos, image in enumerate(match_images, start=1):
+        index = _build_group_index(folder, source_path, selection, doc_width, doc_height, job_id=job_id)
+        if _is_raw_path(source_path):
+            cloned_xmp = _clone_source_xmp_to_group(source_path, index.members, str(payload.get("source_xmp") or ""))
+            if cloned_xmp and job_id:
+                _update_job(job_id, progress=0.74, status="running", text="Подготовлены XMP для RAW этой группы: %d" % cloned_xmp)
         if job_id:
-            _update_job(
-                job_id,
-                progress=0.80 + ((match_pos - 1) / float(match_total)) * 0.08,
-                status="running",
-                text="Поиск совпадений %d/%d: %s" % (match_pos, match_total, image.name),
-            )
-        best_face = None
-        best_similarity = -1.0
-        for face in image.faces:
-            similarity = _cosine(ref_emb, face.embedding)
-            if similarity > best_similarity:
-                best_similarity = similarity
-                best_face = face
-        if best_face is None or best_similarity < _match_threshold():
-            below_threshold += 1
-            continue
-        # Candidate discovery is always translation-only. Optional face-scale
-        # matching is evaluated later, at insertion time, from the live setting.
-        crop = _aligned_crop(
-            best_face, image, reference, reference_image, selection, doc_width, doc_height
-        )
-        if crop is None:
-            outside_frame += 1
-            LOGGER.info(
-                "[MATCH] %s matched %.3f but the aligned crop would leave the frame; skipped.",
-                image.name, best_similarity,
-            )
-            continue
+            _update_job(job_id, progress=0.78, status="running", text="Поиск выбранного лица...")
+        reference_image, reference = _choose_reference(index, source_path, selection, doc_width, doc_height)
+        ref_emb = reference.embedding
+        source_norm = _norm_path(str(source_path))
+        candidates: List[QueryCandidate] = []
+        below_threshold = 0
+        outside_frame = 0
+
+        # Include the active source in the preview list as a visual reference. It is
+        # marked non-insertable in JSX, so the target document is never used as its
+        # own donor.
+        active_crop = _aligned_crop(reference, reference_image, reference, reference_image, selection, doc_width, doc_height)
+        if active_crop is None:
+            active_crop = (selection["left"], selection["top"], selection["right"], selection["bottom"])
         candidates.append(
             QueryCandidate(
-                source_path=image.path,
-                name=image.name,
-                width=image.source_width,
-                height=image.source_height,
-                analysis_width=image.width,
-                analysis_height=image.height,
-                face=best_face,
-                similarity=best_similarity,
-                crop=crop,
+                source_path=reference_image.path,
+                name=reference_image.name,
+                width=reference_image.source_width,
+                height=reference_image.source_height,
+                analysis_width=reference_image.width,
+                analysis_height=reference_image.height,
+                face=reference,
+                similarity=1.0,
+                crop=active_crop,
+                is_active=True,
             )
         )
-        LOGGER.info(
-            "[MATCH] %-40s similarity=%.3f crop=%s",
-            image.name, best_similarity, crop,
-        )
 
-    candidates.sort(key=lambda item: (0 if item.is_active else 1, item.name.casefold()))
-    if len(candidates) <= 1:
-        raise UserVisibleError(
-            "The selected child was not found in other images of the detected group with sufficient confidence. "
-            "Try a tighter face selection or lower the face-match threshold in Photoshop settings."
-        )
+        match_images = [image for image in index.images if _norm_path(image.path) != source_norm]
+        match_total = max(1, len(match_images))
+        for match_pos, image in enumerate(match_images, start=1):
+            if job_id:
+                _update_job(
+                    job_id,
+                    progress=0.80 + ((match_pos - 1) / float(match_total)) * 0.08,
+                    status="running",
+                    text="Поиск совпадений %d/%d: %s" % (match_pos, match_total, image.name),
+                )
+            best_face = None
+            best_similarity = -1.0
+            for face in image.faces:
+                similarity = _cosine(ref_emb, face.embedding)
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_face = face
+            if best_face is None or best_similarity < _match_threshold():
+                below_threshold += 1
+                continue
+            # Candidate discovery is always translation-only. Optional face-scale
+            # matching is evaluated later, at insertion time, from the live setting.
+            crop = _aligned_crop(
+                best_face, image, reference, reference_image, selection, doc_width, doc_height
+            )
+            if crop is None:
+                outside_frame += 1
+                LOGGER.info(
+                    "[MATCH] %s matched %.3f but the aligned crop would leave the frame; skipped.",
+                    image.name, best_similarity,
+                )
+                continue
+            candidates.append(
+                QueryCandidate(
+                    source_path=image.path,
+                    name=image.name,
+                    width=image.source_width,
+                    height=image.source_height,
+                    analysis_width=image.width,
+                    analysis_height=image.height,
+                    face=best_face,
+                    similarity=best_similarity,
+                    crop=crop,
+                )
+            )
+            LOGGER.info(
+                "[MATCH] %-40s similarity=%.3f crop=%s",
+                image.name, best_similarity, crop,
+            )
 
-    ref_sx = float(doc_width) / float(max(1, reference_image.width))
-    ref_sy = float(doc_height) / float(max(1, reference_image.height))
-    reference_eyes_doc = [
-        [reference.kps[0][0] * ref_sx, reference.kps[0][1] * ref_sy],
-        [reference.kps[1][0] * ref_sx, reference.kps[1][1] * ref_sy],
-    ]
-    target_eye_offsets = [
-        [reference_eyes_doc[0][0] - selection["left"], reference_eyes_doc[0][1] - selection["top"]],
-        [reference_eyes_doc[1][0] - selection["left"], reference_eyes_doc[1][1] - selection["top"]],
-    ]
-    target_face_dims = _face_scale_dimensions(reference, ref_sx, ref_sy) or (0.0, 0.0)
-    query_id = uuid.uuid4().hex
-    context = QueryContext(
-        created_at=time.time(),
-        target_eye_offsets=target_eye_offsets,
-        target_face_width=float(target_face_dims[0]),
-        target_face_height=float(target_face_dims[1]),
-        candidates=candidates,
-    )
-    with QUERY_LOCK:
-        QUERIES[query_id] = context
-    if job_id:
-        _update_job(job_id, progress=0.90, status="running", text="Подготовка превью 0/%d..." % len(candidates))
-    previews = _render_previews(candidates, job_id=job_id)
-    return {
-        "query_id": query_id,
-        "previews": previews,
-        "matches": [
-            {
-                "name": item.name,
-                "source_path": item.source_path,
-                "similarity": float(item.similarity),
-                "is_active": bool(item.is_active),
-            }
-            for item in candidates
-        ],
-        "skipped_low_similarity": below_threshold,
-        "skipped_outside_frame": outside_frame,
-        "threshold": _match_threshold(),
-        "provider": ENGINE.provider_name(),
-    }
+        candidates.sort(key=lambda item: (0 if item.is_active else 1, item.name.casefold()))
+        if len(candidates) <= 1:
+            raise UserVisibleError(
+                "The selected child was not found in other images of the detected group with sufficient confidence. "
+                "Try a tighter face selection or lower the face-match threshold in Photoshop settings."
+            )
+
+        ref_sx = float(doc_width) / float(max(1, reference_image.width))
+        ref_sy = float(doc_height) / float(max(1, reference_image.height))
+        reference_eyes_doc = [
+            [reference.kps[0][0] * ref_sx, reference.kps[0][1] * ref_sy],
+            [reference.kps[1][0] * ref_sx, reference.kps[1][1] * ref_sy],
+        ]
+        target_eye_offsets = [
+            [reference_eyes_doc[0][0] - selection["left"], reference_eyes_doc[0][1] - selection["top"]],
+            [reference_eyes_doc[1][0] - selection["left"], reference_eyes_doc[1][1] - selection["top"]],
+        ]
+        target_face_dims = _face_scale_dimensions(reference, ref_sx, ref_sy) or (0.0, 0.0)
+        query_id = uuid.uuid4().hex
+        context = QueryContext(
+            created_at=time.time(),
+            target_eye_offsets=target_eye_offsets,
+            target_face_width=float(target_face_dims[0]),
+            target_face_height=float(target_face_dims[1]),
+            candidates=candidates,
+        )
+        with QUERY_LOCK:
+            QUERIES[query_id] = context
+        if job_id:
+            _update_job(job_id, progress=0.90, status="running", text="Подготовка превью 0/%d..." % len(candidates))
+        previews = _render_previews(candidates, job_id=job_id)
+        return {
+            "query_id": query_id,
+            "previews": previews,
+            "matches": [
+                {
+                    "name": item.name,
+                    "source_path": item.source_path,
+                    "similarity": float(item.similarity),
+                    "is_active": bool(item.is_active),
+                }
+                for item in candidates
+            ],
+            "skipped_low_similarity": below_threshold,
+            "skipped_outside_frame": outside_frame,
+            "threshold": _match_threshold(),
+            "provider": ENGINE.provider_name(),
+        }
 
 
 def _prepare_crop(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2458,9 +2491,9 @@ def _start_select_job(payload: Dict[str, Any]) -> Dict[str, Any]:
 def _job_status(payload: Dict[str, Any]) -> Dict[str, Any]:
     job_id = str(payload.get("job_id") or "")
     with JOBS_LOCK:
+        # Terminal results are retained for JOB_TTL_SECONDS so polling is
+        # idempotent even if a Photoshop callback/response is lost once.
         job = dict(JOBS.get(job_id) or {})
-        if job and job.get("status") in ("done", "error"):
-            JOBS.pop(job_id, None)
     if not job:
         raise UserVisibleError("Analysis job not found.")
     return _json_response("answer", {
@@ -2477,7 +2510,11 @@ def _cleanup_old_state() -> None:
     now = time.time()
     with JOBS_LOCK:
         for key in list(JOBS):
-            if now - float(JOBS[key].get("updated_at") or 0) > JOB_TTL_SECONDS:
+            job = JOBS.get(key) or {}
+            # Never discard an actively running worker merely because one
+            # operation took unusually long. Completed/error results expire
+            # after the normal TTL and remain retryable until then.
+            if job.get("status") in ("done", "error") and now - float(job.get("updated_at") or 0) > JOB_TTL_SECONDS:
                 JOBS.pop(key, None)
     with QUERY_LOCK:
         for key in list(QUERIES):
@@ -2486,77 +2523,107 @@ def _cleanup_old_state() -> None:
 
 
 def _apply_settings(payload: Dict[str, Any], job_id: Optional[str] = None) -> Dict[str, Any]:
-    new_settings = _config_with_defaults(dict(payload.get("settings") or {}))
-    current = _get_runtime_config()
-    LOGGER.info("[SETTINGS] Requested: compute_mode=%s analysis_quality=%s det_size=%d",                new_settings.get("compute_mode"), new_settings.get("analysis_quality"),                int(ANALYSIS_DET_SIZES.get(new_settings.get("analysis_quality"), ANALYSIS_DET_SIZES[DEFAULT_ANALYSIS_QUALITY])))
-    restart_fields: List[str] = []
-    if new_settings.get("server_host") != current.get("server_host"):
-        restart_fields.append("server_host")
-    if int(new_settings.get("server_port")) != int(current.get("server_port")):
-        restart_fields.append("server_port")
-    requested_det_size = int(ANALYSIS_DET_SIZES.get(
-        new_settings.get("analysis_quality"),
-        ANALYSIS_DET_SIZES[DEFAULT_ANALYSIS_QUALITY],
-    ))
-    engine_state_before = ENGINE.current_state()
-    # Reconfigure not only when the config value changes, but also when the live
-    # engine has drifted from the persisted configuration.
-    engine_changed = (
-        new_settings.get("compute_mode") != current.get("compute_mode")
-        or new_settings.get("analysis_quality") != current.get("analysis_quality")
-        or str(engine_state_before.get("mode") or "") != str(new_settings.get("compute_mode") or "")
-        or int(engine_state_before.get("det_size") or 0) != requested_det_size
-    )
-    if job_id:
-        _update_job(job_id, progress=0.10, status="running", text="Проверка настроек...")
-
-    # Engine-dependent options are applied first. If the requested GPU/provider
-    # cannot be initialized, the server keeps the previous valid configuration
-    # instead of persisting settings that cannot actually be used.
-    if engine_changed:
-        if job_id:
-            _update_job(job_id, progress=0.20, status="running", text="Применение режима распознавания...")
-        try:
-            state_after = ENGINE.reconfigure(str(new_settings.get("compute_mode")), requested_det_size)
-        except Exception:
-            LOGGER.exception("[SETTINGS] Engine reconfiguration rejected; previous settings stay active.")
-            raise
-        if int(state_after.get("det_size") or 0) != requested_det_size:
-            raise UserVisibleError(
-                "Face engine did not accept detector size %d (active: %s)."
-                % (requested_det_size, state_after.get("det_size"))
-            )
-        if job_id:
-            _update_job(job_id, progress=0.82, status="running", text="Модель распознавания готова.")
-
-    saved = _save_runtime_config(new_settings)
-    # Final consistency check: persisted quality and live engine must describe
-    # the same detector size before the server reports success to Photoshop.
-    final_state = ENGINE.current_state()
-    saved_det_size = int(ANALYSIS_DET_SIZES.get(saved.get("analysis_quality"), ANALYSIS_DET_SIZES[DEFAULT_ANALYSIS_QUALITY]))
-    if int(final_state.get("det_size") or 0) != saved_det_size:
-        raise UserVisibleError(
-            "Settings were saved, but the live detector is %s instead of %d."
-            % (final_state.get("det_size"), saved_det_size)
+    # Settings are an engine+disk transaction. Serialize updates and roll both
+    # sides back if persistence or the final consistency check fails.
+    with SETTINGS_APPLY_LOCK:
+        new_settings = _config_with_defaults(dict(payload.get("settings") or {}))
+        current = _get_runtime_config()
+        LOGGER.info(
+            "[SETTINGS] Requested: compute_mode=%s analysis_quality=%s det_size=%d",
+            new_settings.get("compute_mode"),
+            new_settings.get("analysis_quality"),
+            int(ANALYSIS_DET_SIZES.get(new_settings.get("analysis_quality"), ANALYSIS_DET_SIZES[DEFAULT_ANALYSIS_QUALITY])),
         )
-    if saved.get("cache_ttl_hours") != current.get("cache_ttl_hours"):
-        _cleanup_disk_cache(force=True)
-    try:
-        settings_revision = int(CONFIG_FILE.stat().st_mtime_ns)
-    except OSError:
-        settings_revision = int(time.time() * 1000000000)
-    result = {
-        "settings": saved,
-        "settings_revision": settings_revision,
-        "restart_required": bool(restart_fields),
-        "restart_fields": restart_fields,
-        "engine": final_state,
-        "applied_now": ["preview_size", "cache_ttl_hours", "match_threshold", "scan_threads", "preview_threads", "compute_mode", "analysis_quality", "group_boundary_search", "face_scale_match"],
-    }
-    if job_id:
-        _update_job(job_id, progress=0.95, status="running", text="Настройки сохранены.")
-    return result
+        restart_fields: List[str] = []
+        if new_settings.get("server_host") != current.get("server_host"):
+            restart_fields.append("server_host")
+        if int(new_settings.get("server_port")) != int(current.get("server_port")):
+            restart_fields.append("server_port")
+        requested_det_size = int(ANALYSIS_DET_SIZES.get(
+            new_settings.get("analysis_quality"),
+            ANALYSIS_DET_SIZES[DEFAULT_ANALYSIS_QUALITY],
+        ))
+        engine_state_before = ENGINE.current_state()
+        engine_changed = (
+            new_settings.get("compute_mode") != current.get("compute_mode")
+            or new_settings.get("analysis_quality") != current.get("analysis_quality")
+            or str(engine_state_before.get("mode") or "") != str(new_settings.get("compute_mode") or "")
+            or int(engine_state_before.get("det_size") or 0) != requested_det_size
+        )
+        if job_id:
+            _update_job(job_id, progress=0.10, status="running", text="Проверка настроек...")
 
+        engine_was_reconfigured = False
+        config_may_have_changed = False
+        try:
+            if engine_changed:
+                if job_id:
+                    _update_job(job_id, progress=0.20, status="running", text="Применение режима распознавания...")
+                state_after = ENGINE.reconfigure(str(new_settings.get("compute_mode")), requested_det_size)
+                engine_was_reconfigured = True
+                if int(state_after.get("det_size") or 0) != requested_det_size:
+                    raise UserVisibleError(
+                        "Face engine did not accept detector size %d (active: %s)."
+                        % (requested_det_size, state_after.get("det_size"))
+                    )
+                if job_id:
+                    _update_job(job_id, progress=0.82, status="running", text="Модель распознавания готова.")
+
+            # _save_runtime_config uses atomic replace, but a verification error
+            # can happen after the new file reached disk. Mark the config as
+            # potentially changed before calling it so rollback covers that case.
+            config_may_have_changed = True
+            saved = _save_runtime_config(new_settings)
+            final_state = ENGINE.current_state()
+            saved_det_size = int(ANALYSIS_DET_SIZES.get(
+                saved.get("analysis_quality"),
+                ANALYSIS_DET_SIZES[DEFAULT_ANALYSIS_QUALITY],
+            ))
+            if int(final_state.get("det_size") or 0) != saved_det_size:
+                raise UserVisibleError(
+                    "Settings were saved, but the live detector is %s instead of %d."
+                    % (final_state.get("det_size"), saved_det_size)
+                )
+        except Exception as original_exc:
+            rollback_errors: List[str] = []
+            if config_may_have_changed:
+                try:
+                    _save_runtime_config(current)
+                except Exception as rollback_exc:
+                    rollback_errors.append("config rollback failed: %s" % rollback_exc)
+                    LOGGER.exception("[SETTINGS] Could not restore previous config after failed update.")
+            if engine_was_reconfigured:
+                try:
+                    ENGINE.reconfigure(
+                        str(engine_state_before.get("mode") or current.get("compute_mode") or DEFAULT_COMPUTE_MODE),
+                        int(engine_state_before.get("det_size") or ANALYSIS_DET_SIZES[DEFAULT_ANALYSIS_QUALITY]),
+                    )
+                except Exception as rollback_exc:
+                    rollback_errors.append("engine rollback failed: %s" % rollback_exc)
+                    LOGGER.exception("[SETTINGS] Could not restore previous face-engine state after failed update.")
+            if rollback_errors:
+                raise UserVisibleError(
+                    "%s; additionally, %s" % (str(original_exc), "; ".join(rollback_errors))
+                ) from original_exc
+            raise
+
+        if saved.get("cache_ttl_hours") != current.get("cache_ttl_hours"):
+            _cleanup_disk_cache(force=True)
+        try:
+            settings_revision = int(CONFIG_FILE.stat().st_mtime_ns)
+        except OSError:
+            settings_revision = int(time.time() * 1000000000)
+        result = {
+            "settings": saved,
+            "settings_revision": settings_revision,
+            "restart_required": bool(restart_fields),
+            "restart_fields": restart_fields,
+            "engine": final_state,
+            "applied_now": ["preview_size", "cache_ttl_hours", "match_threshold", "scan_threads", "preview_threads", "compute_mode", "analysis_quality", "group_boundary_search", "face_scale_match"],
+        }
+        if job_id:
+            _update_job(job_id, progress=0.95, status="running", text="Настройки сохранены.")
+        return result
 
 def _start_settings_job(payload: Dict[str, Any]) -> Dict[str, Any]:
     job_id = uuid.uuid4().hex

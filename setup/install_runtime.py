@@ -23,13 +23,19 @@ def has_nvidia() -> bool:
     return shutil.which("nvidia-smi") is not None
 
 
+def uninstall_ort_variants() -> None:
+    # Both distributions expose the same ``onnxruntime`` module. Always clean
+    # both names before switching between GPU and CPU variants.
+    subprocess.call([sys.executable, "-m", "pip", "uninstall", "-y", "onnxruntime", "onnxruntime-gpu"])
+
+
 def install_ort() -> int:
     # CPU/GPU ORT distributions export the same Python module. Always keep one
     # clean runtime. For RTX 50xx/Blackwell we pin the complete CUDA 12.8
     # runtime family instead of letting ORT extras mix whichever CUDA 12.x
     # component versions are newest on the day of installation. cuDNN 9.24
     # officially supports Blackwell with CUDA >=12.8.
-    subprocess.call([sys.executable, "-m", "pip", "uninstall", "-y", "onnxruntime", "onnxruntime-gpu"])
+    uninstall_ort_variants()
     if has_nvidia():
         print("NVIDIA GPU detected. Installing pinned CUDA 12.8 runtime for ONNX Runtime 1.26.0...")
         gpu_packages = (
@@ -45,7 +51,9 @@ def install_ort() -> int:
         rc = pip_install(*gpu_packages)
         if rc == 0:
             return 0
-        print("GPU runtime installation failed; falling back to CPU ONNX Runtime 1.26.0.")
+        print("GPU runtime installation failed; cleaning partial ORT install before CPU fallback...")
+        uninstall_ort_variants()
+        print("Falling back to CPU ONNX Runtime 1.26.0.")
     return pip_install("onnxruntime==1.26.0")
 
 
