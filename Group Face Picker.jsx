@@ -17,7 +17,7 @@
 
 var GFP_NAME = "Group Face Picker";
 var GFP_UUID = "9a189321-e07f-40ff-8394-156a4bd48cf5";
-var GFP_VERSION = "0.5.7";
+var GFP_VERSION = "0.5.8";
 var GFP_DEFAULT_HOST = "127.0.0.1";
 var GFP_DEFAULT_PORT_SEND = 6420;
 var GFP_DEFAULT_PORT_LISTEN = 6421;
@@ -81,23 +81,30 @@ function gfpMain() {
         throw new Error("Откройте групповую фотографию и выделите лицо ребёнка.");
     }
 
-    var ping = gfpEnsureServerAvailable();
-    if (!ping || ping.type != "answer") {
-        var startupDetails = GFP_LAST_SERVER_LAUNCHER ? ("\n\nПроверенный путь автозапуска:\n" + GFP_LAST_SERVER_LAUNCHER) : "";
-        if (confirm("Python-сервер не запущен или недоступен по текущему адресу. Автоматический запуск не удался." + startupDetails + "\n\nОткрыть настройки подключения?")) {
-            gfpShowSettingsDialog();
-            return;
-        }
-        throw new Error("Python-сервер недоступен. Запустите run_server.bat вручную и повторите запуск скрипта.");
-    }
-    if (ping.message && ping.message.version && String(ping.message.version) != GFP_VERSION) {
-        throw new Error("Версия запущенного Python-сервера (" + String(ping.message.version) + ") не совпадает с версией JSX (" + GFP_VERSION + ").\n\nПерезапустите run_server.bat из этой же папки скрипта. Старый процесс сервера может оставаться запущенным после обновления файлов.");
-    }
-
-    gfpRememberServerLauncherFromResponse(ping);
-
+    // Полностью проверяем документ ДО любого обращения к Python-серверу.
+    // gfpReadPhotoshopState() проверяет RGB, существующий исходный файл и
+    // реальное активное выделение (включая случай Quick Mask).
     var state = gfpReadPhotoshopState();
+
     try {
+        var ping = gfpEnsureServerAvailable();
+        if (!ping || ping.type != "answer") {
+            var startupDetails = GFP_LAST_SERVER_LAUNCHER ? ("\n\nПроверенный путь автозапуска:\n" + GFP_LAST_SERVER_LAUNCHER) : "";
+            if (confirm("Python-сервер не запущен или недоступен по текущему адресу. Автоматический запуск не удался." + startupDetails + "\n\nОткрыть настройки подключения?")) {
+                // Чтение Quick Mask могло временно перевести документ в обычный
+                // режим выделения. Настройки не должны оставлять документ изменённым.
+                gfpRestoreQuickMaskState(state);
+                gfpShowSettingsDialog();
+                return;
+            }
+            throw new Error("Python-сервер недоступен. Запустите run_server.bat вручную и повторите запуск скрипта.");
+        }
+        if (ping.message && ping.message.version && String(ping.message.version) != GFP_VERSION) {
+            throw new Error("Версия запущенного Python-сервера (" + String(ping.message.version) + ") не совпадает с версией JSX (" + GFP_VERSION + ").\n\nПерезапустите run_server.bat из этой же папки скрипта. Старый процесс сервера может оставаться запущенным после обновления файлов.");
+        }
+
+        gfpRememberServerLauncherFromResponse(ping);
+
         var response = gfpApiRequest({
             command: "select",
             source_path: state.sourcePath,
@@ -169,8 +176,8 @@ function gfpMain() {
             gfpRestoreQuickMaskState(state);
         }
     } catch (mainError) {
-        // Analysis/network/insertion failures must not leave a document that was
-        // originally in Quick Mask mode silently switched to standard mode.
+        // Любая ошибка после preflight, включая запуск/проверку сервера, не
+        // должна оставлять Quick Mask в изменённом состоянии.
         gfpRestoreQuickMaskState(state);
         throw mainError;
     }
@@ -222,6 +229,11 @@ function gfpPollSelectionJob() {
 
 function gfpReadPhotoshopState() {
     var doc = app.activeDocument;
+
+    if (doc.mode != DocumentMode.RGB) {
+        throw new Error("Активный документ должен быть в режиме RGB.");
+    }
+
     var sourceFile = null;
 
     try {
