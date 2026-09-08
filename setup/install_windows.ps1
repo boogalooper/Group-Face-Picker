@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("bootstrap-pip", "download-insightface")]
+    [ValidateSet("bootstrap-pip", "download-insightface", "download-portrait-preference")]
     [string]$Action,
 
     [string]$Python = ""
@@ -24,6 +24,11 @@ $InsightFacePack = Join-Path $InsightFaceRoot "buffalo_l"
 $InsightFaceZip = Join-Path $Root "runtime\downloads\buffalo_l.zip"
 $InsightFaceUrl = "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip"
 $InsightFaceSha256 = "80ffe37d8a5940d59a7384c201a2a38d4741f2f3c51eef46ebb28218a7b0ca2f"
+$PortraitPreferenceDir = Join-Path $ModelDir "portrait_preference"
+$PortraitPreferenceModel = Join-Path $PortraitPreferenceDir "beauty_resnet.caffemodel"
+$PortraitPreferenceProto = Join-Path $PortraitPreferenceDir "beauty_resnet.prototxt"
+$PortraitPreferenceModelUrl = "https://raw.githubusercontent.com/asiryan/HowCuteAmI/main/models/beauty_resnet.caffemodel"
+$PortraitPreferenceProtoUrl = "https://raw.githubusercontent.com/asiryan/HowCuteAmI/main/models/beauty_resnet.prototxt"
 
 function Invoke-WindowsDownload {
     param(
@@ -135,12 +140,78 @@ function Bootstrap-Pip {
     Remove-Item -Recurse -Force $BootstrapDir -ErrorAction SilentlyContinue
 }
 
+
+function Download-PortraitPreference {
+    $modelOk = (Test-Path -LiteralPath $PortraitPreferenceModel -PathType Leaf) -and ((Get-Item $PortraitPreferenceModel).Length -gt 40000000)
+    $protoOk = (Test-Path -LiteralPath $PortraitPreferenceProto -PathType Leaf) -and ((Get-Item $PortraitPreferenceProto).Length -gt 10000)
+    if ($modelOk -and $protoOk) {
+        Write-Host "Portrait preference model already present: $PortraitPreferenceDir"
+        return
+    }
+
+    $stageDir = Join-Path $Root "runtime\downloads\portrait_preference_stage"
+    $stageModel = Join-Path $stageDir "beauty_resnet.caffemodel"
+    $stageProto = Join-Path $stageDir "beauty_resnet.prototxt"
+    $backupDir = Join-Path $ModelDir "portrait_preference_backup"
+    Remove-Item -Recurse -Force $stageDir -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $backupDir -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+
+    try {
+        Write-Host "Downloading public HowCuteAmI ResNet-18 portrait preference model..."
+        Invoke-WindowsDownload -Uri $PortraitPreferenceProtoUrl -OutFile $stageProto
+        Invoke-WindowsDownload -Uri $PortraitPreferenceModelUrl -OutFile $stageModel
+
+        if ((Get-Item $stageModel).Length -le 40000000) {
+            throw "Downloaded portrait preference model is unexpectedly small or incomplete"
+        }
+        if ((Get-Item $stageProto).Length -le 10000) {
+            throw "Downloaded portrait preference prototxt is unexpectedly small or incomplete"
+        }
+
+        New-Item -ItemType Directory -Force -Path $ModelDir | Out-Null
+        $hadOldDir = Test-Path -LiteralPath $PortraitPreferenceDir -PathType Container
+        if ($hadOldDir) {
+            Move-Item -LiteralPath $PortraitPreferenceDir -Destination $backupDir
+        }
+        try {
+            Move-Item -LiteralPath $stageDir -Destination $PortraitPreferenceDir
+        } catch {
+            Remove-Item -Recurse -Force $PortraitPreferenceDir -ErrorAction SilentlyContinue
+            if ($hadOldDir -and (Test-Path -LiteralPath $backupDir -PathType Container)) {
+                Move-Item -LiteralPath $backupDir -Destination $PortraitPreferenceDir
+            }
+            throw
+        }
+        Remove-Item -Recurse -Force $backupDir -ErrorAction SilentlyContinue
+        Write-Host "Portrait preference model installed: $PortraitPreferenceDir"
+    } finally {
+        Remove-Item -Recurse -Force $stageDir -ErrorAction SilentlyContinue
+        if ((Test-Path -LiteralPath $PortraitPreferenceDir -PathType Container) -and
+            (Test-Path -LiteralPath $backupDir -PathType Container)) {
+            Remove-Item -Recurse -Force $backupDir -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Download-InsightFace {
-    $detector = Join-Path $InsightFacePack "det_10g.onnx"
-    $recognizer = Join-Path $InsightFacePack "w600k_r50.onnx"
-    $landmarks = Join-Path $InsightFacePack "2d106det.onnx"
-    if ((Test-Path $detector) -and (Test-Path $recognizer) -and (Test-Path $landmarks)) {
-        Write-Host "InsightFace buffalo_l already present: $InsightFacePack"
+    $required = @(
+        "det_10g.onnx",
+        "w600k_r50.onnx",
+        "2d106det.onnx",
+        "1k3d68.onnx",
+        "genderage.onnx"
+    )
+    $complete = $true
+    foreach ($name in $required) {
+        $candidate = Join-Path $InsightFacePack $name
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf) -or (Get-Item -LiteralPath $candidate).Length -lt 100000) {
+            $complete = $false
+            break
+        }
+    }
+    if ($complete) {
+        Write-Host "Complete InsightFace buffalo_l already present: $InsightFacePack"
         return
     }
 
@@ -168,17 +239,29 @@ function Download-InsightFace {
     if (-not (Test-Path (Join-Path $source "w600k_r50.onnx"))) {
         throw "Downloaded buffalo_l archive does not contain w600k_r50.onnx"
     }
-    if (-not (Test-Path (Join-Path $source "2d106det.onnx"))) {
-        throw "Downloaded buffalo_l archive does not contain 2d106det.onnx"
+    foreach ($name in $required) {
+        if (-not (Test-Path -LiteralPath (Join-Path $source $name) -PathType Leaf)) {
+            throw "Downloaded buffalo_l archive does not contain $name"
+        }
     }
 
     New-Item -ItemType Directory -Force -Path $InsightFaceRoot | Out-Null
-    Remove-Item -Recurse -Force $InsightFacePack -ErrorAction SilentlyContinue
-    New-Item -ItemType Directory -Force -Path $InsightFacePack | Out-Null
-    Get-ChildItem -Path $source -File | ForEach-Object {
-        Copy-Item -Force $_.FullName (Join-Path $InsightFacePack $_.Name)
+    $backupPack = Join-Path $InsightFaceRoot "buffalo_l_backup"
+    Remove-Item -Recurse -Force $backupPack -ErrorAction SilentlyContinue
+    $hadOldPack = Test-Path -LiteralPath $InsightFacePack -PathType Container
+    if ($hadOldPack) {
+        Move-Item -LiteralPath $InsightFacePack -Destination $backupPack
     }
-
+    try {
+        Move-Item -LiteralPath $source -Destination $InsightFacePack
+    } catch {
+        Remove-Item -Recurse -Force $InsightFacePack -ErrorAction SilentlyContinue
+        if ($hadOldPack -and (Test-Path -LiteralPath $backupPack -PathType Container)) {
+            Move-Item -LiteralPath $backupPack -Destination $InsightFacePack
+        }
+        throw
+    }
+    Remove-Item -Recurse -Force $backupPack -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force $extract -ErrorAction SilentlyContinue
     Remove-Item -Force $InsightFaceZip -ErrorAction SilentlyContinue
     Write-Host "InsightFace model installed: $InsightFacePack"
@@ -188,6 +271,7 @@ try {
     switch ($Action) {
         "bootstrap-pip" { Bootstrap-Pip }
         "download-insightface" { Download-InsightFace }
+        "download-portrait-preference" { Download-PortraitPreference }
     }
     exit 0
 } catch {

@@ -16,14 +16,15 @@ import threading
 import time
 import traceback
 import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 APP_NAME = "Group Face Picker"
-VERSION = "0.5.8"
-SETTINGS_SCHEMA_VERSION = 6
+VERSION = "0.6.5"
+SETTINGS_SCHEMA_VERSION = 8
 SERVER_INSTANCE_ID = uuid.uuid4().hex[:12]
 CACHE_VERSION = 12
 QUERY_TTL_SECONDS = 30 * 60
@@ -40,6 +41,8 @@ DEFAULT_PREVIEW_THREADS = 2
 DEFAULT_ANALYSIS_QUALITY = "balanced"
 DEFAULT_GROUP_BOUNDARY_SEARCH = False
 DEFAULT_FACE_SCALE_MATCH = False
+DEFAULT_COLLECT_STATISTICS = False
+DEFAULT_RECOMMENDATION_MODEL = "public"
 ANALYSIS_DET_SIZES = {"fast": 640, "balanced": 800, "accurate": 1024}
 DET_THRESHOLD = 0.22
 MAX_FACES = 80
@@ -61,9 +64,24 @@ GROUP_TARGET_PRESENCE_THRESHOLD = 0.38
 GROUP_TARGET_MISS_STOP_FRAMES = 3
 GROUP_RECENT_REFERENCE_FRAMES = 2
 GROUP_CACHE_PREFIX = "group_"
+RECOMMENDATION_MODEL_VALUES = {"off", "public", "personal", "combined"}
+RECOMMENDATION_LABELS = {
+    "off": "Подсветка отключена",
+    "public": "Публичная FBP",
+    "personal": "Моя обученная модель",
+    "combined": "Публичная FBP + моя модель",
+}
+RECOMMENDATION_BORDER_COLOR = (44, 184, 74)
+RECOMMENDATION_BORDER_MIN_PX = 2
 
 ROOT = Path(__file__).resolve().parent
 MODEL_ROOT = ROOT / "models" / "insightface"
+PUBLIC_PREFERENCE_ROOT = ROOT / "models" / "portrait_preference"
+PUBLIC_PREFERENCE_MODEL = PUBLIC_PREFERENCE_ROOT / "beauty_resnet.caffemodel"
+PUBLIC_PREFERENCE_PROTO = PUBLIC_PREFERENCE_ROOT / "beauty_resnet.prototxt"
+PERSONAL_MODEL_DIR = ROOT / "personal_model"
+PERSONAL_PREFERENCE_ONNX = PERSONAL_MODEL_DIR / "personal_preference.onnx"
+PERSONAL_PREFERENCE_JSON = PERSONAL_MODEL_DIR / "personal_preference.json"
 RUNTIME_DIR = ROOT / "runtime"
 CACHE_DIR = RUNTIME_DIR / "cache"
 LOG_DIR = RUNTIME_DIR / "logs"
@@ -72,6 +90,43 @@ for directory in (CACHE_DIR, LOG_DIR):
 
 LOG_FILE = LOG_DIR / "group-face-server.log"
 CONFIG_FILE = ROOT / "gfp_config.json"
+TRAINING_DATA_DIR = ROOT / "training_data"
+TRAINING_EVENTS_DIR = TRAINING_DATA_DIR / "events"
+TRAINING_FACES_DIR = TRAINING_DATA_DIR / "faces"
+TRAINING_SCHEMA_VERSION = 1
+TRAINING_DATA_LOCK = threading.RLock()
+TRAINING_COLLECTOR_FILE = TRAINING_DATA_DIR / "collector.json"
+
+
+def _load_or_create_collector_id() -> str:
+    """Return a stable random id for this local Group Face Picker instance.
+
+    The id is intentionally not derived from hostname, username or path. Fresh
+    copies on different computers therefore get independent ids even when the
+    machines were cloned or the project lives at the same path. ``collector.json``
+    is local provenance only; merge_training_data never imports it.
+    """
+    with TRAINING_DATA_LOCK:
+        TRAINING_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if TRAINING_COLLECTOR_FILE.is_file():
+            try:
+                payload = json.loads(TRAINING_COLLECTOR_FILE.read_text(encoding="utf-8"))
+                collector_id = str(payload.get("collector_id") or "").strip().lower()
+                if len(collector_id) == 32 and all(ch in "0123456789abcdef" for ch in collector_id):
+                    return collector_id
+            except Exception:
+                LOGGER.warning("Could not read training collector id; a new local id will be created.")
+
+        collector_id = uuid.uuid4().hex
+        payload = {
+            "schema_version": 1,
+            "collector_id": collector_id,
+            "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        }
+        temp = TRAINING_COLLECTOR_FILE.with_suffix(".json.tmp")
+        temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(str(temp), str(TRAINING_COLLECTOR_FILE))
+        return collector_id
 DEFAULT_CONFIG = {
     "server_host": DEFAULT_SERVER_HOST,
     "server_port": DEFAULT_SERVER_PORT,
@@ -84,6 +139,8 @@ DEFAULT_CONFIG = {
     "analysis_quality": DEFAULT_ANALYSIS_QUALITY,
     "group_boundary_search": DEFAULT_GROUP_BOUNDARY_SEARCH,
     "face_scale_match": DEFAULT_FACE_SCALE_MATCH,
+    "collect_statistics": DEFAULT_COLLECT_STATISTICS,
+    "recommendation_model": DEFAULT_RECOMMENDATION_MODEL,
 }
 LOGGER = logging.getLogger(APP_NAME)
 LOGGER.setLevel(logging.INFO)
@@ -102,6 +159,11 @@ except OSError:
 
 
 class UserVisibleError(RuntimeError):
+    pass
+
+
+class JobCancelled(RuntimeError):
+    """Internal cooperative cancellation raised for background jobs."""
     pass
 
 
@@ -168,6 +230,10 @@ def _config_with_defaults(data: Optional[Dict[str, Any]] = None) -> Dict[str, An
         analysis_quality = DEFAULT_ANALYSIS_QUALITY
     group_boundary_search = _config_bool(raw.get("group_boundary_search", DEFAULT_GROUP_BOUNDARY_SEARCH), DEFAULT_GROUP_BOUNDARY_SEARCH)
     face_scale_match = _config_bool(raw.get("face_scale_match", DEFAULT_FACE_SCALE_MATCH), DEFAULT_FACE_SCALE_MATCH)
+    collect_statistics = _config_bool(raw.get("collect_statistics", DEFAULT_COLLECT_STATISTICS), DEFAULT_COLLECT_STATISTICS)
+    recommendation_model = str(raw.get("recommendation_model") or DEFAULT_RECOMMENDATION_MODEL).strip().lower()
+    if recommendation_model not in RECOMMENDATION_MODEL_VALUES:
+        recommendation_model = DEFAULT_RECOMMENDATION_MODEL
     return {
         "server_host": server_host,
         "server_port": server_port,
@@ -180,6 +246,8 @@ def _config_with_defaults(data: Optional[Dict[str, Any]] = None) -> Dict[str, An
         "analysis_quality": analysis_quality,
         "group_boundary_search": group_boundary_search,
         "face_scale_match": face_scale_match,
+        "collect_statistics": collect_statistics,
+        "recommendation_model": recommendation_model,
     }
 
 
@@ -252,6 +320,11 @@ def _scan_threads() -> int:
 
 def _preview_threads() -> int:
     return int(_get_runtime_config().get("preview_threads", DEFAULT_PREVIEW_THREADS))
+
+
+def _recommendation_model() -> str:
+    value = str(_get_runtime_config().get("recommendation_model", DEFAULT_RECOMMENDATION_MODEL) or DEFAULT_RECOMMENDATION_MODEL).strip().lower()
+    return value if value in RECOMMENDATION_MODEL_VALUES else DEFAULT_RECOMMENDATION_MODEL
 
 
 def _analysis_quality() -> str:
@@ -405,6 +478,381 @@ class QueryContext:
     candidates: List[QueryCandidate]
 
 
+class PublicPreferenceScorer:
+    MODEL_NAME = "beauty_resnet.caffemodel"
+    PROTO_NAME = "beauty_resnet.prototxt"
+    SOURCE_LABEL = RECOMMENDATION_LABELS["public"]
+
+    def __init__(self, model_root: Path) -> None:
+        self.model_root = model_root
+        self.model_path = model_root / self.MODEL_NAME
+        self.proto_path = model_root / self.PROTO_NAME
+        missing = [path.name for path in (self.model_path, self.proto_path) if not path.is_file()]
+        if missing:
+            raise UserVisibleError(
+                "Public FBP model is not installed: missing " + ", ".join(missing) + ". Run install.bat."
+            )
+        import cv2
+
+        self.cv2 = cv2
+        self.net = cv2.dnn.readNetFromCaffe(str(self.proto_path), str(self.model_path))
+
+    def score_rgb(self, rgb: Any) -> Optional[float]:
+        bgr = self.cv2.cvtColor(rgb, self.cv2.COLOR_RGB2BGR)
+        blob = self.cv2.dnn.blobFromImage(
+            bgr,
+            scalefactor=1.0 / 255.0,
+            size=(224, 224),
+            mean=(104.0, 117.0, 123.0),
+            swapRB=False,
+            crop=False,
+        )
+        self.net.setInput(blob)
+        output = self.net.forward()
+        raw = float(output.reshape(-1)[0])
+        if not math.isfinite(raw):
+            return None
+        normalized = (raw - 1.0) / 4.0
+        return max(0.0, min(1.0, normalized))
+
+
+class PersonalPreferenceScorer:
+    SOURCE_LABEL = RECOMMENDATION_LABELS["personal"]
+
+    def __init__(self, model_path: Path) -> None:
+        if not model_path.is_file():
+            raise UserVisibleError("Personal preference model was not found: %s" % model_path)
+        import onnxruntime as ort
+
+        self.model_path = model_path
+        self.ort = ort
+        self.session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        inputs = self.session.get_inputs()
+        if len(inputs) != 1:
+            raise UserVisibleError("Personal preference model must have exactly one input.")
+        self.input_name = str(inputs[0].name or "image")
+
+    def score_rgb(self, rgb: Any) -> Optional[float]:
+        import numpy as np
+
+        arr = np.asarray(rgb, dtype=np.float32) / 255.0
+        nchw = np.transpose(arr, (2, 0, 1))[None, ...]
+        output = self.session.run(None, {self.input_name: nchw})[0]
+        score = float(output.reshape(-1)[0])
+        if not math.isfinite(score):
+            return None
+        return max(0.0, min(1.0, score))
+
+
+class RecommendationRuntime:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._public_signature = ""
+        self._personal_signature = ""
+        self._public_scorer: Optional[PublicPreferenceScorer] = None
+        self._personal_scorer: Optional[PersonalPreferenceScorer] = None
+        self._public_error = ""
+        self._personal_error = ""
+        self._public_cache: Dict[str, Optional[float]] = {}
+        self._personal_cache: Dict[str, Optional[float]] = {}
+
+    def _signature_for_paths(self, paths: List[Path]) -> str:
+        parts: List[str] = []
+        for path in paths:
+            if path.is_file():
+                stat = path.stat()
+                parts.append(path.name + ":%d:%d" % (int(stat.st_size), int(stat.st_mtime_ns)))
+            else:
+                parts.append(path.name + ":missing")
+        return "|".join(parts)
+
+    def get_public(self) -> Tuple[Optional[PublicPreferenceScorer], str]:
+        with self._lock:
+            signature = self._signature_for_paths([PUBLIC_PREFERENCE_MODEL, PUBLIC_PREFERENCE_PROTO])
+            if signature != self._public_signature:
+                self._public_signature = signature
+                self._public_scorer = None
+                self._public_error = ""
+                self._public_cache.clear()
+                if PUBLIC_PREFERENCE_MODEL.is_file() and PUBLIC_PREFERENCE_PROTO.is_file():
+                    try:
+                        self._public_scorer = PublicPreferenceScorer(PUBLIC_PREFERENCE_ROOT)
+                    except Exception as exc:
+                        self._public_error = str(exc)
+                        LOGGER.warning("[RECOMMEND] Public FBP could not be loaded: %s", exc)
+                else:
+                    missing = [path.name for path in (PUBLIC_PREFERENCE_MODEL, PUBLIC_PREFERENCE_PROTO) if not path.is_file()]
+                    self._public_error = "Missing: " + ", ".join(missing)
+            return self._public_scorer, self._public_error
+
+    def get_personal(self) -> Tuple[Optional[PersonalPreferenceScorer], str]:
+        with self._lock:
+            signature = self._signature_for_paths([PERSONAL_PREFERENCE_ONNX])
+            if signature != self._personal_signature:
+                self._personal_signature = signature
+                self._personal_scorer = None
+                self._personal_error = ""
+                self._personal_cache.clear()
+                if PERSONAL_PREFERENCE_ONNX.is_file():
+                    try:
+                        self._personal_scorer = PersonalPreferenceScorer(PERSONAL_PREFERENCE_ONNX)
+                    except Exception as exc:
+                        self._personal_error = str(exc)
+                        LOGGER.warning("[RECOMMEND] Personal model could not be loaded: %s", exc)
+                else:
+                    self._personal_error = "Missing: %s" % PERSONAL_PREFERENCE_ONNX.name
+            return self._personal_scorer, self._personal_error
+
+    def backend_status(self) -> Dict[str, Any]:
+        """Report model availability without loading inference backends.
+
+        ping/get_settings are latency-sensitive control-plane calls. Loading a
+        40+ MB Caffe model or an ONNX personal model there made a simple server
+        liveness check unexpectedly expensive. Models are therefore loaded only
+        when a preview recommendation is actually requested.
+        """
+        public_installed = PUBLIC_PREFERENCE_MODEL.is_file() and PUBLIC_PREFERENCE_PROTO.is_file()
+        personal_installed = PERSONAL_PREFERENCE_ONNX.is_file()
+        with self._lock:
+            return {
+                "public": {
+                    "installed": public_installed,
+                    "loaded": self._public_scorer is not None,
+                    "ready": public_installed and not bool(self._public_error),
+                    "label": RECOMMENDATION_LABELS["public"],
+                    "model_path": str(PUBLIC_PREFERENCE_MODEL),
+                    "error": self._public_error,
+                },
+                "personal": {
+                    "installed": personal_installed,
+                    "loaded": self._personal_scorer is not None,
+                    "ready": personal_installed and not bool(self._personal_error),
+                    "label": RECOMMENDATION_LABELS["personal"],
+                    "model_path": str(PERSONAL_PREFERENCE_ONNX),
+                    "meta_path": str(PERSONAL_PREFERENCE_JSON),
+                    "error": self._personal_error,
+                },
+            }
+
+    def _face_cache_key(self, path: Path) -> str:
+        stat = path.stat()
+        return "%s|%d|%d" % (os.path.normcase(os.path.abspath(str(path))), int(stat.st_size), int(stat.st_mtime_ns))
+
+    def score_paths(
+        self, paths: List[Path], need_public: bool, need_personal: bool,
+        cancel_check: Optional[Any] = None,
+    ) -> Tuple[List[Tuple[Optional[float], Optional[float]]], str, str]:
+        """Score cached faces with one model lookup and one decode per cache miss."""
+        public_scorer = None
+        personal_scorer = None
+        public_error = ""
+        personal_error = ""
+        if need_public:
+            public_scorer, public_error = self.get_public()
+        if need_personal:
+            personal_scorer, personal_error = self.get_personal()
+        if public_scorer is None and personal_scorer is None:
+            return [(None, None) for _ in paths], public_error, personal_error
+
+        import numpy as np
+        from PIL import Image
+
+        results: List[Tuple[Optional[float], Optional[float]]] = []
+        for path in paths:
+            if cancel_check is not None:
+                cancel_check()
+            try:
+                key = self._face_cache_key(path)
+            except OSError as exc:
+                LOGGER.warning("[RECOMMEND] Cached face is unavailable: %s", exc)
+                results.append((None, None))
+                continue
+            public_missing = public_scorer is not None and key not in self._public_cache
+            personal_missing = personal_scorer is not None and key not in self._personal_cache
+            if public_missing or personal_missing:
+                try:
+                    with Image.open(path) as source:
+                        full = source.convert("RGB")
+                    public_rgb = None
+                    personal_rgb = None
+                    if public_missing:
+                        # UI face previews are built with a 1.55x context margin.
+                        # Recover the tight square used by the public FBP in
+                        # Photo Select AI without reopening the source image.
+                        width, height = full.size
+                        side = max(1, int(round(min(width, height) / 1.55)))
+                        cx = width * 0.5
+                        cy = height * 0.52
+                        left = max(0, int(round(cx - side * 0.5)))
+                        top = max(0, int(round(cy - side * 0.5)))
+                        right = min(width, left + side)
+                        bottom = min(height, top + side)
+                        tight = full.crop((left, top, right, bottom)).resize((224, 224), Image.Resampling.BICUBIC)
+                        public_rgb = np.array(tight, dtype=np.uint8, copy=True)
+                        tight.close()
+                    if personal_missing:
+                        personal = full.resize((224, 224), Image.Resampling.BICUBIC)
+                        personal_rgb = np.array(personal, dtype=np.uint8, copy=True)
+                        personal.close()
+                    full.close()
+                except Exception as exc:
+                    LOGGER.warning("[RECOMMEND] Could not decode cached face %s: %s", path.name, exc)
+                    if public_missing:
+                        self._public_cache[key] = None
+                    if personal_missing:
+                        self._personal_cache[key] = None
+                else:
+                    if public_missing:
+                        try:
+                            self._public_cache[key] = public_scorer.score_rgb(public_rgb)
+                        except Exception as exc:
+                            LOGGER.warning("[RECOMMEND] Public FBP failed for %s: %s", path.name, exc)
+                            self._public_cache[key] = None
+                    if personal_missing:
+                        try:
+                            self._personal_cache[key] = personal_scorer.score_rgb(personal_rgb)
+                        except Exception as exc:
+                            LOGGER.warning("[RECOMMEND] Personal model failed for %s: %s", path.name, exc)
+                            self._personal_cache[key] = None
+            results.append((
+                self._public_cache.get(key) if public_scorer is not None else None,
+                self._personal_cache.get(key) if personal_scorer is not None else None,
+            ))
+
+        # Keep lazy caches bounded even during very long editing sessions.
+        if len(self._public_cache) > 4096:
+            self._public_cache.clear()
+        if len(self._personal_cache) > 4096:
+            self._personal_cache.clear()
+        return results, public_error, personal_error
+
+
+
+RECOMMENDER = RecommendationRuntime()
+
+
+def _score_candidates_for_recommendation(
+    candidates: List[QueryCandidate], job_id: Optional[str] = None
+) -> Dict[str, Any]:
+    mode = _recommendation_model()
+    info: Dict[str, Any] = {
+        "mode": mode,
+        "requested_mode": mode,
+        "label": RECOMMENDATION_LABELS.get(mode, RECOMMENDATION_LABELS["off"]),
+        "status": "disabled" if mode == "off" else "pending",
+        "message": "",
+        "recommended_index": -1,
+        "effective_mode": "off",
+        "items": [
+            {
+                "public_score": None,
+                "personal_score": None,
+                "effective_score": None,
+                "is_recommended": False,
+                "variant_tag": "",
+            }
+            for _ in candidates
+        ],
+    }
+    if mode == "off" or not candidates:
+        if mode == "off":
+            info["message"] = "Подсветка лучшего дубля отключена в настройках."
+        return info
+
+    need_public = mode in ("public", "combined")
+    need_personal = mode in ("personal", "combined")
+    paths = [Path(candidate.face.preview_master_path) for candidate in candidates]
+    try:
+        scored, public_error, personal_error = RECOMMENDER.score_paths(
+            paths,
+            need_public=need_public,
+            need_personal=need_personal,
+            cancel_check=(lambda: _check_job_cancelled(job_id)) if job_id else None,
+        )
+    except JobCancelled:
+        raise
+    except Exception as exc:
+        LOGGER.warning("[RECOMMEND] Preference scoring failed: %s", exc)
+        scored = [(None, None) for _ in candidates]
+        public_error = str(exc) if need_public else ""
+        personal_error = str(exc) if need_personal else ""
+
+    if not any(public is not None or personal is not None for public, personal in scored):
+        info["status"] = "unavailable"
+        missing_parts: List[str] = []
+        if need_public and public_error:
+            missing_parts.append(RECOMMENDATION_LABELS["public"] + ": " + public_error)
+        if need_personal and personal_error:
+            missing_parts.append(RECOMMENDATION_LABELS["personal"] + ": " + personal_error)
+        info["message"] = "; ".join(missing_parts) or "No recommendation models are available."
+        return info
+
+    any_public = False
+    any_personal = False
+    for index, (public_score, personal_score) in enumerate(scored):
+        item = info["items"][index]
+        if public_score is not None and math.isfinite(public_score):
+            item["public_score"] = float(public_score)
+            any_public = True
+        if personal_score is not None and math.isfinite(personal_score):
+            item["personal_score"] = float(personal_score)
+            any_personal = True
+
+    effective_mode = "off"
+    if mode == "public":
+        effective_mode = "public" if any_public else "off"
+    elif mode == "personal":
+        effective_mode = "personal" if any_personal else "off"
+    elif mode == "combined":
+        if any_public and any_personal:
+            effective_mode = "combined"
+        elif any_public:
+            effective_mode = "public"
+        elif any_personal:
+            effective_mode = "personal"
+
+    best_score = None
+    best_index = -1
+    for index, candidate in enumerate(candidates):
+        item = info["items"][index]
+        public_score = item["public_score"]
+        personal_score = item["personal_score"]
+        effective = None
+        if effective_mode == "public":
+            effective = public_score
+        elif effective_mode == "personal":
+            effective = personal_score
+        elif effective_mode == "combined":
+            parts = [value for value in (public_score, personal_score) if value is not None and math.isfinite(float(value))]
+            if parts:
+                effective = float(sum(parts) / float(len(parts)))
+        item["effective_score"] = effective
+        if effective is None or not math.isfinite(float(effective)):
+            continue
+        candidate_key = (float(effective), float(candidate.similarity), -float(index))
+        if best_score is None or candidate_key > best_score:
+            best_score = candidate_key
+            best_index = index
+
+    info["effective_mode"] = effective_mode
+    info["label"] = RECOMMENDATION_LABELS.get(effective_mode, info["label"])
+    if best_index >= 0:
+        info["recommended_index"] = int(best_index)
+        info["items"][best_index]["is_recommended"] = True
+        info["items"][best_index]["variant_tag"] = "best_" + effective_mode
+        info["status"] = "ok" if effective_mode == mode else "partial"
+        if mode == "combined" and effective_mode in ("public", "personal"):
+            info["message"] = "Комбинированный режим частично недоступен; используется только %s." % RECOMMENDATION_LABELS[effective_mode].lower()
+        elif mode != effective_mode and effective_mode != "off":
+            info["message"] = "Запрошенный режим %s недоступен; используется %s." % (RECOMMENDATION_LABELS[mode], RECOMMENDATION_LABELS[effective_mode])
+        else:
+            info["message"] = "Тонкой зелёной рамкой отмечен лучший дубль по критерию: %s." % RECOMMENDATION_LABELS[effective_mode]
+    else:
+        info["status"] = "unavailable"
+        info["message"] = "Модель(и) загружены, но не удалось получить пригодные оценки для превью."
+    return info
+
+
 class FaceEngine:
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -445,7 +893,13 @@ class FaceEngine:
                 "det_size": self._det_size,
             }
 
-    def _choose_providers(self, ort: Any, recognition_model: Path, mode: str) -> Tuple[List[Any], bool]:
+    def _choose_providers(self, ort: Any, mode: str) -> Tuple[List[Any], bool]:
+        """Choose provider order without constructing a duplicate ONNX session.
+
+        Runtime CUDA failures are already handled by detect_geometry()/recognize()
+        in Auto mode. Building a separate ArcFace InferenceSession here only to
+        probe CUDA loaded the recognition model twice during normal startup.
+        """
         available = list(ort.get_available_providers())
         if mode == "cpu":
             if "CPUExecutionProvider" in available:
@@ -457,26 +911,8 @@ class FaceEngine:
                 dll_dirs = _configure_private_cuda_dll_search_path()
                 if dll_dirs:
                     LOGGER.info("Private CUDA DLL paths enabled: %d", len(dll_dirs))
-                try:
-                    probe = ort.InferenceSession(
-                        str(recognition_model),
-                        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-                    )
-                    active = list(probe.get_providers())
-                    del probe
-                    if active and active[0] == "CUDAExecutionProvider":
-                        LOGGER.info("CUDA provider probe succeeded.")
-                        return ["CUDAExecutionProvider", "CPUExecutionProvider"], False
-                    if mode == "gpu":
-                        raise UserVisibleError("GPU mode was requested, but CUDAExecutionProvider did not activate.")
-                    LOGGER.warning("CUDA provider is registered but did not activate; using CPUExecutionProvider.")
-                except UserVisibleError:
-                    raise
-                except Exception as exc:
-                    if mode == "gpu":
-                        raise UserVisibleError("GPU mode cannot be enabled: %s" % exc) from exc
-                    LOGGER.warning("CUDA provider probe failed; using CPUExecutionProvider: %s", exc)
-            elif mode == "gpu":
+                return ["CUDAExecutionProvider", "CPUExecutionProvider"], False
+            if mode == "gpu":
                 raise UserVisibleError("GPU mode was requested, but CUDAExecutionProvider is not installed/available.")
 
         if "CPUExecutionProvider" in available:
@@ -484,6 +920,29 @@ class FaceEngine:
         if available and mode == "auto":
             return [available[0]], False
         raise UserVisibleError("ONNX Runtime has no usable execution provider.")
+
+    def _critical_models_use_cuda(self, app: Any) -> Optional[bool]:
+        """Return True/False when detector+recognition session providers are inspectable."""
+        models = [getattr(app, "det_model", None)]
+        try:
+            models.append(getattr(app, "models", {}).get("recognition"))
+        except Exception:
+            models.append(None)
+        states: List[bool] = []
+        for model in models:
+            session = getattr(model, "session", None)
+            getter = getattr(session, "get_providers", None)
+            if getter is None:
+                continue
+            try:
+                active = list(getter())
+            except Exception:
+                continue
+            if active:
+                states.append(str(active[0]) == "CUDAExecutionProvider")
+        if not states:
+            return None
+        return all(states)
 
     def _create_app(self, mode: str, det_size: int):
         expected = MODEL_ROOT / "models" / "buffalo_l"
@@ -500,15 +959,38 @@ class FaceEngine:
         except Exception as exc:
             raise UserVisibleError("Python modules are incomplete. Run install.bat. Details: %s" % exc) from exc
 
-        providers, fallback = self._choose_providers(ort, expected / "w600k_r50.onnx", mode)
-        app = FaceAnalysis(
-            name="buffalo_l",
-            root=str(MODEL_ROOT),
-            allowed_modules=["detection", "recognition"],
-            providers=providers,
+        providers, fallback = self._choose_providers(ort, mode)
+        requested_cuda = bool(
+            providers and (providers[0][0] if isinstance(providers[0], tuple) else providers[0]) == "CUDAExecutionProvider"
         )
-        gpu = bool(providers and (providers[0][0] if isinstance(providers[0], tuple) else providers[0]) == "CUDAExecutionProvider")
-        app.prepare(ctx_id=0 if gpu else -1, det_thresh=DET_THRESHOLD, det_size=(det_size, det_size))
+        try:
+            app = FaceAnalysis(
+                name="buffalo_l",
+                root=str(MODEL_ROOT),
+                allowed_modules=["detection", "recognition"],
+                providers=providers,
+            )
+            app.prepare(ctx_id=0 if requested_cuda else -1, det_thresh=DET_THRESHOLD, det_size=(det_size, det_size))
+        except Exception as exc:
+            if mode == "auto" and requested_cuda:
+                LOGGER.warning("InsightFace CUDA initialization failed in Auto mode; retrying on CPU: %s", exc)
+                cpu_providers = ["CPUExecutionProvider"]
+                app = FaceAnalysis(
+                    name="buffalo_l",
+                    root=str(MODEL_ROOT),
+                    allowed_modules=["detection", "recognition"],
+                    providers=cpu_providers,
+                )
+                app.prepare(ctx_id=-1, det_thresh=DET_THRESHOLD, det_size=(det_size, det_size))
+                return app, cpu_providers, True
+            raise
+
+        actual_cuda = self._critical_models_use_cuda(app)
+        if requested_cuda and actual_cuda is False:
+            if mode == "gpu":
+                raise UserVisibleError("GPU mode was requested, but InsightFace activated CPU execution.")
+            fallback = True
+            LOGGER.warning("CUDAExecutionProvider was requested, but InsightFace activated CPU for at least one critical model.")
         return app, providers, fallback
 
     def reconfigure(self, mode: str, det_size: int) -> Dict[str, Any]:
@@ -766,7 +1248,7 @@ def _source_camera_raw_xmp(source_path: Path, photoshop_xmp: str = "") -> Option
     return None
 
 
-def _clone_source_xmp_to_group(source_path: Path, members: Iterable[str], photoshop_xmp: str = "") -> int:
+def _clone_source_xmp_to_group(source_path: Path, members: Iterable[str], photoshop_xmp: str = "", job_id: Optional[str] = None) -> int:
     if not _is_raw_path(source_path):
         return 0
     payload = _source_camera_raw_xmp(source_path, photoshop_xmp)
@@ -775,6 +1257,7 @@ def _clone_source_xmp_to_group(source_path: Path, members: Iterable[str], photos
         return 0
     copied = 0
     for value in members:
+        _check_job_cancelled(job_id)
         candidate = Path(str(value))
         if not candidate.is_file() or _norm_path(str(candidate)) == _norm_path(str(source_path)) or not _is_raw_path(candidate):
             continue
@@ -1162,6 +1645,23 @@ def _preview_variant_path(face: FaceRecord, size: int) -> Path:
     return master.with_name(master.stem + "_%03d.png" % int(size))
 
 
+def _write_recommended_preview(source_path: Path, target_path: Path) -> None:
+    from PIL import Image, ImageDraw
+
+    with Image.open(source_path) as source:
+        preview = source.convert("RGB")
+        draw = ImageDraw.Draw(preview)
+        border = max(RECOMMENDATION_BORDER_MIN_PX, int(round(min(preview.width, preview.height) / 28.0)))
+        for offset in range(border):
+            draw.rectangle(
+                [offset, offset, max(offset, preview.width - 1 - offset), max(offset, preview.height - 1 - offset)],
+                outline=RECOMMENDATION_BORDER_COLOR,
+            )
+        temp = target_path.with_suffix(target_path.suffix + ".tmp")
+        preview.save(temp, format="PNG", compress_level=1)
+        os.replace(str(temp), str(target_path))
+
+
 def _touch_group_cache(index: GroupIndex) -> None:
     cache_id = index.cache_id or _group_cache_id(Path(index.folder), index.members)
     for path in _group_cache_paths(cache_id):
@@ -1186,6 +1686,7 @@ def _cleanup_disk_cache(force: bool = False) -> None:
         if not force and now - LAST_CACHE_CLEANUP < CACHE_CLEANUP_INTERVAL_SECONDS:
             return
         LAST_CACHE_CLEANUP = now
+        ttl_seconds = _cache_ttl_seconds()
         removed = 0
         for path in list(CACHE_DIR.glob(GROUP_CACHE_PREFIX + "*.pickle")) + list(CACHE_DIR.glob("*.tmp")):
             try:
@@ -1199,7 +1700,7 @@ def _cleanup_disk_cache(force: bool = False) -> None:
                             incompatible = int(json.loads(meta.read_text(encoding="utf-8")).get("version") or 0) != CACHE_VERSION
                     except Exception:
                         incompatible = True
-                if not incompatible and age <= _cache_ttl_seconds():
+                if not incompatible and age <= ttl_seconds:
                     continue
                 path.unlink()
                 removed += 1
@@ -1419,8 +1920,44 @@ def _update_job(job_id: str, **values: Any) -> None:
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if job is not None:
+            # Once cancellation is requested, ordinary progress updates must not
+            # turn the job back into a visibly running state.
+            if job.get("cancel_requested") and values.get("status") == "running":
+                values = dict(values)
+                values.pop("status", None)
             job.update(values)
             job["updated_at"] = time.time()
+
+
+def _job_cancel_requested(job_id: Optional[str]) -> bool:
+    if not job_id:
+        return False
+    with JOBS_LOCK:
+        job = JOBS.get(str(job_id))
+        return bool(job and job.get("cancel_requested"))
+
+
+def _check_job_cancelled(job_id: Optional[str]) -> None:
+    if _job_cancel_requested(job_id):
+        raise JobCancelled("Cancelled by user")
+
+
+def _cancel_job(payload: Dict[str, Any]) -> Dict[str, Any]:
+    job_id = str(payload.get("job_id") or "")
+    if not job_id:
+        return {"cancelled": False, "reason": "missing_job_id"}
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            return {"cancelled": False, "reason": "not_found"}
+        if job.get("status") in ("done", "error", "cancelled"):
+            return {"cancelled": False, "reason": "already_finished", "status": job.get("status")}
+        job["cancel_requested"] = True
+        job["status"] = "cancelling"
+        job["text"] = "Отмена..."
+        job["updated_at"] = time.time()
+    LOGGER.info("[JOB] Cancellation requested: %s", job_id)
+    return {"cancelled": True, "job_id": job_id}
 
 
 def _analyze_image_record(path: Path) -> ImageRecord:
@@ -1695,6 +2232,7 @@ def _reference_face_for_group_scan(source_record: ImageRecord, source_path: Path
 
 
 def _build_group_index(folder: Path, source_path: Path, selection: Dict[str, int], doc_width: int, doc_height: int, job_id: Optional[str] = None) -> GroupIndex:
+    _check_job_cancelled(job_id)
     files = _scan_files(folder)
     if not files:
         raise UserVisibleError("No supported image files were found in: %s" % folder)
@@ -1706,6 +2244,7 @@ def _build_group_index(folder: Path, source_path: Path, selection: Dict[str, int
         raise UserVisibleError("The active Photoshop file is not among the supported images in its folder.")
 
     cached = _find_cached_group(source_path, files)
+    _check_job_cancelled(job_id)
     if cached is not None:
         if job_id:
             _update_job(job_id, progress=0.72, status="running", text="Кэш этой группы актуален.")
@@ -1726,6 +2265,7 @@ def _build_group_index(folder: Path, source_path: Path, selection: Dict[str, int
 
         if threads <= 1:
             for completed, path in enumerate(files, start=1):
+                _check_job_cancelled(job_id)
                 try:
                     record = _analyze_image_record(path)
                     records.append(record)
@@ -1735,11 +2275,24 @@ def _build_group_index(folder: Path, source_path: Path, selection: Dict[str, int
                 if job_id:
                     _update_job(job_id, progress=0.03 + (completed / float(total_files)) * 0.69, status="running", text="Анализ всей папки %d/%d: %s" % (completed, len(files), path.name))
         else:
+            # Keep only one small in-flight window instead of submitting the
+            # entire folder. This improves ESC cancellation: pending work is
+            # never queued far ahead, and cancellation stops new submissions.
             completed = 0
-            with ThreadPoolExecutor(max_workers=threads, thread_name_prefix="FolderScan") as pool:
-                future_map = {pool.submit(_analyze_image_record, path): path for path in files}
-                for future in as_completed(future_map):
-                    path = future_map[future]
+            pool = ThreadPoolExecutor(max_workers=threads, thread_name_prefix="FolderScan")
+            future_map: Dict[Any, Path] = {}
+            iterator = iter(files)
+            try:
+                for _ in range(threads):
+                    try:
+                        path = next(iterator)
+                    except StopIteration:
+                        break
+                    future_map[pool.submit(_analyze_image_record, path)] = path
+                while future_map:
+                    _check_job_cancelled(job_id)
+                    future = next(as_completed(list(future_map)))
+                    path = future_map.pop(future)
                     completed += 1
                     try:
                         records.append(future.result())
@@ -1748,6 +2301,20 @@ def _build_group_index(folder: Path, source_path: Path, selection: Dict[str, int
                         LOGGER.warning("[GROUP] Skipping %s: %s", path.name, exc)
                     if job_id:
                         _update_job(job_id, progress=0.03 + (completed / float(total_files)) * 0.69, status="running", text="Анализ всей папки %d/%d: %s" % (completed, len(files), path.name))
+                    _check_job_cancelled(job_id)
+                    try:
+                        next_path = next(iterator)
+                    except StopIteration:
+                        next_path = None
+                    if next_path is not None:
+                        future_map[pool.submit(_analyze_image_record, next_path)] = next_path
+            except JobCancelled:
+                for future in future_map:
+                    future.cancel()
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                pool.shutdown(wait=True)
 
         records.sort(key=lambda item: item.name.casefold())
         if not records:
@@ -1784,6 +2351,7 @@ def _build_group_index(folder: Path, source_path: Path, selection: Dict[str, int
         source_record = _analyze_image_record(source_path)
     except Exception as exc:
         raise UserVisibleError("Could not analyze the active group image %s: %s" % (source_path.name, exc)) from exc
+    _check_job_cancelled(job_id)
 
     anchor_faces = list(source_record.faces)
     selected_reference = _reference_face_for_group_scan(source_record, source_path, selection, doc_width, doc_height)
@@ -1798,6 +2366,7 @@ def _build_group_index(folder: Path, source_path: Path, selection: Dict[str, int
     total = max(1, len(files))
 
     def mark_progress(path: Path, side: str) -> None:
+        _check_job_cancelled(job_id)
         with progress_lock:
             processed[0] += 1
             value = 0.03 + min(1.0, float(processed[0]) / float(total)) * 0.69
@@ -1814,6 +2383,7 @@ def _build_group_index(folder: Path, source_path: Path, selection: Dict[str, int
         consecutive_target_misses = 0
 
         for position in indices:
+            _check_job_cancelled(job_id)
             path = files[position]
             try:
                 record = _analyze_image_record(path)
@@ -1939,6 +2509,8 @@ def _build_group_index(folder: Path, source_path: Path, selection: Dict[str, int
         right_probe=right_probe,
         cache_id=cache_id,
     )
+    _check_job_cancelled(job_id)
+    _check_job_cancelled(job_id)
     _set_active_group_index(index)
     try:
         _save_group_index(index)
@@ -2197,46 +2769,96 @@ def _render_previews(candidates: List[QueryCandidate], job_id: Optional[str] = N
         columns = min(12, count)
         thumb = max(64, min(thumb, 104))
 
+    if job_id:
+        _update_job(job_id, progress=0.90, status="running", text="Оценка лучших дублей...")
+    _check_job_cancelled(job_id)
+    recommendation = _score_candidates_for_recommendation(candidates, job_id=job_id)
+    _check_job_cancelled(job_id)
+    recommended_index = int(recommendation.get("recommended_index", -1))
+    if job_id:
+        _update_job(job_id, progress=0.93, status="running", text="Подготовка превью 0/%d..." % count)
+
     workers = max(1, min(_preview_threads(), count))
-    LOGGER.info("[PREVIEW] Preparing %d cached previews with %d worker(s), size=%d px", count, workers, thumb)
+    LOGGER.info(
+        "[PREVIEW] Preparing %d cached previews with %d worker(s), size=%d px, recommendation=%s/%s",
+        count, workers, thumb, recommendation.get("effective_mode"), recommendation.get("status")
+    )
 
     def prepare_one(index: int, candidate: QueryCandidate) -> Tuple[int, Dict[str, Any]]:
-        path = _preview_variant_path(candidate.face, thumb)
-        if not path.is_file():
+        _check_job_cancelled(job_id)
+        item_recommendation = recommendation["items"][index]
+        variant_tag = str(item_recommendation.get("variant_tag") or "")
+        base_path = _preview_variant_path(candidate.face, thumb)
+        recommended_path = (
+            base_path.with_name(base_path.stem + "_" + variant_tag + base_path.suffix)
+            if variant_tag else None
+        )
+        generated_preview = None
+        if not base_path.is_file():
             master = Path(candidate.face.preview_master_path)
             with Image.open(master) as source:
-                preview = ImageOps.fit(source.convert("RGB"), (thumb, thumb), method=Image.Resampling.LANCZOS)
-                temp = path.with_suffix(path.suffix + ".tmp")
-                # UI variants are small cached files. Low compression is much
-                # faster and has no visual penalty; disk-size difference is tiny.
-                preview.save(temp, format="PNG", compress_level=1)
-                os.replace(str(temp), str(path))
+                generated_preview = ImageOps.fit(source.convert("RGB"), (thumb, thumb), method=Image.Resampling.LANCZOS)
+            temp = base_path.with_suffix(base_path.suffix + ".tmp")
+            # UI variants are small cached files. Low compression is much
+            # faster and has no visual penalty; disk-size difference is tiny.
+            generated_preview.save(temp, format="PNG", compress_level=1)
+            os.replace(str(temp), str(base_path))
+        path = base_path
+        if recommended_path is not None:
+            if not recommended_path.is_file():
+                if generated_preview is not None:
+                    from PIL import ImageDraw
+                    highlighted = generated_preview.copy()
+                    draw = ImageDraw.Draw(highlighted)
+                    border = max(RECOMMENDATION_BORDER_MIN_PX, int(round(min(highlighted.width, highlighted.height) / 28.0)))
+                    for offset in range(border):
+                        draw.rectangle(
+                            [offset, offset, max(offset, highlighted.width - 1 - offset), max(offset, highlighted.height - 1 - offset)],
+                            outline=RECOMMENDATION_BORDER_COLOR,
+                        )
+                    temp = recommended_path.with_suffix(recommended_path.suffix + ".tmp")
+                    highlighted.save(temp, format="PNG", compress_level=1)
+                    os.replace(str(temp), str(recommended_path))
+                    highlighted.close()
+                else:
+                    _write_recommended_preview(base_path, recommended_path)
+            path = recommended_path
+        if generated_preview is not None:
+            generated_preview.close()
         return index, {
             "path": str(path),
             "name": candidate.name,
             "width": int(thumb),
             "height": int(thumb),
+            "is_recommended": bool(item_recommendation.get("is_recommended")),
+            "recommendation_model": str(recommendation.get("effective_mode") or "off"),
+            "recommendation_label": str(recommendation.get("label") or ""),
+            "recommendation_score": item_recommendation.get("effective_score"),
+            "public_score": item_recommendation.get("public_score"),
+            "personal_score": item_recommendation.get("personal_score"),
         }
 
     previews: List[Optional[Dict[str, Any]]] = [None] * count
     completed = 0
     if workers == 1:
         for index, candidate in enumerate(candidates):
+            _check_job_cancelled(job_id)
             result_index, item = prepare_one(index, candidate)
             previews[result_index] = item
             completed += 1
             if job_id:
-                _update_job(job_id, progress=0.90 + (completed / float(max(1, count))) * 0.09,
+                _update_job(job_id, progress=0.93 + (completed / float(max(1, count))) * 0.06,
                             status="running", text="Подготовка превью %d/%d" % (completed, count))
     else:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="Preview") as pool:
             future_map = {pool.submit(prepare_one, index, candidate): index for index, candidate in enumerate(candidates)}
             for future in as_completed(future_map):
+                _check_job_cancelled(job_id)
                 result_index, item = future.result()
                 previews[result_index] = item
                 completed += 1
                 if job_id:
-                    _update_job(job_id, progress=0.90 + (completed / float(max(1, count))) * 0.09,
+                    _update_job(job_id, progress=0.93 + (completed / float(max(1, count))) * 0.06,
                                 status="running", text="Подготовка превью %d/%d" % (completed, count))
 
     result_items = [item for item in previews if item is not None]
@@ -2248,10 +2870,19 @@ def _render_previews(candidates: List[QueryCandidate], job_id: Optional[str] = N
         "thumb_height": int(thumb),
         "columns": int(columns),
         "count": int(count),
+        "recommendation": {
+            "mode": str(recommendation.get("mode") or "off"),
+            "effective_mode": str(recommendation.get("effective_mode") or "off"),
+            "label": str(recommendation.get("label") or ""),
+            "status": str(recommendation.get("status") or "disabled"),
+            "message": str(recommendation.get("message") or ""),
+            "recommended_index": recommended_index,
+        },
     }
 
 
 def _select_child(payload: Dict[str, Any], job_id: Optional[str] = None) -> Dict[str, Any]:
+    _check_job_cancelled(job_id)
     # One selection job owns group-cache rebuild state at a time. Settings
     # updates use the same outer lock so an analysis cannot mix two engine/config
     # revisions midway through a group.
@@ -2273,18 +2904,23 @@ def _select_child(payload: Dict[str, Any], job_id: Optional[str] = None) -> Dict
             raise UserVisibleError("Could not read Photoshop document dimensions.")
 
         index = _build_group_index(folder, source_path, selection, doc_width, doc_height, job_id=job_id)
+        _check_job_cancelled(job_id)
         if _is_raw_path(source_path):
-            cloned_xmp = _clone_source_xmp_to_group(source_path, index.members, str(payload.get("source_xmp") or ""))
+            cloned_xmp = _clone_source_xmp_to_group(
+                source_path, index.members, str(payload.get("source_xmp") or ""), job_id=job_id
+            )
             if cloned_xmp and job_id:
                 _update_job(job_id, progress=0.74, status="running", text="Подготовлены XMP для RAW этой группы: %d" % cloned_xmp)
         if job_id:
             _update_job(job_id, progress=0.78, status="running", text="Поиск выбранного лица...")
+        _check_job_cancelled(job_id)
         reference_image, reference = _choose_reference(index, source_path, selection, doc_width, doc_height)
         ref_emb = reference.embedding
         source_norm = _norm_path(str(source_path))
         candidates: List[QueryCandidate] = []
         below_threshold = 0
         outside_frame = 0
+        match_threshold = _match_threshold()
 
         # Include the active source in the preview list as a visual reference. It is
         # marked non-insertable in JSX, so the target document is never used as its
@@ -2310,6 +2946,7 @@ def _select_child(payload: Dict[str, Any], job_id: Optional[str] = None) -> Dict
         match_images = [image for image in index.images if _norm_path(image.path) != source_norm]
         match_total = max(1, len(match_images))
         for match_pos, image in enumerate(match_images, start=1):
+            _check_job_cancelled(job_id)
             if job_id:
                 _update_job(
                     job_id,
@@ -2324,7 +2961,7 @@ def _select_child(payload: Dict[str, Any], job_id: Optional[str] = None) -> Dict
                 if similarity > best_similarity:
                     best_similarity = similarity
                     best_face = face
-            if best_face is None or best_similarity < _match_threshold():
+            if best_face is None or best_similarity < match_threshold:
                 below_threshold += 1
                 continue
             # Candidate discovery is always translation-only. Optional face-scale
@@ -2375,6 +3012,14 @@ def _select_child(payload: Dict[str, Any], job_id: Optional[str] = None) -> Dict
             [reference_eyes_doc[1][0] - selection["left"], reference_eyes_doc[1][1] - selection["top"]],
         ]
         target_face_dims = _face_scale_dimensions(reference, ref_sx, ref_sy) or (0.0, 0.0)
+        if job_id:
+            _update_job(job_id, progress=0.90, status="running", text="Подготовка превью 0/%d..." % len(candidates))
+        previews = _render_previews(candidates, job_id=job_id)
+        _check_job_cancelled(job_id)
+
+        # Publish a query only after all preview/recommendation work succeeded.
+        # A failed FBP/PNG stage must not leave an unreachable QueryContext in
+        # memory until QUERY_TTL_SECONDS expires.
         query_id = uuid.uuid4().hex
         context = QueryContext(
             created_at=time.time(),
@@ -2385,9 +3030,6 @@ def _select_child(payload: Dict[str, Any], job_id: Optional[str] = None) -> Dict
         )
         with QUERY_LOCK:
             QUERIES[query_id] = context
-        if job_id:
-            _update_job(job_id, progress=0.90, status="running", text="Подготовка превью 0/%d..." % len(candidates))
-        previews = _render_previews(candidates, job_id=job_id)
         return {
             "query_id": query_id,
             "previews": previews,
@@ -2402,7 +3044,7 @@ def _select_child(payload: Dict[str, Any], job_id: Optional[str] = None) -> Dict
             ],
             "skipped_low_similarity": below_threshold,
             "skipped_outside_frame": outside_frame,
-            "threshold": _match_threshold(),
+            "threshold": match_threshold,
             "provider": ENGINE.provider_name(),
         }
 
@@ -2454,6 +3096,125 @@ def _prepare_crop(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+
+def _training_face_asset(candidate: QueryCandidate) -> Dict[str, Any]:
+    """Persist one cached 320px face crop by content hash.
+
+    Content-addressed filenames make datasets from several computers naturally
+    mergeable and deduplicate the same crop without depending on source paths.
+    """
+    master = Path(candidate.face.preview_master_path)
+    if not master.is_file():
+        raise UserVisibleError("Training preview is missing from the group cache. Run the face selection again.")
+    data = master.read_bytes()
+    face_id = hashlib.sha256(data).hexdigest()
+    target = TRAINING_FACES_DIR / (face_id + ".jpg")
+    if target.is_file():
+        if hashlib.sha256(target.read_bytes()).hexdigest() != face_id:
+            raise UserVisibleError("Training face-store hash mismatch: %s" % target.name)
+    else:
+        temp = target.with_suffix(target.suffix + ".tmp")
+        temp.write_bytes(data)
+        os.replace(str(temp), str(target))
+    return {
+        "face_id": face_id,
+        "file": "faces/" + target.name,
+        "source_name": candidate.name,
+        "similarity_to_active": float(candidate.similarity),
+        "is_active": bool(candidate.is_active),
+    }
+
+
+def _record_preference(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Save one explicit user preference after Photoshop insertion succeeded.
+
+    Only ``chosen > current`` is recorded. Other visible candidates are not
+    treated as rejected because the user may not have compared every preview.
+    The query id + selected index form an idempotent event key so a retried API
+    call cannot create a duplicate training event.
+    """
+    # Statistics are controlled only by the persisted Settings value. The
+    # request flag is an additional guard from the JSX snapshot; both must be
+    # explicitly true so a stale/external request cannot enable collection.
+    if not bool(_get_runtime_config().get("collect_statistics", False)):
+        return {"saved": False, "reason": "disabled"}
+    if not _config_bool(payload.get("collect_statistics", False), False):
+        return {"saved": False, "reason": "disabled"}
+
+    query_id = str(payload.get("query_id") or "")
+    selected_index = int(payload.get("selected_index", -1))
+    with QUERY_LOCK:
+        context = QUERIES.get(query_id)
+    if context is None:
+        raise UserVisibleError("The preview set expired before training statistics could be saved.")
+    if selected_index < 0 or selected_index >= len(context.candidates):
+        raise UserVisibleError("Invalid selected preview index for training statistics.")
+
+    chosen = context.candidates[selected_index]
+    if chosen.is_active:
+        raise UserVisibleError("The active/current face cannot be recorded as the chosen replacement.")
+    active_index = next((i for i, item in enumerate(context.candidates) if item.is_active), -1)
+    if active_index < 0:
+        raise UserVisibleError("The current face is missing from the preview context; statistics were not saved.")
+    baseline = context.candidates[active_index]
+
+    event_seed = (query_id + "|" + str(selected_index)).encode("utf-8", "surrogatepass")
+    event_id = hashlib.sha256(event_seed).hexdigest()[:32]
+
+    with TRAINING_DATA_LOCK:
+        TRAINING_EVENTS_DIR.mkdir(parents=True, exist_ok=True)
+        TRAINING_FACES_DIR.mkdir(parents=True, exist_ok=True)
+        baseline_asset = _training_face_asset(baseline)
+        chosen_asset = _training_face_asset(chosen)
+        pair_key = hashlib.sha256(
+            (chosen_asset["face_id"] + ">" + baseline_asset["face_id"]).encode("ascii")
+        ).hexdigest()
+        event = {
+            "schema_version": TRAINING_SCHEMA_VERSION,
+            "event_id": event_id,
+            "pair_key": pair_key,
+            "created_utc": datetime.fromtimestamp(context.created_at, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "collector_id": _load_or_create_collector_id(),
+            "app_version": VERSION,
+            "preference": "chosen_over_current",
+            "chosen": chosen_asset,
+            "current": baseline_asset,
+            "context": {
+                "candidate_count": len(context.candidates),
+                "selected_index": selected_index,
+                "current_index": active_index,
+                "face_scale_match": bool(payload.get("face_scale_match", False)),
+            },
+        }
+        target = TRAINING_EVENTS_DIR / (event_id + ".json")
+        encoded = (json.dumps(event, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        if target.is_file():
+            existing = target.read_bytes()
+            if existing != encoded:
+                raise UserVisibleError("Training event id collision: %s" % event_id)
+            saved = False
+        else:
+            temp = target.with_suffix(target.suffix + ".tmp")
+            temp.write_bytes(encoded)
+            os.replace(str(temp), str(target))
+            saved = True
+
+    LOGGER.info(
+        "[TRAINING] %s event=%s chosen=%s current=%s pair=%s",
+        "Saved" if saved else "Already present",
+        event_id,
+        chosen.name,
+        baseline.name,
+        pair_key[:12],
+    )
+    return {
+        "saved": saved,
+        "event_id": event_id,
+        "pair_key": pair_key,
+        "training_dir": str(TRAINING_DATA_DIR),
+    }
+
+
 def _start_select_job(payload: Dict[str, Any]) -> Dict[str, Any]:
     source = Path(str(payload.get("source_path") or ""))
     if not source.is_file():
@@ -2474,12 +3235,17 @@ def _start_select_job(payload: Dict[str, Any]) -> Dict[str, Any]:
             "text": "Проверка кэша группы...",
             "result": None,
             "error": "",
+            "cancel_requested": False,
         }
 
     def worker() -> None:
         try:
             result = _select_child(payload, job_id=job_id)
+            _check_job_cancelled(job_id)
             _update_job(job_id, status="done", progress=1.0, text="Превью готовы", result=result)
+        except JobCancelled:
+            LOGGER.info("Selection job cancelled: %s", job_id)
+            _update_job(job_id, status="cancelled", progress=1.0, text="Отменено", error="")
         except Exception as exc:
             LOGGER.exception("Selection job failed")
             _update_job(job_id, status="error", progress=1.0, text="Ошибка", error=str(exc))
@@ -2514,7 +3280,7 @@ def _cleanup_old_state() -> None:
             # Never discard an actively running worker merely because one
             # operation took unusually long. Completed/error results expire
             # after the normal TTL and remain retryable until then.
-            if job.get("status") in ("done", "error") and now - float(job.get("updated_at") or 0) > JOB_TTL_SECONDS:
+            if job.get("status") in ("done", "error", "cancelled") and now - float(job.get("updated_at") or 0) > JOB_TTL_SECONDS:
                 JOBS.pop(key, None)
     with QUERY_LOCK:
         for key in list(QUERIES):
@@ -2523,6 +3289,7 @@ def _cleanup_old_state() -> None:
 
 
 def _apply_settings(payload: Dict[str, Any], job_id: Optional[str] = None) -> Dict[str, Any]:
+    _check_job_cancelled(job_id)
     # Settings are an engine+disk transaction. Serialize updates and roll both
     # sides back if persistence or the final consistency check fails.
     with SETTINGS_APPLY_LOCK:
@@ -2561,6 +3328,7 @@ def _apply_settings(payload: Dict[str, Any], job_id: Optional[str] = None) -> Di
                     _update_job(job_id, progress=0.20, status="running", text="Применение режима распознавания...")
                 state_after = ENGINE.reconfigure(str(new_settings.get("compute_mode")), requested_det_size)
                 engine_was_reconfigured = True
+                _check_job_cancelled(job_id)
                 if int(state_after.get("det_size") or 0) != requested_det_size:
                     raise UserVisibleError(
                         "Face engine did not accept detector size %d (active: %s)."
@@ -2572,6 +3340,7 @@ def _apply_settings(payload: Dict[str, Any], job_id: Optional[str] = None) -> Di
             # _save_runtime_config uses atomic replace, but a verification error
             # can happen after the new file reached disk. Mark the config as
             # potentially changed before calling it so rollback covers that case.
+            _check_job_cancelled(job_id)
             config_may_have_changed = True
             saved = _save_runtime_config(new_settings)
             final_state = ENGINE.current_state()
@@ -2619,7 +3388,7 @@ def _apply_settings(payload: Dict[str, Any], job_id: Optional[str] = None) -> Di
             "restart_required": bool(restart_fields),
             "restart_fields": restart_fields,
             "engine": final_state,
-            "applied_now": ["preview_size", "cache_ttl_hours", "match_threshold", "scan_threads", "preview_threads", "compute_mode", "analysis_quality", "group_boundary_search", "face_scale_match"],
+            "applied_now": ["preview_size", "cache_ttl_hours", "match_threshold", "scan_threads", "preview_threads", "compute_mode", "analysis_quality", "group_boundary_search", "face_scale_match", "collect_statistics", "recommendation_model"],
         }
         if job_id:
             _update_job(job_id, progress=0.95, status="running", text="Настройки сохранены.")
@@ -2636,12 +3405,17 @@ def _start_settings_job(payload: Dict[str, Any]) -> Dict[str, Any]:
             "text": "Применение настроек...",
             "result": None,
             "error": "",
+            "cancel_requested": False,
         }
 
     def worker() -> None:
         try:
             result = _apply_settings(payload, job_id=job_id)
+            _check_job_cancelled(job_id)
             _update_job(job_id, status="done", progress=1.0, text="Настройки применены", result=result)
+        except JobCancelled:
+            LOGGER.info("Settings job cancelled: %s", job_id)
+            _update_job(job_id, status="cancelled", progress=1.0, text="Отменено", error="")
         except Exception as exc:
             LOGGER.exception("Settings job failed")
             _update_job(job_id, status="error", progress=1.0, text="Ошибка настроек", error=str(exc))
@@ -2661,6 +3435,7 @@ def _handle_command(payload: Dict[str, Any]) -> Dict[str, Any]:
             "provider": ENGINE.provider_name(),
             "settings": _get_runtime_config(),
             "engine": ENGINE.current_state(),
+            "recommendation_backends": RECOMMENDER.backend_status(),
             "server_root": str(ROOT),
             "run_server_path": str(ROOT / "run_server.bat"),
         })
@@ -2676,6 +3451,7 @@ def _handle_command(payload: Dict[str, Any]) -> Dict[str, Any]:
             "settings_revision": settings_revision,
             "settings": _get_runtime_config(),
             "engine": ENGINE.current_state(),
+            "recommendation_backends": RECOMMENDER.backend_status(),
             "server_root": str(ROOT),
             "run_server_path": str(ROOT / "run_server.bat"),
         })
@@ -2685,8 +3461,12 @@ def _handle_command(payload: Dict[str, Any]) -> Dict[str, Any]:
         return _start_select_job(payload)
     if command == "job_status":
         return _job_status(payload)
+    if command == "cancel_job":
+        return _json_response("answer", _cancel_job(payload))
     if command == "prepare_crop":
         return _json_response("answer", _prepare_crop(payload))
+    if command == "record_preference":
+        return _json_response("answer", _record_preference(payload))
     if command == "release_query":
         query_id = str(payload.get("query_id") or "")
         with QUERY_LOCK:
@@ -2753,6 +3533,8 @@ def main() -> int:
         LOGGER.info("Loading InsightFace buffalo_l... mode=%s, quality=%s, det-size=%d, scan threads=%d", _compute_mode(), _analysis_quality(), _det_size(), _scan_threads())
         ENGINE.prepare()
         LOGGER.info("Supported source formats: %s", ", ".join(sorted(SUPPORTED_EXTENSIONS)))
+        backends = RECOMMENDER.backend_status()
+        LOGGER.info("Recommendation backends: public=%s personal=%s", "ready" if backends.get("public", {}).get("ready") else backends.get("public", {}).get("error") or "missing", "ready" if backends.get("personal", {}).get("ready") else backends.get("personal", {}).get("error") or "missing")
         with ThreadedServer((args.host, args.port), JsonLineHandler) as server:
             LOGGER.info("Server ready: %s:%d", args.host, args.port)
             LOGGER.info("Keep this window open while using the Photoshop JSX script. Ctrl+C stops the server.")

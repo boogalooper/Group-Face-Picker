@@ -1,4 +1,4 @@
-#target photoshop
+﻿#target photoshop
 /*
 // BEGIN__HARVEST_EXCEPTION_ZSTRING
 <javascriptresource>
@@ -17,7 +17,7 @@
 
 var GFP_NAME = "Group Face Picker";
 var GFP_UUID = "9a189321-e07f-40ff-8394-156a4bd48cf5";
-var GFP_VERSION = "0.5.8";
+var GFP_VERSION = "0.6.5";
 var GFP_DEFAULT_HOST = "127.0.0.1";
 var GFP_DEFAULT_PORT_SEND = 6420;
 var GFP_DEFAULT_PORT_LISTEN = 6421;
@@ -29,13 +29,17 @@ var GFP_JOB_TIMEOUT = 60 * 60 * 1000;
 var GFP_PENDING_JOB_ID = "";
 var GFP_PENDING_JOB_RESULT = null;
 var GFP_PENDING_JOB_ERROR = null;
+var GFP_PENDING_JOB_CANCELLED = false;
 var GFP_PENDING_SETTINGS_JOB_ID = "";
 var GFP_PENDING_SETTINGS_RESULT = null;
 var GFP_PENDING_SETTINGS_ERROR = null;
+var GFP_PENDING_SETTINGS_CANCELLED = false;
 var GFP_SETTINGS_APPLY_HOST = "";
 var GFP_SETTINGS_APPLY_PORT = 0;
 var GFP_SERVER_START_OK = false;
 var GFP_SERVER_START_ERROR = "";
+var GFP_SERVER_START_RESPONSE = null;
+var GFP_SERVER_START_CANCELLED = false;
 var GFP_SERVER_START_TIMEOUT = 120000;
 var GFP_LAST_SERVER_LAUNCHER = "";
 var GFP_S2T = stringIDToTypeID;
@@ -88,6 +92,10 @@ function gfpMain() {
 
     try {
         var ping = gfpEnsureServerAvailable();
+        if (GFP_SERVER_START_CANCELLED) {
+            gfpClearSelectionAfterCancel(state);
+            return;
+        }
         if (!ping || ping.type != "answer") {
             var startupDetails = GFP_LAST_SERVER_LAUNCHER ? ("\n\nПроверенный путь автозапуска:\n" + GFP_LAST_SERVER_LAUNCHER) : "";
             if (confirm("Python-сервер не запущен или недоступен по текущему адресу. Автоматический запуск не удался." + startupDetails + "\n\nОткрыть настройки подключения?")) {
@@ -102,8 +110,6 @@ function gfpMain() {
         if (ping.message && ping.message.version && String(ping.message.version) != GFP_VERSION) {
             throw new Error("Версия запущенного Python-сервера (" + String(ping.message.version) + ") не совпадает с версией JSX (" + GFP_VERSION + ").\n\nПерезапустите run_server.bat из этой же папки скрипта. Старый процесс сервера может оставаться запущенным после обновления файлов.");
         }
-
-        gfpRememberServerLauncherFromResponse(ping);
 
         var response = gfpApiRequest({
             command: "select",
@@ -126,10 +132,24 @@ function gfpMain() {
             GFP_PENDING_JOB_ID = String(response.message.job_id || "");
             GFP_PENDING_JOB_RESULT = null;
             GFP_PENDING_JOB_ERROR = null;
+            GFP_PENDING_JOB_CANCELLED = false;
             if (!GFP_PENDING_JOB_ID) {
                 throw new Error("Сервер не вернул идентификатор анализа.");
             }
-            app.doForcedProgress("Подготовка превью лиц", "gfpPollSelectionJob();");
+            try {
+                app.doForcedProgress("Подготовка превью лиц", "gfpPollSelectionJob();");
+            } catch (progressError) {
+                if (gfpIsUserCancelError(progressError)) {
+                    GFP_PENDING_JOB_CANCELLED = true;
+                    gfpCancelServerJob(GFP_PENDING_JOB_ID);
+                } else {
+                    throw progressError;
+                }
+            }
+            if (GFP_PENDING_JOB_CANCELLED) {
+                gfpClearSelectionAfterCancel(state);
+                return;
+            }
             if (GFP_PENDING_JOB_ERROR) {
                 throw new Error(GFP_PENDING_JOB_ERROR);
             }
@@ -163,17 +183,19 @@ function gfpMain() {
         try {
             selectedIndex = gfpShowDialog(payload);
             if (selectedIndex >= 0) {
-                gfpInsertCandidate(payload, selectedIndex);
+                var inserted = gfpInsertCandidate(payload, selectedIndex);
+                if (inserted && payload.collect_statistics === true) {
+                    gfpRecordPreference(payload, selectedIndex);
+                }
             }
         } finally {
             gfpApiFire({ command: "release_query", query_id: payload.query_id });
         }
 
-        // Reading an existing Quick Mask temporarily exits Quick Mask mode so
-        // Photoshop exposes the real selection. If the user cancels, return the
-        // document to the mode it had before the script was launched.
+        // Отмена главного окна всегда оставляет целевой документ в нейтральном
+        // состоянии: обычный режим (не Quick Mask) и без активного выделения.
         if (selectedIndex < 0) {
-            gfpRestoreQuickMaskState(state);
+            gfpClearSelectionAfterCancel(state);
         }
     } catch (mainError) {
         // Любая ошибка после preflight, включая запуск/проверку сервера, не
@@ -192,7 +214,7 @@ function gfpPollSelectionJob() {
             return false;
         }
 
-        var response = gfpApiRequest({ command: "job_status", job_id: GFP_PENDING_JOB_ID }, 8000);
+        var response = gfpApiRequest({ command: "job_status", job_id: GFP_PENDING_JOB_ID }, 1500);
         if (!response) {
             consecutiveNetworkFailures++;
             if (consecutiveNetworkFailures >= 2) {
@@ -211,13 +233,23 @@ function gfpPollSelectionJob() {
 
         var status = response.message || {};
         var progress = Math.max(0, Math.min(1, Number(status.progress) || 0));
-        app.updateProgress(Math.round(progress * 1000), 1000);
-        app.changeProgressText(String(status.text || "Подготовка превью лиц..."));
+        if (!gfpUpdateNativeProgress(Math.round(progress * 1000), 1000, String(status.text || "Подготовка превью лиц..."))) {
+            GFP_PENDING_JOB_CANCELLED = true;
+            gfpCancelServerJob(GFP_PENDING_JOB_ID);
+            return false;
+        }
 
         if (status.status == "done") {
+            if (!gfpUpdateNativeProgress(1000, 1000, "Превью готовы.")) {
+                GFP_PENDING_JOB_CANCELLED = true;
+                return false;
+            }
             GFP_PENDING_JOB_RESULT = status.result;
-            app.updateProgress(1000, 1000);
             return true;
+        }
+        if (status.status == "cancelled" || status.status == "cancelling") {
+            GFP_PENDING_JOB_CANCELLED = true;
+            return false;
         }
         if (status.status == "error") {
             GFP_PENDING_JOB_ERROR = String(status.error || "Ошибка анализа.");
@@ -368,6 +400,28 @@ function gfpRestoreQuickMaskState(state) {
     }
 }
 
+function gfpClearSelectionAfterCancel(state) {
+    if (!state) {
+        return;
+    }
+    try {
+        var target = gfpSelectDocumentById(state.documentId);
+        app.activeDocument = target;
+
+        // На момент показа главного окна Quick Mask обычно уже временно снята
+        // gfpReadPhotoshopState(). Проверяем состояние повторно на случай, если
+        // пользователь включил её вручную, пока окно скрипта было открыто.
+        if (gfpGetBooleanDocumentProperty("quickMask")) {
+            gfpQuickMask("clearEvent");
+        }
+
+        target.selection.deselect();
+    } catch (e) {
+        // Отмена не должна порождать вторичную ошибку, если документ успели
+        // закрыть или изменить его состояние во время показа окна.
+    }
+}
+
 function gfpShowDialog(payload) {
     var items = payload.previews && payload.previews.items ? payload.previews.items : [];
     if (!items.length || items.length != payload.matches.length) {
@@ -378,6 +432,7 @@ function gfpShowDialog(payload) {
     var lastClickIndex = -1;
     var lastClickTime = 0;
     var previewButtons = [];
+    var recommendation = payload.previews && payload.previews.recommendation ? payload.previews.recommendation : {};
     var columns = Math.max(1, Number(payload.previews.columns) || 1);
     var thumbWidth = Math.max(32, Number(payload.previews.thumb_width) || 96);
     var buttonSize = thumbWidth + 8;
@@ -395,7 +450,7 @@ function gfpShowDialog(payload) {
     topRow.spacing = 8;
 
     var header = topRow.add("statictext");
-    header.text = "Найдено кадров: " + String(items.length);
+    header.text = "Найдено кадров: " + String(items.length) + (recommendation && recommendation.status == "ok" && recommendation.label ? " · " + String(recommendation.label) : "");
     header.preferredSize = [Math.max(260, contentWidth - 120), 20];
 
     var settingsButton = topRow.add("button", undefined, "⚙");
@@ -445,21 +500,50 @@ function gfpShowDialog(payload) {
         previewButton.maximumSize = previewButton.preferredSize;
         var similarity = Number(matchInfo.similarity);
         var similarityText = isFinite(similarity) ? similarity.toFixed(3) : "—";
-        previewButton.helpTip = String(matchInfo.name || items[i].name || "") + "\nСходство: " + similarityText + (isActiveFile ? "\nТекущий открытый файл" : "");
+        var isRecommended = items[i].is_recommended === true;
+        var recommendationLabel = String(items[i].recommendation_label || recommendation.label || "");
+        var fullFileName = String(matchInfo.name || items[i].name || "");
+        var displayFileName = fullFileName.replace(/^.*[\\\/]/, "");
+        var extensionPos = displayFileName.lastIndexOf(".");
+        if (extensionPos > 0) {
+            displayFileName = displayFileName.substring(0, extensionPos);
+        }
+        if (displayFileName.length > 16) {
+            displayFileName = displayFileName.substring(0, 16);
+        }
+        if (!displayFileName.length) {
+            displayFileName = "—";
+        }
+        previewButton.helpTip = fullFileName + "\nСходство: " + similarityText + (isActiveFile ? "\nТекущий открытый файл" : "") + (isRecommended ? "\nРекомендовано: " + recommendationLabel : "");
         previewButton.gfpIndex = i;
         previewButton.onClick = function () {
             gfpHandlePreviewClick(Number(this.gfpIndex));
         };
 
-        var previewCaption = isActiveFile ? ("ТЕКУЩИЙ · " + similarityText) : similarityText;
-        var activeLabel = cell.add("statictext", undefined, previewCaption);
+        var similarityCaption = isActiveFile ? ("ТЕКУЩИЙ · " + similarityText) : similarityText;
+        if (isRecommended) {
+            similarityCaption = "ЛУЧШИЙ · " + similarityCaption;
+        }
+        var previewCaption = displayFileName + "\n" + similarityCaption;
+        var activeLabel = cell.add("statictext", undefined, previewCaption, { multiline: true });
         activeLabel.justify = "center";
         activeLabel.helpTip = previewButton.helpTip;
-        activeLabel.preferredSize = [buttonSize, 16];
+        activeLabel.preferredSize = [buttonSize, 32];
+        if (isRecommended) {
+            try {
+                var greenBrush = activeLabel.graphics.newBrush(activeLabel.graphics.BrushType.SOLID_COLOR, [0.12, 0.55, 0.18, 1]);
+                activeLabel.graphics.foregroundColor = greenBrush;
+            } catch (brushError) {
+            }
+        }
         previewButtons.push(previewButton);
     }
 
-    var status = w.add("statictext", undefined, "Выберите превью. Второй быстрый клик по выбранному кадру — вставить.", { multiline: true });
+    var defaultStatus = "Выберите превью. Второй быстрый клик по выбранному кадру — вставить.";
+    if (recommendation && recommendation.message) {
+        defaultStatus = recommendation.message + "\n" + defaultStatus;
+    }
+    var status = w.add("statictext", undefined, defaultStatus, { multiline: true });
     status.preferredSize = [contentWidth, 34];
 
     var buttons = w.add("group");
@@ -476,7 +560,7 @@ function gfpShowDialog(payload) {
         if (index < 0 || index >= payload.matches.length) {
             selectedIndex = -1;
             insertButton.enabled = false;
-            status.text = "Выберите превью. Второй быстрый клик по выбранному кадру — вставить.";
+            status.text = defaultStatus;
             w.update();
             return;
         }
@@ -521,13 +605,17 @@ function gfpShowDialog(payload) {
     };
     settingsButton.onClick = function () {
         if (gfpShowSettingsDialog()) {
-            status.text = "Настройки сохранены. Параметры вставки применяются сразу к текущему набору превью.";
+            status.text = "Настройки сохранены. Для обновления подсветки лучшего дубля перезапустите текущий поиск лица.";
             w.update();
         }
     };
 
     w.center();
     var dialogResult = w.show();
+    // Statistics collection is configured only in the Settings dialog.
+    // Snapshot the persisted setting into this query result; the preview
+    // window itself intentionally has no control that can change it.
+    payload.collect_statistics = GFP_SETTINGS.collect_statistics === true;
     for (var ci = 0; ci < previewButtons.length; ci++) {
         try {
             previewButtons[ci].image = null;
@@ -541,9 +629,28 @@ function gfpShowDialog(payload) {
     return selectedIndex;
 }
 
+function gfpRecordPreference(payload, index) {
+    try {
+        var response = gfpApiRequest({
+            command: "record_preference",
+            query_id: payload.query_id,
+            selected_index: index,
+            collect_statistics: payload.collect_statistics === true,
+            face_scale_match: GFP_SETTINGS.face_scale_match === true
+        }, 5000);
+        if (!response || response.type != "answer") {
+            throw new Error(response && response.message ? String(response.message) : "Python-сервер не подтвердил запись.");
+        }
+        return true;
+    } catch (e) {
+        alert("Лицо успешно вставлено, но статистика для обучения не была сохранена.\n\n" + gfpErrorText(e), GFP_NAME, true);
+        return false;
+    }
+}
+
 function gfpInsertCandidate(payload, index) {
     if (index < 0 || index >= payload.matches.length) {
-        return;
+        return false;
     }
 
     var targetHistory = null;
@@ -740,6 +847,7 @@ function gfpInsertCandidate(payload, index) {
             target.activeLayer = insertedLayer;
             gfpMakeSelectionMask();
         }
+        return true;
     } catch (insertError) {
         try {
             if (sourceDocument) {
@@ -888,15 +996,45 @@ function gfpApiRequestTo(host, port, payload, timeout) {
 }
 
 function gfpApiFire(payload) {
+    gfpApiFireTo(GFP_API_HOST, GFP_API_PORT_SEND, payload);
+}
+
+function gfpApiFireTo(host, port, payload) {
     try {
         payload.no_reply = true;
         var sender = new Socket();
-        if (sender.open(GFP_API_HOST + ":" + GFP_API_PORT_SEND, "UTF-8")) {
+        if (sender.open(String(host) + ":" + String(port), "UTF-8")) {
             sender.writeln(gfpObjectToJSON(payload));
             sender.close();
         }
     } catch (e) {
     }
+}
+
+function gfpIsUserCancelError(error) {
+    try {
+        if (Number(error.number) == 8007) return true;
+    } catch (_) {
+    }
+    var text = gfpErrorText(error).toLowerCase();
+    return text.indexOf("cancel") >= 0 || text.indexOf("отмен") >= 0;
+}
+
+function gfpUpdateNativeProgress(done, total, text) {
+    if (text !== undefined && text !== null && String(text).length) {
+        app.changeProgressText(String(text));
+    }
+    try {
+        return app.updateProgress(Number(done), Number(total)) !== false;
+    } catch (e) {
+        if (gfpIsUserCancelError(e)) return false;
+        throw e;
+    }
+}
+
+function gfpCancelServerJob(jobId, host, port) {
+    if (!jobId) return;
+    gfpApiFireTo(host || GFP_API_HOST, port || GFP_API_PORT_SEND, { command: "cancel_job", job_id: String(jobId) });
 }
 
 
@@ -1059,24 +1197,24 @@ function gfpEnsureServerAvailable() {
 
     GFP_SERVER_START_OK = false;
     GFP_SERVER_START_ERROR = "";
+    GFP_SERVER_START_RESPONSE = null;
+    GFP_SERVER_START_CANCELLED = false;
     try {
         app.doForcedProgress("Запуск Group Face Picker server", "gfpPollServerStartup();");
     } catch (progressError) {
-        GFP_SERVER_START_ERROR = gfpErrorText(progressError);
+        if (gfpIsUserCancelError(progressError)) {
+            GFP_SERVER_START_CANCELLED = true;
+        } else {
+            GFP_SERVER_START_ERROR = gfpErrorText(progressError);
+        }
     }
     if (!GFP_SERVER_START_OK) {
         return null;
     }
-    try {
-        ping = gfpApiRequest({ command: "ping" }, 3000);
-    } catch (finalPingError) {
-        ping = null;
-    }
-    if (ping && ping.type == "answer") {
-        gfpRememberServerLauncherFromResponse(ping);
-        return ping;
-    }
-    return null;
+    // gfpPollServerStartup already received a successful ping. Reuse that
+    // exact response instead of immediately issuing the same network request
+    // a second time.
+    return GFP_SERVER_START_RESPONSE;
 }
 
 function gfpPollServerStartup() {
@@ -1095,15 +1233,23 @@ function gfpPollServerStartup() {
             ping = null;
         }
         if (ping && ping.type == "answer") {
-            GFP_SERVER_START_OK = true;
+            // The server is already verified at this point. Remember its launcher
+            // even if the user presses Esc on the final progress update.
             gfpRememberServerLauncherFromResponse(ping);
-            app.updateProgress(1000, 1000);
-            app.changeProgressText("Python-сервер готов.");
+            if (!gfpUpdateNativeProgress(1000, 1000, "Python-сервер готов.")) {
+                GFP_SERVER_START_CANCELLED = true;
+                return false;
+            }
+            GFP_SERVER_START_OK = true;
+            GFP_SERVER_START_RESPONSE = ping;
             return true;
         }
         var progress = Math.min(950, Math.round((elapsed / GFP_SERVER_START_TIMEOUT) * 950));
-        app.updateProgress(progress, 1000);
-        app.changeProgressText("Ожидание запуска Python-сервера...");
+        if (!gfpUpdateNativeProgress(progress, 1000, "Ожидание запуска Python-сервера...")) {
+            GFP_SERVER_START_CANCELLED = true;
+            GFP_SERVER_START_ERROR = "";
+            return false;
+        }
         $.sleep(350);
     }
 }
@@ -1120,7 +1266,9 @@ function gfpDefaultConfig() {
         preview_threads: 2,
         analysis_quality: "balanced",
         group_boundary_search: false,
-        face_scale_match: false
+        face_scale_match: false,
+        collect_statistics: false,
+        recommendation_model: "public"
     };
 }
 
@@ -1213,6 +1361,11 @@ function gfpNormalizeConfig(raw) {
     }
     cfg.group_boundary_search = gfpBooleanValue(cfg.group_boundary_search, false);
     cfg.face_scale_match = gfpBooleanValue(cfg.face_scale_match, false);
+    cfg.collect_statistics = gfpBooleanValue(cfg.collect_statistics, false);
+    cfg.recommendation_model = gfpTrimString(cfg.recommendation_model || "public").toLowerCase();
+    if (cfg.recommendation_model != "off" && cfg.recommendation_model != "public" && cfg.recommendation_model != "personal" && cfg.recommendation_model != "combined") {
+        cfg.recommendation_model = "public";
+    }
     return cfg;
 }
 
@@ -1376,6 +1529,7 @@ function gfpShowSettingsDialog() {
     var oldHost = GFP_API_HOST;
     var oldPort = GFP_API_PORT_SEND;
     var liveEngine = null;
+    var liveRecommendationBackends = null;
     try {
         var live = gfpApiRequestTo(oldHost, oldPort, { command: "get_settings" }, 3000);
         if (live && live.type == "answer" && live.message && live.message.settings) {
@@ -1384,15 +1538,22 @@ function gfpShowSettingsDialog() {
                 throw new Error("Запущен Python-сервер версии " + String(live.message.version) + ", а JSX имеет версию " + GFP_VERSION + ". Перезапустите run_server.bat перед изменением настроек.");
             }
             var serverSettings = gfpNormalizeConfig(live.message.settings);
+            // Statistics collection is a Photoshop-side opt-in shown only in
+            // this Settings dialog. Preserve the local value while importing
+            // the other live server settings; Save synchronizes it back.
+            serverSettings.collect_statistics = localCurrent.collect_statistics === true;
             current = gfpNormalizeConfig(serverSettings);
             liveEngine = live.message.engine || null;
+            liveRecommendationBackends = live.message.recommendation_backends || null;
             // Сервер является источником истины для рабочих параметров, но адрес,
             // по которому Photoshop уже успешно к нему подключился, остаётся
             // клиентским endpoint. Это важно для удалённого сервера, который
             // может слушать 0.0.0.0, а Photoshop подключается к его LAN-IP.
             current.server_host = localCurrent.server_host;
             current.server_port = localCurrent.server_port;
-            gfpSaveConfig(current);
+            // Synchronize live server-controlled values in memory, but do not
+            // rewrite the client config merely because Settings was opened.
+            // Persist only after Save; Cancel stays disk-I/O free.
             gfpApplyConfig(current);
             oldHost = GFP_API_HOST;
             oldPort = GFP_API_PORT_SEND;
@@ -1556,6 +1717,37 @@ function gfpShowSettingsDialog() {
         { multiline: true });
     faceScaleHint.preferredSize = [470, 34];
 
+    var chCollectStatistics = insertPanel.add("checkbox", undefined, "Собирать статистику для обучения");
+    chCollectStatistics.value = current.collect_statistics === true;
+    chCollectStatistics.helpTip = "После успешной вставки сохраняется только пара: выбранное лицо > текущее лицо. Данные находятся в training_data рядом с Python-сервером и объединяются через merge_training_data.bat.";
+    var recommendationRow = insertPanel.add("group");
+    recommendationRow.orientation = "row";
+    recommendationRow.alignChildren = ["left", "center"];
+    var recommendationLabel = recommendationRow.add("statictext", undefined, "Подсветка лучшего дубля");
+    recommendationLabel.preferredSize = [230, 20];
+    var dlRecommendation = recommendationRow.add("dropdownlist", undefined);
+    dlRecommendation.preferredSize = [220, 24];
+    gfpPopulateValueDropdown(dlRecommendation, [
+        { label: "Отключено", value: "off" },
+        { label: "Публичная FBP", value: "public" },
+        { label: "Моя обученная модель", value: "personal" },
+        { label: "Публичная FBP + моя модель", value: "combined" }
+    ]);
+    gfpRestoreValueDropdown(dlRecommendation, current.recommendation_model, "public");
+    var recommendationHint = insertPanel.add("statictext", undefined,
+        "Тонкая зелёная рамка показывает один рекомендованный дубль. Публичная FBP оценивает удачность портрета, а личная модель может использовать ваш накопленный выбор.",
+        { multiline: true });
+    recommendationHint.preferredSize = [470, 34];
+    var recommendationStatusText = "Публичная FBP: нужен install.bat. Личная модель: положите personal_preference.onnx в папку personal_model рядом с Python-сервером.";
+    if (liveRecommendationBackends) {
+        var publicState = liveRecommendationBackends.public || {};
+        var personalState = liveRecommendationBackends.personal || {};
+        recommendationStatusText = "Публичная FBP: " + (publicState.loaded ? "загружена" : (publicState.installed ? "установлена; загрузится при первом поиске" : "не установлена")) +
+            "; личная модель: " + (personalState.loaded ? "загружена" : (personalState.installed ? "установлена; загрузится при первом поиске" : "не найдена"));
+    }
+    var recommendationStatus = insertPanel.add("statictext", undefined, recommendationStatusText, { multiline: true });
+    recommendationStatus.preferredSize = [470, 32];
+
     var cachePanel = w.add("panel", undefined, "Кэш и поиск");
     cachePanel.orientation = "column";
     cachePanel.alignChildren = ["fill", "top"];
@@ -1613,7 +1805,9 @@ function gfpShowSettingsDialog() {
             preview_threads: Number(slPreviewThreads.value),
             analysis_quality: selectedAnalysisQuality,
             group_boundary_search: chGroupBoundarySearch.value === true,
-            face_scale_match: chFaceScaleMatch.value === true
+            face_scale_match: chFaceScaleMatch.value === true,
+            collect_statistics: chCollectStatistics.value === true,
+            recommendation_model: gfpReadValueDropdown(dlRecommendation, current.recommendation_model || "public")
         });
         w.close(1);
     };
@@ -1659,7 +1853,20 @@ function gfpShowSettingsDialog() {
             serverResponse = gfpApiRequestTo(oldHost, oldPort, { command: "set_settings", settings: configForServer }, 10000);
             if (serverResponse && serverResponse.type == "job" && serverResponse.message && serverResponse.message.job_id) {
                 GFP_PENDING_SETTINGS_JOB_ID = String(serverResponse.message.job_id);
-                app.doForcedProgress("Применение настроек Group Face Picker", "gfpPollSettingsJob();");
+                GFP_PENDING_SETTINGS_CANCELLED = false;
+                try {
+                    app.doForcedProgress("Применение настроек Group Face Picker", "gfpPollSettingsJob();");
+                } catch (progressError) {
+                    if (gfpIsUserCancelError(progressError)) {
+                        GFP_PENDING_SETTINGS_CANCELLED = true;
+                        gfpCancelServerJob(GFP_PENDING_SETTINGS_JOB_ID, oldHost, oldPort);
+                    } else {
+                        throw progressError;
+                    }
+                }
+                if (GFP_PENDING_SETTINGS_CANCELLED) {
+                    return false;
+                }
                 if (GFP_PENDING_SETTINGS_ERROR) {
                     // Если сервер отклонил изменение (например, принудительный
                     // GPU недоступен), возвращаем локальный JSON к реально
@@ -1740,16 +1947,17 @@ function gfpShowSettingsDialog() {
     var offlineConfig = gfpLoadConfig();
     offlineConfig.server_host = resultConfig.server_host;
     offlineConfig.server_port = resultConfig.server_port;
+    offlineConfig.collect_statistics = resultConfig.collect_statistics === true;
     gfpSaveConfig(offlineConfig);
     gfpApplyConfig(offlineConfig);
-    alert("Python-сервер сейчас недоступен. Сохранены только адрес и порт подключения Photoshop.\n\nОстальные параметры не изменены: откройте настройки после восстановления соединения и сохраните их на работающем сервере.", GFP_NAME, true);
+    alert("Python-сервер сейчас недоступен. Сохранены адрес/порт подключения Photoshop и локальная галочка сбора статистики.\n\nОстальные параметры не изменены: откройте настройки после восстановления соединения и сохраните их на работающем сервере.", GFP_NAME, true);
     return true;
 }
 
 function gfpSameConfigValues(a, b) {
     var left = gfpNormalizeConfig(a);
     var right = gfpNormalizeConfig(b);
-    var keys = ["server_host", "server_port", "preview_size", "cache_ttl_hours", "match_threshold", "compute_mode", "scan_threads", "preview_threads", "analysis_quality", "group_boundary_search", "face_scale_match"];
+    var keys = ["server_host", "server_port", "preview_size", "cache_ttl_hours", "match_threshold", "compute_mode", "scan_threads", "preview_threads", "analysis_quality", "group_boundary_search", "face_scale_match", "collect_statistics", "recommendation_model"];
     for (var i = 0; i < keys.length; i++) {
         var key = keys[i];
         if (String(left[key]) != String(right[key])) {
@@ -1768,7 +1976,7 @@ function gfpPollSettingsJob() {
             return false;
         }
         var response = gfpApiRequestTo(GFP_SETTINGS_APPLY_HOST, GFP_SETTINGS_APPLY_PORT,
-            { command: "job_status", job_id: GFP_PENDING_SETTINGS_JOB_ID }, 8000);
+            { command: "job_status", job_id: GFP_PENDING_SETTINGS_JOB_ID }, 1500);
         if (!response) {
             consecutiveNetworkFailures++;
             if (consecutiveNetworkFailures >= 2) {
@@ -1786,12 +1994,22 @@ function gfpPollSettingsJob() {
         }
         var status = response.message || {};
         var progress = Math.max(0, Math.min(1, Number(status.progress) || 0));
-        app.updateProgress(Math.round(progress * 1000), 1000);
-        app.changeProgressText(String(status.text || "Применение настроек..."));
+        if (!gfpUpdateNativeProgress(Math.round(progress * 1000), 1000, String(status.text || "Применение настроек..."))) {
+            GFP_PENDING_SETTINGS_CANCELLED = true;
+            gfpCancelServerJob(GFP_PENDING_SETTINGS_JOB_ID, GFP_SETTINGS_APPLY_HOST, GFP_SETTINGS_APPLY_PORT);
+            return false;
+        }
         if (status.status == "done") {
+            if (!gfpUpdateNativeProgress(1000, 1000, "Настройки применены.")) {
+                GFP_PENDING_SETTINGS_CANCELLED = true;
+                return false;
+            }
             GFP_PENDING_SETTINGS_RESULT = status.result;
-            app.updateProgress(1000, 1000);
             return true;
+        }
+        if (status.status == "cancelled" || status.status == "cancelling") {
+            GFP_PENDING_SETTINGS_CANCELLED = true;
+            return false;
         }
         if (status.status == "error") {
             GFP_PENDING_SETTINGS_ERROR = String(status.error || "Ошибка применения настроек.");

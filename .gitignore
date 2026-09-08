@@ -8,3 +8,11 @@ models/insightface/*
 !runtime/.gitkeep
 !models/.gitkeep
 gfp_config.json
+training_data/events/*
+training_data/faces/*
+!training_data/README.txt
+
+training_data/collector.json
+runtime/training_venv/*
+models/torch/*
+personal_model/*
