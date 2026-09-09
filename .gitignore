@@ -5,6 +5,8 @@ runtime/python/*
 runtime/uv/*
 runtime/downloads/*
 models/insightface/*
+models/portrait_preference/
+models/portrait_preference_backup/
 !runtime/.gitkeep
 !models/.gitkeep
 gfp_config.json

@@ -8,6 +8,7 @@ import math
 from io import BytesIO
 import os
 import pickle
+import re
 import shutil
 import socket
 import socketserver
@@ -23,13 +24,14 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 APP_NAME = "Group Face Picker"
-VERSION = "0.6.5"
-SETTINGS_SCHEMA_VERSION = 8
+VERSION = "0.6.7"
+SETTINGS_SCHEMA_VERSION = 9
 SERVER_INSTANCE_ID = uuid.uuid4().hex[:12]
-CACHE_VERSION = 12
+CACHE_VERSION = 13
 QUERY_TTL_SECONDS = 30 * 60
 JOB_TTL_SECONDS = 15 * 60
 CACHE_CLEANUP_INTERVAL_SECONDS = 15 * 60
+STATE_CLEANUP_INTERVAL_SECONDS = 60
 DEFAULT_CACHE_TTL_HOURS = 48
 DEFAULT_MATCH_THRESHOLD = 0.28
 DEFAULT_PREVIEW_SIZE = 96
@@ -40,8 +42,6 @@ DEFAULT_SCAN_THREADS = 2
 DEFAULT_PREVIEW_THREADS = 2
 DEFAULT_ANALYSIS_QUALITY = "balanced"
 DEFAULT_GROUP_BOUNDARY_SEARCH = False
-DEFAULT_FACE_SCALE_MATCH = False
-DEFAULT_COLLECT_STATISTICS = False
 DEFAULT_RECOMMENDATION_MODEL = "public"
 ANALYSIS_DET_SIZES = {"fast": 640, "balanced": 800, "accurate": 1024}
 DET_THRESHOLD = 0.22
@@ -138,8 +138,6 @@ DEFAULT_CONFIG = {
     "preview_threads": DEFAULT_PREVIEW_THREADS,
     "analysis_quality": DEFAULT_ANALYSIS_QUALITY,
     "group_boundary_search": DEFAULT_GROUP_BOUNDARY_SEARCH,
-    "face_scale_match": DEFAULT_FACE_SCALE_MATCH,
-    "collect_statistics": DEFAULT_COLLECT_STATISTICS,
     "recommendation_model": DEFAULT_RECOMMENDATION_MODEL,
 }
 LOGGER = logging.getLogger(APP_NAME)
@@ -229,8 +227,6 @@ def _config_with_defaults(data: Optional[Dict[str, Any]] = None) -> Dict[str, An
     if analysis_quality not in ANALYSIS_DET_SIZES:
         analysis_quality = DEFAULT_ANALYSIS_QUALITY
     group_boundary_search = _config_bool(raw.get("group_boundary_search", DEFAULT_GROUP_BOUNDARY_SEARCH), DEFAULT_GROUP_BOUNDARY_SEARCH)
-    face_scale_match = _config_bool(raw.get("face_scale_match", DEFAULT_FACE_SCALE_MATCH), DEFAULT_FACE_SCALE_MATCH)
-    collect_statistics = _config_bool(raw.get("collect_statistics", DEFAULT_COLLECT_STATISTICS), DEFAULT_COLLECT_STATISTICS)
     recommendation_model = str(raw.get("recommendation_model") or DEFAULT_RECOMMENDATION_MODEL).strip().lower()
     if recommendation_model not in RECOMMENDATION_MODEL_VALUES:
         recommendation_model = DEFAULT_RECOMMENDATION_MODEL
@@ -245,8 +241,6 @@ def _config_with_defaults(data: Optional[Dict[str, Any]] = None) -> Dict[str, An
         "preview_threads": preview_threads,
         "analysis_quality": analysis_quality,
         "group_boundary_search": group_boundary_search,
-        "face_scale_match": face_scale_match,
-        "collect_statistics": collect_statistics,
         "recommendation_model": recommendation_model,
     }
 
@@ -337,10 +331,6 @@ def _det_size() -> int:
 
 def _group_boundary_search() -> bool:
     return bool(_get_runtime_config().get("group_boundary_search", DEFAULT_GROUP_BOUNDARY_SEARCH))
-
-
-def _face_scale_match() -> bool:
-    return bool(_get_runtime_config().get("face_scale_match", DEFAULT_FACE_SCALE_MATCH))
 
 
 def _analysis_signature() -> str:
@@ -533,15 +523,34 @@ class PersonalPreferenceScorer:
         self.input_name = str(inputs[0].name or "image")
 
     def score_rgb(self, rgb: Any) -> Optional[float]:
+        scores = self.score_batch_rgb([rgb])
+        return scores[0] if scores else None
+
+    def score_batch_rgb(self, images: List[Any]) -> List[Optional[float]]:
+        """Score several 224x224 RGB crops in one ONNX Runtime call.
+
+        The trainer exports a dynamic batch axis, so batching removes one Python
+        -> ORT boundary per preview without changing model math.
+        """
         import numpy as np
 
-        arr = np.asarray(rgb, dtype=np.float32) / 255.0
-        nchw = np.transpose(arr, (2, 0, 1))[None, ...]
-        output = self.session.run(None, {self.input_name: nchw})[0]
-        score = float(output.reshape(-1)[0])
-        if not math.isfinite(score):
-            return None
-        return max(0.0, min(1.0, score))
+        if not images:
+            return []
+        rows = []
+        for rgb in images:
+            arr = np.asarray(rgb, dtype=np.float32) / 255.0
+            rows.append(np.transpose(arr, (2, 0, 1)))
+        batch = np.stack(rows, axis=0)
+        output = np.asarray(self.session.run(None, {self.input_name: batch})[0], dtype=np.float32).reshape(-1)
+        if output.size != len(images):
+            raise RuntimeError(
+                "Personal preference model returned %d scores for batch of %d" % (output.size, len(images))
+            )
+        result: List[Optional[float]] = []
+        for value in output:
+            score = float(value)
+            result.append(max(0.0, min(1.0, score)) if math.isfinite(score) else None)
+        return result
 
 
 class RecommendationRuntime:
@@ -642,7 +651,14 @@ class RecommendationRuntime:
         self, paths: List[Path], need_public: bool, need_personal: bool,
         cancel_check: Optional[Any] = None,
     ) -> Tuple[List[Tuple[Optional[float], Optional[float]]], str, str]:
-        """Score cached faces with one model lookup and one decode per cache miss."""
+        """Score cached faces with one decode per cache miss.
+
+        Public Caffe inference remains one-image-at-a-time because the upstream
+        deploy prototxt has a fixed batch dimension of 1. The personal ONNX
+        model is exported with a dynamic batch axis, so all newly decoded
+        personal crops are grouped into small batches instead of one ORT call
+        per preview.
+        """
         public_scorer = None
         personal_scorer = None
         public_error = ""
@@ -657,7 +673,8 @@ class RecommendationRuntime:
         import numpy as np
         from PIL import Image
 
-        results: List[Tuple[Optional[float], Optional[float]]] = []
+        keys: List[Optional[str]] = []
+        pending_personal: List[Tuple[str, Any]] = []
         for path in paths:
             if cancel_check is not None:
                 cancel_check()
@@ -665,70 +682,131 @@ class RecommendationRuntime:
                 key = self._face_cache_key(path)
             except OSError as exc:
                 LOGGER.warning("[RECOMMEND] Cached face is unavailable: %s", exc)
-                results.append((None, None))
+                keys.append(None)
                 continue
+            keys.append(key)
             public_missing = public_scorer is not None and key not in self._public_cache
             personal_missing = personal_scorer is not None and key not in self._personal_cache
-            if public_missing or personal_missing:
-                try:
-                    with Image.open(path) as source:
-                        full = source.convert("RGB")
-                    public_rgb = None
-                    personal_rgb = None
-                    if public_missing:
-                        # UI face previews are built with a 1.55x context margin.
-                        # Recover the tight square used by the public FBP in
-                        # Photo Select AI without reopening the source image.
-                        width, height = full.size
-                        side = max(1, int(round(min(width, height) / 1.55)))
-                        cx = width * 0.5
-                        cy = height * 0.52
-                        left = max(0, int(round(cx - side * 0.5)))
-                        top = max(0, int(round(cy - side * 0.5)))
-                        right = min(width, left + side)
-                        bottom = min(height, top + side)
-                        tight = full.crop((left, top, right, bottom)).resize((224, 224), Image.Resampling.BICUBIC)
+            if not public_missing and not personal_missing:
+                continue
+
+            full = None
+            try:
+                with Image.open(path) as source:
+                    full = source.convert("RGB")
+                if public_missing:
+                    # UI face previews are built with a 1.55x context margin.
+                    # Recover the tight square used by the public FBP in
+                    # Photo Select AI without reopening the source image.
+                    width, height = full.size
+                    side = max(1, int(round(min(width, height) / 1.55)))
+                    cx = width * 0.5
+                    cy = height * 0.52
+                    left = max(0, int(round(cx - side * 0.5)))
+                    top = max(0, int(round(cy - side * 0.5)))
+                    right = min(width, left + side)
+                    bottom = min(height, top + side)
+                    tight = full.crop((left, top, right, bottom)).resize((224, 224), Image.Resampling.BICUBIC)
+                    try:
                         public_rgb = np.array(tight, dtype=np.uint8, copy=True)
+                    finally:
                         tight.close()
-                    if personal_missing:
-                        personal = full.resize((224, 224), Image.Resampling.BICUBIC)
+                    try:
+                        self._public_cache[key] = public_scorer.score_rgb(public_rgb)
+                    except Exception as exc:
+                        # Do not permanently poison the cache on a transient
+                        # inference failure; the next chooser may retry.
+                        LOGGER.warning("[RECOMMEND] Public FBP failed for %s: %s", path.name, exc)
+
+                if personal_missing:
+                    personal = full.resize((224, 224), Image.Resampling.BICUBIC)
+                    try:
                         personal_rgb = np.array(personal, dtype=np.uint8, copy=True)
+                    finally:
                         personal.close()
-                    full.close()
+                    pending_personal.append((key, personal_rgb))
+            except Exception as exc:
+                LOGGER.warning("[RECOMMEND] Could not decode cached face %s: %s", path.name, exc)
+                # A decode failure is deterministic for this exact file state;
+                # cache it as unknown until the file changes.
+                if public_missing:
+                    self._public_cache[key] = None
+                if personal_missing:
+                    self._personal_cache[key] = None
+            finally:
+                if full is not None:
+                    try:
+                        full.close()
+                    except Exception:
+                        pass
+
+        if personal_scorer is not None and pending_personal:
+            # Keep memory bounded for large groups while still reducing the
+            # number of ORT calls dramatically.
+            batch_size = 32
+            for start in range(0, len(pending_personal), batch_size):
+                if cancel_check is not None:
+                    cancel_check()
+                chunk = pending_personal[start:start + batch_size]
+                try:
+                    values = personal_scorer.score_batch_rgb([rgb for _key, rgb in chunk])
                 except Exception as exc:
-                    LOGGER.warning("[RECOMMEND] Could not decode cached face %s: %s", path.name, exc)
-                    if public_missing:
-                        self._public_cache[key] = None
-                    if personal_missing:
-                        self._personal_cache[key] = None
-                else:
-                    if public_missing:
-                        try:
-                            self._public_cache[key] = public_scorer.score_rgb(public_rgb)
-                        except Exception as exc:
-                            LOGGER.warning("[RECOMMEND] Public FBP failed for %s: %s", path.name, exc)
-                            self._public_cache[key] = None
-                    if personal_missing:
-                        try:
-                            self._personal_cache[key] = personal_scorer.score_rgb(personal_rgb)
-                        except Exception as exc:
-                            LOGGER.warning("[RECOMMEND] Personal model failed for %s: %s", path.name, exc)
-                            self._personal_cache[key] = None
+                    LOGGER.warning("[RECOMMEND] Personal model batch failed: %s", exc)
+                    # Leave these keys uncached so a later chooser can retry.
+                    continue
+                for (key, _rgb), value in zip(chunk, values):
+                    self._personal_cache[key] = value
+
+        results: List[Tuple[Optional[float], Optional[float]]] = []
+        for key in keys:
+            if key is None:
+                results.append((None, None))
+                continue
             results.append((
                 self._public_cache.get(key) if public_scorer is not None else None,
                 self._personal_cache.get(key) if personal_scorer is not None else None,
             ))
 
         # Keep lazy caches bounded even during very long editing sessions.
-        if len(self._public_cache) > 4096:
-            self._public_cache.clear()
-        if len(self._personal_cache) > 4096:
-            self._personal_cache.clear()
+        # Evict only the oldest entries instead of clearing thousands of valid
+        # scores at once and forcing a large re-inference spike on the next query.
+        for cache in (self._public_cache, self._personal_cache):
+            while len(cache) > 4096:
+                cache.pop(next(iter(cache)))
         return results, public_error, personal_error
 
 
 
 RECOMMENDER = RecommendationRuntime()
+
+
+def _relative_rank_scores(values: List[Optional[float]]) -> List[Optional[float]]:
+    """Convert one model's scores into equal-weight within-set ranks.
+
+    Public FBP and the personal sigmoid are not calibrated to the same numeric
+    scale. Combined mode therefore averages relative ordering, not raw 0..1
+    values. Ties receive their mean rank; one lone valid value is neutral.
+    """
+    valid = [(float(value), index) for index, value in enumerate(values) if value is not None and math.isfinite(float(value))]
+    result: List[Optional[float]] = [None] * len(values)
+    if not valid:
+        return result
+    if len(valid) == 1:
+        result[valid[0][1]] = 0.5
+        return result
+    valid.sort(key=lambda item: (item[0], item[1]))
+    pos = 0
+    denom = float(len(valid) - 1)
+    while pos < len(valid):
+        end = pos + 1
+        while end < len(valid) and abs(valid[end][0] - valid[pos][0]) <= 1e-9:
+            end += 1
+        mean_position = (pos + (end - 1)) * 0.5
+        rank = mean_position / denom
+        for _score, index in valid[pos:end]:
+            result[index] = rank
+        pos = end
+    return result
 
 
 def _score_candidates_for_recommendation(
@@ -777,61 +855,78 @@ def _score_candidates_for_recommendation(
         public_error = str(exc) if need_public else ""
         personal_error = str(exc) if need_personal else ""
 
-    if not any(public is not None or personal is not None for public, personal in scored):
-        info["status"] = "unavailable"
-        missing_parts: List[str] = []
-        if need_public and public_error:
-            missing_parts.append(RECOMMENDATION_LABELS["public"] + ": " + public_error)
-        if need_personal and personal_error:
-            missing_parts.append(RECOMMENDATION_LABELS["personal"] + ": " + personal_error)
-        info["message"] = "; ".join(missing_parts) or "No recommendation models are available."
-        return info
-
-    any_public = False
-    any_personal = False
+    public_values: List[Optional[float]] = []
+    personal_values: List[Optional[float]] = []
     for index, (public_score, personal_score) in enumerate(scored):
-        item = info["items"][index]
-        if public_score is not None and math.isfinite(public_score):
-            item["public_score"] = float(public_score)
-            any_public = True
-        if personal_score is not None and math.isfinite(personal_score):
-            item["personal_score"] = float(personal_score)
-            any_personal = True
+        public_value = float(public_score) if public_score is not None and math.isfinite(float(public_score)) else None
+        personal_value = float(personal_score) if personal_score is not None and math.isfinite(float(personal_score)) else None
+        public_values.append(public_value)
+        personal_values.append(personal_value)
+        info["items"][index]["public_score"] = public_value
+        info["items"][index]["personal_score"] = personal_value
+
+    public_count = sum(value is not None for value in public_values)
+    personal_count = sum(value is not None for value in personal_values)
+    overlap_indices = [
+        index for index, (public_value, personal_value) in enumerate(zip(public_values, personal_values))
+        if public_value is not None and personal_value is not None
+    ]
 
     effective_mode = "off"
-    if mode == "public":
-        effective_mode = "public" if any_public else "off"
-    elif mode == "personal":
-        effective_mode = "personal" if any_personal else "off"
+    if mode == "public" and public_count >= 2:
+        effective_mode = "public"
+    elif mode == "personal" and personal_count >= 2:
+        effective_mode = "personal"
     elif mode == "combined":
-        if any_public and any_personal:
+        if len(overlap_indices) >= 2:
             effective_mode = "combined"
-        elif any_public:
-            effective_mode = "public"
-        elif any_personal:
-            effective_mode = "personal"
+        elif public_count >= 2 or personal_count >= 2:
+            # Combined comparison is impossible when fewer than two candidates
+            # have scores from both models. Fall back to the model with better
+            # coverage instead of allowing one partially-scored candidate to win.
+            effective_mode = "public" if public_count >= personal_count and public_count >= 2 else "personal"
 
-    best_score = None
+    if effective_mode == "off":
+        info["status"] = "unavailable"
+        missing_parts: List[str] = []
+        if need_public and public_count < 2:
+            missing_parts.append(
+                RECOMMENDATION_LABELS["public"] + ": " + (public_error or "недостаточно надёжно оценённых дублей")
+            )
+        if need_personal and personal_count < 2:
+            missing_parts.append(
+                RECOMMENDATION_LABELS["personal"] + ": " + (personal_error or "недостаточно надёжно оценённых дублей")
+            )
+        info["message"] = "; ".join(missing_parts) or "Недостаточно данных для сравнения дублей."
+        return info
+
+    if effective_mode == "combined":
+        overlap_set = set(overlap_indices)
+        overlap_public = [public_values[i] if i in overlap_set else None for i in range(len(candidates))]
+        overlap_personal = [personal_values[i] if i in overlap_set else None for i in range(len(candidates))]
+        public_ranks = _relative_rank_scores(overlap_public)
+        personal_ranks = _relative_rank_scores(overlap_personal)
+    else:
+        public_ranks = [None] * len(candidates)
+        personal_ranks = [None] * len(candidates)
+
+    best_key = None
     best_index = -1
     for index, candidate in enumerate(candidates):
-        item = info["items"][index]
-        public_score = item["public_score"]
-        personal_score = item["personal_score"]
         effective = None
         if effective_mode == "public":
-            effective = public_score
+            effective = public_values[index]
         elif effective_mode == "personal":
-            effective = personal_score
+            effective = personal_values[index]
         elif effective_mode == "combined":
-            parts = [value for value in (public_score, personal_score) if value is not None and math.isfinite(float(value))]
-            if parts:
-                effective = float(sum(parts) / float(len(parts)))
-        item["effective_score"] = effective
+            if public_ranks[index] is not None and personal_ranks[index] is not None:
+                effective = (float(public_ranks[index]) + float(personal_ranks[index])) * 0.5
+        info["items"][index]["effective_score"] = effective
         if effective is None or not math.isfinite(float(effective)):
             continue
         candidate_key = (float(effective), float(candidate.similarity), -float(index))
-        if best_score is None or candidate_key > best_score:
-            best_score = candidate_key
+        if best_key is None or candidate_key > best_key:
+            best_key = candidate_key
             best_index = index
 
     info["effective_mode"] = effective_mode
@@ -842,14 +937,19 @@ def _score_candidates_for_recommendation(
         info["items"][best_index]["variant_tag"] = "best_" + effective_mode
         info["status"] = "ok" if effective_mode == mode else "partial"
         if mode == "combined" and effective_mode in ("public", "personal"):
-            info["message"] = "Комбинированный режим частично недоступен; используется только %s." % RECOMMENDATION_LABELS[effective_mode].lower()
+            info["message"] = (
+                "Для честного объединения недостаточно общих оценок двух моделей; используется только %s."
+                % RECOMMENDATION_LABELS[effective_mode].lower()
+            )
         elif mode != effective_mode and effective_mode != "off":
-            info["message"] = "Запрошенный режим %s недоступен; используется %s." % (RECOMMENDATION_LABELS[mode], RECOMMENDATION_LABELS[effective_mode])
+            info["message"] = "Запрошенный режим %s недоступен; используется %s." % (
+                RECOMMENDATION_LABELS[mode], RECOMMENDATION_LABELS[effective_mode]
+            )
         else:
             info["message"] = "Тонкой зелёной рамкой отмечен лучший дубль по критерию: %s." % RECOMMENDATION_LABELS[effective_mode]
     else:
         info["status"] = "unavailable"
-        info["message"] = "Модель(и) загружены, но не удалось получить пригодные оценки для превью."
+        info["message"] = "Модель(и) загружены, но не удалось получить минимум две сопоставимые оценки."
     return info
 
 
@@ -989,9 +1089,52 @@ class FaceEngine:
         if requested_cuda and actual_cuda is False:
             if mode == "gpu":
                 raise UserVisibleError("GPU mode was requested, but InsightFace activated CPU execution.")
-            fallback = True
-            LOGGER.warning("CUDAExecutionProvider was requested, but InsightFace activated CPU for at least one critical model.")
+            # Do not keep a mixed/implicitly-fallen-back app while still
+            # advertising CUDA as the first provider. A later unrelated
+            # inference error would otherwise be mistaken for a CUDA failure
+            # and trigger another unnecessary rebuild. In Auto mode normalize
+            # the engine once to an explicit all-CPU state.
+            LOGGER.warning(
+                "CUDAExecutionProvider was requested, but at least one critical InsightFace model activated CPU; "
+                "rebuilding the engine explicitly on CPU."
+            )
+            cpu_providers = ["CPUExecutionProvider"]
+            cpu_app = FaceAnalysis(
+                name="buffalo_l",
+                root=str(MODEL_ROOT),
+                allowed_modules=["detection", "recognition"],
+                providers=cpu_providers,
+            )
+            cpu_app.prepare(ctx_id=-1, det_thresh=DET_THRESHOLD, det_size=(det_size, det_size))
+            return cpu_app, cpu_providers, True
         return app, providers, fallback
+
+    def _first_provider_name(self) -> str:
+        if not self._providers:
+            return ""
+        first = self._providers[0]
+        if isinstance(first, (tuple, list)):
+            first = first[0]
+        return str(first)
+
+    def _resize_detector_in_place(self, det_size: int) -> bool:
+        """Change SCRFD input size without recreating detector/recognition sessions."""
+        if self._app is None:
+            return False
+        detector = getattr(self._app, "det_model", None)
+        prepare = getattr(detector, "prepare", None)
+        if prepare is None:
+            return False
+        provider = self._first_provider_name()
+        ctx_id = 0 if provider == "CUDAExecutionProvider" else -1
+        prepare(ctx_id, input_size=(det_size, det_size), det_thresh=DET_THRESHOLD)
+        try:
+            self._app.det_size = (det_size, det_size)
+            self._app.det_thresh = DET_THRESHOLD
+        except Exception:
+            pass
+        self._det_size = det_size
+        return True
 
     def reconfigure(self, mode: str, det_size: int) -> Dict[str, Any]:
         mode = str(mode or DEFAULT_COMPUTE_MODE).lower()
@@ -1001,6 +1144,60 @@ class FaceEngine:
         with self._lock:
             if self._app is not None and self._mode == mode and self._det_size == det_size:
                 return self.current_state()
+
+            provider = self._first_provider_name()
+            # The loaded sessions can be reused when only detector resolution
+            # changes. This is the common settings tweak and must not reload
+            # ArcFace or allocate a second model set temporarily.
+            if self._app is not None and self._mode == mode and self._det_size != det_size:
+                try:
+                    if self._resize_detector_in_place(det_size):
+                        LOGGER.info("Face detector resized in place: %dx%d; model sessions reused.", det_size, det_size)
+                        return self.current_state()
+                except Exception as exc:
+                    LOGGER.warning("Could not resize the existing detector in place; rebuilding FaceEngine: %s", exc)
+
+            # Auto<->GPU with an already active CUDA provider only changes the
+            # future fallback policy; the loaded sessions themselves are valid.
+            if (
+                self._app is not None
+                and provider == "CUDAExecutionProvider"
+                and self._mode in ("auto", "gpu")
+                and mode in ("auto", "gpu")
+            ):
+                self._mode = mode
+                self._using_cpu_fallback = False
+                if self._det_size != det_size:
+                    try:
+                        if self._resize_detector_in_place(det_size):
+                            LOGGER.info("Face engine mode changed to %s and detector resized in place; sessions reused.", mode)
+                            return self.current_state()
+                    except Exception as exc:
+                        LOGGER.warning("Could not reuse CUDA sessions after mode change; rebuilding FaceEngine: %s", exc)
+                else:
+                    LOGGER.info("Face engine mode changed to %s; existing CUDA sessions reused.", mode)
+                    return self.current_state()
+
+            # Auto CPU fallback -> explicit CPU also needs no reload.
+            if (
+                self._app is not None
+                and provider == "CPUExecutionProvider"
+                and self._mode == "auto"
+                and mode == "cpu"
+            ):
+                self._mode = "cpu"
+                self._using_cpu_fallback = False
+                if self._det_size != det_size:
+                    try:
+                        if self._resize_detector_in_place(det_size):
+                            LOGGER.info("Auto CPU fallback promoted to explicit CPU; sessions reused.")
+                            return self.current_state()
+                    except Exception as exc:
+                        LOGGER.warning("Could not reuse CPU sessions after mode change; rebuilding FaceEngine: %s", exc)
+                else:
+                    LOGGER.info("Auto CPU fallback promoted to explicit CPU; existing sessions reused.")
+                    return self.current_state()
+
             LOGGER.info("Reconfiguring face engine: mode=%s, det-size=%d", mode, det_size)
             app, providers, fallback = self._create_app(mode, det_size)
             self._app = app
@@ -1133,6 +1330,8 @@ JOBS_LOCK = threading.RLock()
 JOBS: Dict[str, Dict[str, Any]] = {}
 QUERY_LOCK = threading.RLock()
 QUERIES: Dict[str, QueryContext] = {}
+STATE_CLEANUP_LOCK = threading.RLock()
+LAST_STATE_CLEANUP = 0.0
 CACHE_CLEANUP_LOCK = threading.RLock()
 CACHE_IO_LOCK = threading.RLock()
 SETTINGS_APPLY_LOCK = threading.RLock()
@@ -1596,17 +1795,67 @@ def _build_face_preview_jpeg_from_pil(source: Any, full_bbox: Tuple[float, float
         crop.close()
 
 
-def _scan_files(folder: Path) -> List[Path]:
-    files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS]
-    return sorted(files, key=lambda p: p.name.casefold())
+def _natural_name_key(value: str) -> Tuple[Tuple[int, Any], ...]:
+    """Human/numeric filename ordering: IMG_2 comes before IMG_10."""
+    parts: List[Tuple[int, Any]] = []
+    for part in re.split(r"(\d+)", str(value).casefold()):
+        if not part:
+            continue
+        if part.isdigit():
+            parts.append((1, int(part)))
+        else:
+            parts.append((0, part))
+    return tuple(parts)
 
 
-def _path_state(path: Path) -> Tuple[str, int, int]:
+def _scan_files(folder: Path) -> Tuple[List[Path], Dict[str, Tuple[str, int, int]]]:
+    """Return supported files and their size/mtime state from one scandir pass.
+
+    Cache validation previously called ``Path.is_file()`` while scanning and
+    then ``Path.stat()`` again for every group member. On network folders that
+    doubled metadata round-trips. ``DirEntry.stat()`` is reused here by the
+    fingerprint logic so each visible file is stat'ed at most once per query.
+    """
+    files: List[Path] = []
+    states: Dict[str, Tuple[str, int, int]] = {}
+    try:
+        entries = list(os.scandir(folder))
+    except OSError as exc:
+        raise UserVisibleError("Cannot scan folder %s: %s" % (folder, exc)) from exc
+    for entry in entries:
+        try:
+            if not entry.is_file():
+                continue
+            path = Path(entry.path)
+            if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                continue
+            stat = entry.stat()
+        except OSError:
+            continue
+        norm = _norm_path(str(path))
+        files.append(path)
+        states[norm] = (norm, int(stat.st_size), int(stat.st_mtime_ns))
+    files.sort(key=lambda path: (_natural_name_key(path.name), path.name.casefold()))
+    return files, states
+
+
+def _path_state(path: Path, known_states: Optional[Dict[str, Tuple[str, int, int]]] = None) -> Tuple[str, int, int]:
+    norm = _norm_path(str(path))
+    if known_states is not None:
+        cached = known_states.get(norm)
+        if cached is not None:
+            return cached
     stat = path.stat()
-    return (_norm_path(str(path)), int(stat.st_size), int(stat.st_mtime_ns))
+    return (norm, int(stat.st_size), int(stat.st_mtime_ns))
 
 
-def _group_fingerprint(folder: Path, members: Iterable[str], left_probe: str = "", right_probe: str = "") -> str:
+def _group_fingerprint(
+    folder: Path,
+    members: Iterable[str],
+    left_probe: str = "",
+    right_probe: str = "",
+    known_states: Optional[Dict[str, Tuple[str, int, int]]] = None,
+) -> str:
     """Fingerprint only the detected group plus the immediate boundary probes."""
     digest = hashlib.sha256()
     digest.update(_norm_path(str(folder)).encode("utf-8", "surrogatepass"))
@@ -1614,7 +1863,7 @@ def _group_fingerprint(folder: Path, members: Iterable[str], left_probe: str = "
     for label, values in (("M", list(members)), ("L", [left_probe] if left_probe else []), ("R", [right_probe] if right_probe else [])):
         for value in values:
             path = Path(value)
-            state = _path_state(path)
+            state = _path_state(path, known_states)
             digest.update(label.encode("ascii"))
             digest.update(state[0].encode("utf-8", "surrogatepass"))
             digest.update(str(state[1]).encode("ascii"))
@@ -1808,7 +2057,10 @@ def _save_group_index(index: GroupIndex) -> None:
         os.replace(meta_temp, meta_target)
 
 
-def _validate_group_layout(meta: Dict[str, Any], source_path: Path, files: List[Path]) -> bool:
+def _validate_group_layout(
+    meta: Dict[str, Any], source_path: Path, files: List[Path],
+    known_states: Optional[Dict[str, Tuple[str, int, int]]] = None,
+) -> bool:
     if int(meta.get("version") or 0) != CACHE_VERSION:
         return False
     if str(meta.get("analysis_signature") or "") != _analysis_signature():
@@ -1843,7 +2095,7 @@ def _validate_group_layout(meta: Dict[str, Any], source_path: Path, files: List[
     elif end != len(current_norm) - 1:
         return False
     try:
-        fingerprint = _group_fingerprint(source_path.parent, members, left_probe, right_probe)
+        fingerprint = _group_fingerprint(source_path.parent, members, left_probe, right_probe, known_states)
     except OSError:
         return False
     return fingerprint == str(meta.get("fingerprint") or "")
@@ -1877,7 +2129,10 @@ def _load_group_cache_from_meta(meta: Dict[str, Any]) -> Optional[GroupIndex]:
         return None
 
 
-def _find_cached_group(source_path: Path, files: List[Path]) -> Optional[GroupIndex]:
+def _find_cached_group(
+    source_path: Path, files: List[Path],
+    known_states: Optional[Dict[str, Tuple[str, int, int]]] = None,
+) -> Optional[GroupIndex]:
     source_norm = _norm_path(str(source_path))
 
     with INDEX_LOCK:
@@ -1892,7 +2147,7 @@ def _find_cached_group(source_path: Path, files: List[Path]) -> Optional[GroupIn
             "right_probe": active.right_probe,
             "fingerprint": active.fingerprint,
         }
-        if _validate_group_layout(meta, source_path, files):
+        if _validate_group_layout(meta, source_path, files, known_states):
             _touch_group_cache(active)
             LOGGER.info("[CACHE] Active group cache is current: %s .. %s", Path(active.members[0]).name, Path(active.members[-1]).name)
             return active
@@ -1905,7 +2160,7 @@ def _find_cached_group(source_path: Path, files: List[Path]) -> Optional[GroupIn
         members = [str(value) for value in (meta.get("members") or [])]
         if source_norm not in [_norm_path(value) for value in members]:
             continue
-        if not _validate_group_layout(meta, source_path, files):
+        if not _validate_group_layout(meta, source_path, files, known_states):
             continue
         index = _load_group_cache_from_meta(meta)
         if index is None:
@@ -1946,16 +2201,31 @@ def _cancel_job(payload: Dict[str, Any]) -> Dict[str, Any]:
     job_id = str(payload.get("job_id") or "")
     if not job_id:
         return {"cancelled": False, "reason": "missing_job_id"}
+    finished_query_id = ""
+    finished_status = ""
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if job is None:
             return {"cancelled": False, "reason": "not_found"}
         if job.get("status") in ("done", "error", "cancelled"):
-            return {"cancelled": False, "reason": "already_finished", "status": job.get("status")}
-        job["cancel_requested"] = True
-        job["status"] = "cancelling"
-        job["text"] = "Отмена..."
-        job["updated_at"] = time.time()
+            # A selection can finish in the tiny interval before the JSX cancel
+            # request arrives. If its completed result owns a query, honour the
+            # user's cancellation intent by releasing that query immediately
+            # instead of leaving it until QUERY_TTL_SECONDS. Keep lock ordering
+            # simple: release JOBS_LOCK before touching QUERY_LOCK.
+            result = job.get("result") if job.get("status") == "done" else None
+            finished_query_id = str(result.get("query_id") or "") if isinstance(result, dict) else ""
+            finished_status = str(job.get("status"))
+        else:
+            job["cancel_requested"] = True
+            job["status"] = "cancelling"
+            job["text"] = "Отмена..."
+            job["updated_at"] = time.time()
+    if finished_status:
+        if finished_query_id:
+            with QUERY_LOCK:
+                QUERIES.pop(finished_query_id, None)
+        return {"cancelled": False, "reason": "already_finished", "status": finished_status}
     LOGGER.info("[JOB] Cancellation requested: %s", job_id)
     return {"cancelled": True, "job_id": job_id}
 
@@ -2139,7 +2409,60 @@ def _analyze_image_record(path: Path) -> ImageRecord:
     )
 
 
-def _group_change_stats(anchor_faces: List[FaceRecord], candidate_faces: List[FaceRecord]) -> Dict[str, Any]:
+def _embedding_similarity_matrix(
+    left_faces: List[FaceRecord], right_faces: List[FaceRecord]
+) -> Optional[Any]:
+    """Return a fast cosine-similarity matrix for normalized ArcFace vectors.
+
+    Embeddings are normalized when they are created, so cosine similarity is a
+    matrix dot product. Fall back to scalar comparison if a malformed/legacy
+    cache contains inconsistent embedding lengths.
+    """
+    if not left_faces or not right_faces:
+        return None
+    dims = {len(face.embedding) for face in left_faces + right_faces if face.embedding}
+    if len(dims) != 1 or next(iter(dims), 0) <= 0:
+        return None
+    try:
+        import numpy as np
+        left = np.asarray([face.embedding for face in left_faces], dtype=np.float32)
+        right = np.asarray([face.embedding for face in right_faces], dtype=np.float32)
+        if left.ndim != 2 or right.ndim != 2 or left.shape[1] != right.shape[1]:
+            return None
+        return left @ right.T
+    except Exception:
+        return None
+
+
+def _best_face_match(reference_embedding: List[float], faces: List[FaceRecord]) -> Tuple[Optional[FaceRecord], float]:
+    if not reference_embedding or not faces:
+        return None, -1.0
+    try:
+        import numpy as np
+        dims = {len(face.embedding) for face in faces if face.embedding}
+        if len(dims) == 1 and next(iter(dims), 0) == len(reference_embedding):
+            matrix = np.asarray([face.embedding for face in faces], dtype=np.float32)
+            reference = np.asarray(reference_embedding, dtype=np.float32)
+            scores = matrix @ reference
+            if scores.size:
+                index = int(np.argmax(scores))
+                return faces[index], float(scores[index])
+    except Exception:
+        pass
+    best_face: Optional[FaceRecord] = None
+    best_similarity = -1.0
+    for face in faces:
+        similarity = _cosine(reference_embedding, face.embedding)
+        if similarity > best_similarity:
+            best_similarity = similarity
+            best_face = face
+    return best_face, best_similarity
+
+
+def _group_change_stats(
+    anchor_faces: List[FaceRecord], candidate_faces: List[FaceRecord],
+    candidate_matrix: Optional[Any] = None,
+) -> Dict[str, Any]:
     anchor_count = len(anchor_faces)
     candidate_count = len(candidate_faces)
     if anchor_count <= 0:
@@ -2149,11 +2472,23 @@ def _group_change_stats(anchor_faces: List[FaceRecord], candidate_faces: List[Fa
     # global greedy sort could consume a candidate with the locally best score
     # and thereby lose another valid pairing, falsely inflating roster changes.
     threshold = GROUP_IDENTITY_THRESHOLD
+    similarities = None
+    if candidate_matrix is not None:
+        try:
+            import numpy as np
+            anchor_matrix = np.asarray([face.embedding for face in anchor_faces], dtype=np.float32)
+            if anchor_matrix.ndim == 2 and candidate_matrix.ndim == 2 and anchor_matrix.shape[1] == candidate_matrix.shape[1]:
+                similarities = anchor_matrix @ candidate_matrix.T
+        except Exception:
+            similarities = None
+    if similarities is None:
+        similarities = _embedding_similarity_matrix(anchor_faces, candidate_faces)
+
     edges: List[List[Tuple[float, int]]] = []
-    for anchor in anchor_faces:
+    for ai, anchor in enumerate(anchor_faces):
         row: List[Tuple[float, int]] = []
         for ci, candidate in enumerate(candidate_faces):
-            similarity = _cosine(anchor.embedding, candidate.embedding)
+            similarity = float(similarities[ai, ci]) if similarities is not None else _cosine(anchor.embedding, candidate.embedding)
             if similarity >= threshold:
                 row.append((similarity, ci))
         row.sort(reverse=True, key=lambda value: value[0])
@@ -2199,11 +2534,24 @@ def _group_change_stats(anchor_faces: List[FaceRecord], candidate_faces: List[Fa
 def _best_face_similarity(reference: Optional[FaceRecord], faces: List[FaceRecord]) -> float:
     if reference is None or not faces:
         return -1.0
-    return max((_cosine(reference.embedding, face.embedding) for face in faces), default=-1.0)
+    _face, similarity = _best_face_match(reference.embedding, faces)
+    return similarity
 
 
 def _boundary_reference_stats(reference_sets: List[List[FaceRecord]], candidate_faces: List[FaceRecord]) -> Dict[str, Any]:
-    stats_list = [_group_change_stats(reference_faces, candidate_faces) for reference_faces in reference_sets if reference_faces]
+    candidate_matrix = None
+    if candidate_faces:
+        try:
+            import numpy as np
+            candidate_matrix = np.asarray([face.embedding for face in candidate_faces], dtype=np.float32)
+            if candidate_matrix.ndim != 2:
+                candidate_matrix = None
+        except Exception:
+            candidate_matrix = None
+    stats_list = [
+        _group_change_stats(reference_faces, candidate_faces, candidate_matrix=candidate_matrix)
+        for reference_faces in reference_sets if reference_faces
+    ]
     if not stats_list:
         return {"boundary": False, "strong": False, "changed": 0, "fraction": 0.0, "matched": 0, "missing": 0, "new": len(candidate_faces)}
     # The frame is considered a roster boundary only when it differs from every
@@ -2233,7 +2581,7 @@ def _reference_face_for_group_scan(source_record: ImageRecord, source_path: Path
 
 def _build_group_index(folder: Path, source_path: Path, selection: Dict[str, int], doc_width: int, doc_height: int, job_id: Optional[str] = None) -> GroupIndex:
     _check_job_cancelled(job_id)
-    files = _scan_files(folder)
+    files, file_states = _scan_files(folder)
     if not files:
         raise UserVisibleError("No supported image files were found in: %s" % folder)
     source_norm = _norm_path(str(source_path))
@@ -2243,7 +2591,7 @@ def _build_group_index(folder: Path, source_path: Path, selection: Dict[str, int
     except ValueError:
         raise UserVisibleError("The active Photoshop file is not among the supported images in its folder.")
 
-    cached = _find_cached_group(source_path, files)
+    cached = _find_cached_group(source_path, files, file_states)
     _check_job_cancelled(job_id)
     if cached is not None:
         if job_id:
@@ -2311,16 +2659,21 @@ def _build_group_index(folder: Path, source_path: Path, selection: Dict[str, int
             except JobCancelled:
                 for future in future_map:
                     future.cancel()
-                pool.shutdown(wait=False, cancel_futures=True)
+                # Do not leave already-running detector/recognition calls as
+                # orphan background work after ESC. Photoshop stops waiting
+                # immediately, but the server keeps the selection lock until
+                # only the currently running frames have naturally returned.
+                # No queued/new frame is started.
+                pool.shutdown(wait=True, cancel_futures=True)
                 raise
             else:
                 pool.shutdown(wait=True)
 
-        records.sort(key=lambda item: item.name.casefold())
+        records.sort(key=lambda item: (_natural_name_key(item.name), item.name.casefold()))
         if not records:
             raise UserVisibleError("No images in the folder could be analyzed.")
         members = [str(path) for path in files]
-        fingerprint = _group_fingerprint(folder, members, "", "")
+        fingerprint = _group_fingerprint(folder, members, "", "", file_states)
         cache_id = _group_cache_id(folder, members)
         index = GroupIndex(
             folder=str(folder),
@@ -2498,7 +2851,7 @@ def _build_group_index(folder: Path, source_path: Path, selection: Dict[str, int
     if right.get("probe"):
         right_probe = str(right["probe"])
 
-    fingerprint = _group_fingerprint(folder, members, left_probe, right_probe)
+    fingerprint = _group_fingerprint(folder, members, left_probe, right_probe, file_states)
     cache_id = _group_cache_id(folder, members)
     index = GroupIndex(
         folder=str(folder),
@@ -2509,7 +2862,6 @@ def _build_group_index(folder: Path, source_path: Path, selection: Dict[str, int
         right_probe=right_probe,
         cache_id=cache_id,
     )
-    _check_job_cancelled(job_id)
     _check_job_cancelled(job_id)
     _set_active_group_index(index)
     try:
@@ -2600,14 +2952,19 @@ def _detect_reference_targeted(path: Path, selection: Dict[str, int]) -> Optiona
                 if not embedding:
                     continue
                 bx1, by1, bx2, by2 = geometry.bbox
+                mapped_bbox = (bx1 + x1, by1 + y1, bx2 + x1, by2 + y1)
+                preview = _build_face_preview_jpeg_from_pil(
+                    source, mapped_bbox, int(w), int(h), FACE_CACHE_SIZE
+                )
                 mapped.append(
                     FaceRecord(
-                        bbox=(bx1 + x1, by1 + y1, bx2 + x1, by2 + y1),
+                        bbox=mapped_bbox,
                         kps=[
                             [float(point[0] + x1), float(point[1] + y1)]
                             for point in geometry.kps[:5]
                         ],
                         embedding=embedding,
+                        preview_jpeg=preview,
                     )
                 )
         finally:
@@ -2722,6 +3079,33 @@ def _aligned_crop(
     return left, top, right, bottom
 
 
+def _ensure_transient_face_preview(index: GroupIndex, image: ImageRecord, face: FaceRecord) -> None:
+    """Materialize a targeted-fallback face preview inside the group cache.
+
+    Normal indexed faces already have ``preview_master_path``. A face recovered
+    by targeted detection exists only in RAM, so give it a deterministic cache
+    file without rewriting the whole group pickle.
+    """
+    existing = Path(face.preview_master_path) if face.preview_master_path else None
+    if existing is not None and existing.is_file():
+        return
+    if not face.preview_jpeg:
+        raise UserVisibleError("Targeted face was recovered without a usable preview.")
+    cache_id = index.cache_id or _group_cache_id(Path(index.folder), index.members)
+    bbox_key = ",".join("%.2f" % float(value) for value in face.bbox)
+    digest = hashlib.sha256((str(image.path) + "|" + bbox_key).encode("utf-8", "surrogatepass")).hexdigest()[:20]
+    with CACHE_IO_LOCK:
+        preview_dir = _group_preview_dir(cache_id)
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        target = preview_dir / ("targeted_" + digest + ".jpg")
+        if not target.is_file():
+            temp = target.with_suffix(target.suffix + ".tmp")
+            temp.write_bytes(face.preview_jpeg)
+            os.replace(str(temp), str(target))
+    face.preview_master_path = str(target)
+    face.preview_jpeg = b""
+
+
 def _choose_reference(index: GroupIndex, source_path: Path, selection: Dict[str, int], doc_width: int, doc_height: int) -> Tuple[ImageRecord, FaceRecord]:
     source_norm = _norm_path(str(source_path))
     record = next((item for item in index.images if _norm_path(item.path) == source_norm), None)
@@ -2743,6 +3127,12 @@ def _choose_reference(index: GroupIndex, source_path: Path, selection: Dict[str,
     if face is None:
         LOGGER.info("[MATCH] No indexed face overlaps the selection; trying targeted detection.")
         face = _detect_reference_targeted(source_path, local_selection)
+        if face is not None:
+            _ensure_transient_face_preview(index, record, face)
+            # Reuse the recovered face for later selections in this same
+            # server/session. Persisting the entire group pickle here would be
+            # much more expensive than this lightweight RAM-only promotion.
+            record.faces.append(face)
     if face is None:
         raise UserVisibleError("No face was found inside the Photoshop selection.")
     return record, face
@@ -2954,13 +3344,7 @@ def _select_child(payload: Dict[str, Any], job_id: Optional[str] = None) -> Dict
                     status="running",
                     text="Поиск совпадений %d/%d: %s" % (match_pos, match_total, image.name),
                 )
-            best_face = None
-            best_similarity = -1.0
-            for face in image.faces:
-                similarity = _cosine(ref_emb, face.embedding)
-                if similarity > best_similarity:
-                    best_similarity = similarity
-                    best_face = face
+            best_face, best_similarity = _best_face_match(ref_emb, image.faces)
             if best_face is None or best_similarity < match_threshold:
                 below_threshold += 1
                 continue
@@ -2994,7 +3378,7 @@ def _select_child(payload: Dict[str, Any], job_id: Optional[str] = None) -> Dict
                 image.name, best_similarity, crop,
             )
 
-        candidates.sort(key=lambda item: (0 if item.is_active else 1, item.name.casefold()))
+        candidates.sort(key=lambda item: (0 if item.is_active else 1, _natural_name_key(item.name), item.name.casefold()))
         if len(candidates) <= 1:
             raise UserVisibleError(
                 "The selected child was not found in other images of the detected group with sufficient confidence. "
@@ -3061,8 +3445,9 @@ def _prepare_crop(payload: Dict[str, Any]) -> Dict[str, Any]:
     candidate = context.candidates[index]
     if candidate.is_active:
         raise UserVisibleError("The active Photoshop file is shown only as a reference preview and cannot be inserted into itself.")
+    requested_scale_match = _config_bool(payload.get("face_scale_match", False), False)
     live_scale_match = (
-        _face_scale_match()
+        requested_scale_match
         and context.target_face_width > 1.0
         and context.target_face_height > 1.0
         and len(candidate.face.kps) >= 5
@@ -3136,8 +3521,6 @@ def _record_preference(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Statistics are controlled only by the persisted Settings value. The
     # request flag is an additional guard from the JSX snapshot; both must be
     # explicitly true so a stale/external request cannot enable collection.
-    if not bool(_get_runtime_config().get("collect_statistics", False)):
-        return {"saved": False, "reason": "disabled"}
     if not _config_bool(payload.get("collect_statistics", False), False):
         return {"saved": False, "reason": "disabled"}
 
@@ -3239,11 +3622,31 @@ def _start_select_job(payload: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     def worker() -> None:
+        result: Optional[Dict[str, Any]] = None
         try:
             result = _select_child(payload, job_id=job_id)
-            _check_job_cancelled(job_id)
-            _update_job(job_id, status="done", progress=1.0, text="Превью готовы", result=result)
+            # Linearize completion against cancel_job under one lock. This
+            # closes the check-then-update race between _check_job_cancelled()
+            # and publishing status=done.
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+                cancelled_after_result = bool(job and job.get("cancel_requested"))
+                if job is not None and not cancelled_after_result:
+                    job.update({
+                        "status": "done", "progress": 1.0, "text": "Превью готовы",
+                        "result": result, "updated_at": time.time(),
+                    })
+            if cancelled_after_result:
+                raise JobCancelled("Operation cancelled")
         except JobCancelled:
+            # Cancellation can race with the tiny interval after _select_child
+            # has published its query. Clean it explicitly instead of waiting
+            # QUERY_TTL_SECONDS for an unreachable context to expire.
+            if isinstance(result, dict):
+                query_id = str(result.get("query_id") or "")
+                if query_id:
+                    with QUERY_LOCK:
+                        QUERIES.pop(query_id, None)
             LOGGER.info("Selection job cancelled: %s", job_id)
             _update_job(job_id, status="cancelled", progress=1.0, text="Отменено", error="")
         except Exception as exc:
@@ -3271,9 +3674,15 @@ def _job_status(payload: Dict[str, Any]) -> Dict[str, Any]:
     })
 
 
-def _cleanup_old_state() -> None:
-    _cleanup_disk_cache()
+def _cleanup_old_state(force: bool = False) -> None:
+    global LAST_STATE_CLEANUP
     now = time.time()
+    with STATE_CLEANUP_LOCK:
+        if not force and now - LAST_STATE_CLEANUP < STATE_CLEANUP_INTERVAL_SECONDS:
+            return
+        LAST_STATE_CLEANUP = now
+
+    _cleanup_disk_cache()
     with JOBS_LOCK:
         for key in list(JOBS):
             job = JOBS.get(key) or {}
@@ -3388,7 +3797,7 @@ def _apply_settings(payload: Dict[str, Any], job_id: Optional[str] = None) -> Di
             "restart_required": bool(restart_fields),
             "restart_fields": restart_fields,
             "engine": final_state,
-            "applied_now": ["preview_size", "cache_ttl_hours", "match_threshold", "scan_threads", "preview_threads", "compute_mode", "analysis_quality", "group_boundary_search", "face_scale_match", "collect_statistics", "recommendation_model"],
+            "applied_now": ["preview_size", "cache_ttl_hours", "match_threshold", "scan_threads", "preview_threads", "compute_mode", "analysis_quality", "group_boundary_search", "recommendation_model"],
         }
         if job_id:
             _update_job(job_id, progress=0.95, status="running", text="Настройки сохранены.")
@@ -3411,7 +3820,10 @@ def _start_settings_job(payload: Dict[str, Any]) -> Dict[str, Any]:
     def worker() -> None:
         try:
             result = _apply_settings(payload, job_id=job_id)
-            _check_job_cancelled(job_id)
+            # _apply_settings is the transaction boundary: cancellation is
+            # checked before commit and rolls back there. Once it returns, the
+            # settings are already authoritative and must be reported as done,
+            # not as a misleading post-commit cancellation.
             _update_job(job_id, status="done", progress=1.0, text="Настройки применены", result=result)
         except JobCancelled:
             LOGGER.info("Settings job cancelled: %s", job_id)
