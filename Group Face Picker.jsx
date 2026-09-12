@@ -17,7 +17,7 @@
 
 var GFP_NAME = "Group Face Picker";
 var GFP_UUID = "9a189321-e07f-40ff-8394-156a4bd48cf5";
-var GFP_VERSION = "0.6.7";
+var GFP_VERSION = "0.6.8";
 var GFP_DEFAULT_HOST = "127.0.0.1";
 var GFP_DEFAULT_PORT_SEND = 6420;
 var GFP_DEFAULT_PORT_LISTEN = 6421;
@@ -441,11 +441,14 @@ function gfpShowDialog(payload) {
     var lastClickIndex = -1;
     var lastClickTime = 0;
     var previewButtons = [];
+    var previewFrames = [];
+    var initialIndex = 0;
+    var foundRecommendation = false;
     var recommendation = payload.previews && payload.previews.recommendation ? payload.previews.recommendation : {};
     var columns = Math.max(1, Number(payload.previews.columns) || 1);
     var thumbWidth = Math.max(32, Number(payload.previews.thumb_width) || 96);
     var buttonSize = thumbWidth + 8;
-    var contentWidth = Math.max(420, columns * (buttonSize + 4));
+    var contentWidth = Math.max(420, columns * (buttonSize + 10));
 
     var w = new Window("dialog", String(payload.app_name) + " " + String(payload.version));
     w.orientation = "column";
@@ -503,13 +506,25 @@ function gfpShowDialog(payload) {
         cell.margins = 0;
 
         var previewImage = ScriptUI.newImage(previewFile, previewFile, previewFile, previewFile);
-        var previewButton = cell.add("iconbutton", undefined, previewImage, { style: "button" });
+        // Keep the native image button intact; the surrounding margin is our border.
+        var frame = cell.add("group");
+        frame.margins = 3;
+        frame.spacing = 0;
+        frame.gfpSelected = false;
+        frame.gfpIdleBrush = frame.graphics.backgroundColor;
+        frame.gfpSelectedBrush = frame.graphics.newBrush(frame.graphics.BrushType.SOLID_COLOR, [0.05, 0.55, 1, 1]);
+        previewFrames.push(frame);
+        var previewButton = frame.add("iconbutton", undefined, previewImage, { style: "button" });
         previewButton.preferredSize = [buttonSize, buttonSize];
         previewButton.minimumSize = previewButton.preferredSize;
         previewButton.maximumSize = previewButton.preferredSize;
         var similarity = Number(matchInfo.similarity);
         var similarityText = isFinite(similarity) ? similarity.toFixed(3) : "—";
         var isRecommended = items[i].is_recommended === true;
+        if (isRecommended && !foundRecommendation) {
+            initialIndex = i;
+            foundRecommendation = true;
+        }
         var recommendationLabel = String(items[i].recommendation_label || recommendation.label || "");
         var fullFileName = String(matchInfo.name || items[i].name || "");
         var displayFileName = fullFileName.replace(/^.*[\\\/]/, "");
@@ -553,7 +568,7 @@ function gfpShowDialog(payload) {
     chFaceScaleMatch.value = initialFaceScaleMatch;
     chFaceScaleMatch.helpTip = "Оперативная настройка только для текущей/следующих вставок: равномерно подгоняет размер лица по геометрии без поворота.";
 
-    var defaultStatus = "Выберите превью. Второй быстрый клик по выбранному кадру — вставить.";
+    var defaultStatus = "Стрелки — выбор кадра. Enter — вставить. Двойной клик — вставить.";
     if (recommendation && recommendation.message) {
         defaultStatus = recommendation.message + "\n" + defaultStatus;
     }
@@ -570,15 +585,29 @@ function gfpShowDialog(payload) {
     insertButton.enabled = false;
     var cancelButton = buttons.add("button", undefined, "Отмена", { name: "cancel" });
 
+    function gfpRefreshSelectionFrame(index) {
+        for (var fi = 0; fi < previewFrames.length; fi++) {
+            var frame = previewFrames[fi];
+            var selected = fi == index;
+            if (frame.gfpSelected != selected) {
+                frame.gfpSelected = selected;
+                frame.graphics.backgroundColor = selected ? frame.gfpSelectedBrush : frame.gfpIdleBrush;
+                frame.notify("onDraw");
+            }
+        }
+    }
+
     function gfpSelectIndex(index) {
         if (index < 0 || index >= payload.matches.length) {
             selectedIndex = -1;
+            gfpRefreshSelectionFrame(-1);
             insertButton.enabled = false;
             status.text = defaultStatus;
             w.update();
             return;
         }
         selectedIndex = index;
+        gfpRefreshSelectionFrame(index);
         var isActiveFile = payload.matches[index] && payload.matches[index].is_active === true;
         insertButton.enabled = !isActiveFile;
         status.text = isActiveFile
@@ -622,6 +651,35 @@ function gfpShowDialog(payload) {
             status.text = "Настройки сохранены. Для обновления подсветки лучшего дубля перезапустите текущий поиск лица.";
             w.update();
         }
+    };
+
+    w.addEventListener("keydown", function (event) {
+        var key = event.keyName;
+        if (key == "Enter" && event.target && typeof event.target.gfpIndex == "number") {
+            event.preventDefault();
+            event.stopPropagation();
+            if (insertButton.enabled) w.close(1);
+            return;
+        }
+        if (key != "Left" && key != "Right" && key != "Up" && key != "Down") return;
+        if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+        event.preventDefault();
+        event.stopPropagation();
+        var next = selectedIndex >= 0 ? selectedIndex : initialIndex;
+        var col = next % columns;
+        if (key == "Left" && col > 0) next--;
+        if (key == "Right" && col < columns - 1 && next + 1 < items.length) next++;
+        if (key == "Up" && next >= columns) next -= columns;
+        if (key == "Down" && (Math.floor(next / columns) + 1) * columns < items.length) {
+            next = Math.min(next + columns, items.length - 1);
+        }
+        // Navigation must not complete a previous mouse double-click.
+        lastClickIndex = -1;
+        lastClickTime = 0;
+        gfpSelectIndex(next);
+    }, true);
+    w.onShow = function () {
+        gfpSelectIndex(initialIndex);
     };
 
     w.center();
