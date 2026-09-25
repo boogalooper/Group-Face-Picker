@@ -1,4 +1,5 @@
 ﻿#target photoshop
+var GFP_SHIFT_LAUNCH = !!ScriptUI.environment.keyboardState.shiftKey;
 /*
 // BEGIN__HARVEST_EXCEPTION_ZSTRING
 <javascriptresource>
@@ -17,7 +18,7 @@
 
 var GFP_NAME = "Group Face Picker";
 var GFP_UUID = "9a189321-e07f-40ff-8394-156a4bd48cf5";
-var GFP_VERSION = "0.6.8";
+var GFP_VERSION = "0.6.21";
 var GFP_DEFAULT_HOST = "127.0.0.1";
 var GFP_DEFAULT_PORT_SEND = 6420;
 var GFP_DEFAULT_PORT_LISTEN = 6421;
@@ -43,8 +44,6 @@ var GFP_SERVER_START_CANCELLED = false;
 var GFP_SERVER_START_TIMEOUT = 120000;
 var GFP_LAST_SERVER_LAUNCHER = "";
 var GFP_S2T = stringIDToTypeID;
-var GFP_KEYBOARD_STATE = ScriptUI.environment.keyboardState;
-var GFP_SHIFT_LAUNCH = !!(GFP_KEYBOARD_STATE && GFP_KEYBOARD_STATE.shiftKey);
 var GFP_SETTINGS = gfpLoadConfig();
 gfpApplyConfig(GFP_SETTINGS);
 
@@ -52,7 +51,7 @@ try {
     // Как в img2img helper: Shift действует только на текущий запуск.
     // Для Group Face Picker это короткий путь непосредственно к настройкам;
     // основной поиск/вставка в этот запуск не выполняются.
-    if (GFP_SHIFT_LAUNCH) {
+    if (GFP_SHIFT_LAUNCH || ScriptUI.environment.keyboardState.shiftKey || !app.documents.length) {
         gfpShowSettingsDialog();
     } else {
         gfpMain();
@@ -98,7 +97,7 @@ function gfpMain() {
         }
         if (!ping || ping.type != "answer") {
             var startupDetails = GFP_LAST_SERVER_LAUNCHER ? ("\n\nПроверенный путь автозапуска:\n" + GFP_LAST_SERVER_LAUNCHER) : "";
-            if (confirm("Python-сервер не запущен или недоступен по текущему адресу. Автоматический запуск не удался." + startupDetails + "\n\nОткрыть настройки подключения?")) {
+            if (confirm("Python-сервер не запущен или недоступен по текущему адресу. Время ожидания истекло. Запустите run_server.bat вручную." + startupDetails + "\n\nОткрыть настройки подключения?")) {
                 // Чтение Quick Mask могло временно перевести документ в обычный
                 // режим выделения. Настройки не должны оставлять документ изменённым.
                 gfpRestoreQuickMaskState(state);
@@ -259,7 +258,7 @@ function gfpPollSelectionJob() {
             return false;
         }
         var progress = Math.max(0, Math.min(1, Number(status.progress) || 0));
-        if (!gfpUpdateNativeProgress(Math.round(progress * 1000), 1000, String(status.text || "Подготовка превью лиц..."))) {
+        if (!gfpUpdateNativeProgress(Math.round(progress * 1000), 1000, String(status.text || "Подготовка превью лиц...") + " · " + Math.floor(((new Date()).getTime() - started) / 1000) + " с")) {
             GFP_PENDING_JOB_CANCELLED = true;
             gfpCancelServerJob(GFP_PENDING_JOB_ID);
             return false;
@@ -431,6 +430,39 @@ function gfpClearSelectionAfterCancel(state) {
     }
 }
 
+// Bounded contribution from face height; no rotation or anisotropic scaling.
+function gfpEstimateFaceScale(eyeRatio, heightRatio) {
+    if (!isFinite(eyeRatio) || !isFinite(heightRatio) || eyeRatio <= 0 || heightRatio <= 0) {
+        throw new Error("Некорректные пропорции лица для масштабирования.");
+    }
+    var relativeHeight = heightRatio / eyeRatio;
+    // Strong disagreement indicates pose/expression differences: use eyes only.
+    if (relativeHeight < 0.8 || relativeHeight > 1.25) return eyeRatio;
+    var weight = 0.25 * Math.max(0, 1 - Math.abs(Math.log(relativeHeight)) / Math.log(1.25));
+    return eyeRatio * Math.exp(weight * Math.log(relativeHeight));
+}
+
+function gfpFacePlacement(eyeX, eyeY, targetX, targetY, scale, width, height, sourceWidth, sourceHeight) {
+    var values = [eyeX, eyeY, targetX, targetY, scale, width, height, sourceWidth, sourceHeight];
+    for (var i = 0; i < values.length; i++) {
+        if (!isFinite(values[i])) throw new Error("Некорректные координаты лица.");
+    }
+    if (scale <= 0 || width <= 0 || height <= 0) throw new Error("Некорректный размер фрагмента.");
+    var x = eyeX - targetX / scale;
+    var y = eyeY - targetY / scale;
+    if (x < 0 || y < 0 || x + width / scale > sourceWidth || y + height / scale > sourceHeight) {
+        throw new Error("Точное совмещение требует фрагмент за пределами исходного кадра.");
+    }
+    // A small margin prevents edge gaps after fractional translation/resampling.
+    var margin = Math.ceil(2 / Math.min(1, scale));
+    var left = Math.max(0, Math.floor(x) - margin);
+    var top = Math.max(0, Math.floor(y) - margin);
+    var right = Math.min(sourceWidth, Math.ceil(x + width / scale) + margin);
+    var bottom = Math.min(sourceHeight, Math.ceil(y + height / scale) + margin);
+    return {left: left, top: top, right: right, bottom: bottom,
+        offsetX: (left - x) * scale, offsetY: (top - y) * scale};
+}
+
 function gfpShowDialog(payload) {
     var items = payload.previews && payload.previews.items ? payload.previews.items : [];
     if (!items.length || items.length != payload.matches.length) {
@@ -441,14 +473,13 @@ function gfpShowDialog(payload) {
     var lastClickIndex = -1;
     var lastClickTime = 0;
     var previewButtons = [];
-    var previewFrames = [];
     var initialIndex = 0;
     var foundRecommendation = false;
     var recommendation = payload.previews && payload.previews.recommendation ? payload.previews.recommendation : {};
     var columns = Math.max(1, Number(payload.previews.columns) || 1);
     var thumbWidth = Math.max(32, Number(payload.previews.thumb_width) || 96);
     var buttonSize = thumbWidth + 8;
-    var contentWidth = Math.max(420, columns * (buttonSize + 10));
+    var contentWidth = Math.max(420, columns * (buttonSize + 4));
 
     var w = new Window("dialog", String(payload.app_name) + " " + String(payload.version));
     w.orientation = "column";
@@ -490,13 +521,8 @@ function gfpShowDialog(payload) {
             throw new Error("PNG-превью не найдено: " + previewFile.fsName);
         }
 
-        // В Photoshop ScriptUI обычный image может отображаться, но не получать
-        // клики. iconbutton является настоящим интерактивным контролом и сам
-        // хранит индекс кадра, поэтому координаты мыши больше не используются.
-        // iconbutton использует отдельные изображения normal/disabled/pressed/rollover.
-        // Если передать только normal, Photoshop в некоторых версиях очищает
-        // картинку при hover/pressed. Один и тот же PNG для всех четырёх
-        // состояний оставляет превью неизменным при наведении и нажатии.
+        // Static previews have no native hover/pressed states.
+        // Mouse presses are handled by the grid in the capture phase.
         var matchInfo = payload.matches[i] || {};
         var isActiveFile = matchInfo.is_active === true;
         var cell = row.add("group");
@@ -505,16 +531,16 @@ function gfpShowDialog(payload) {
         cell.spacing = 1;
         cell.margins = 0;
 
-        var previewImage = ScriptUI.newImage(previewFile, previewFile, previewFile, previewFile);
-        // Keep the native image button intact; the surrounding margin is our border.
-        var frame = cell.add("group");
-        frame.margins = 3;
-        frame.spacing = 0;
-        frame.gfpSelected = false;
-        frame.gfpIdleBrush = frame.graphics.backgroundColor;
-        frame.gfpSelectedBrush = frame.graphics.newBrush(frame.graphics.BrushType.SOLID_COLOR, [0.05, 0.55, 1, 1]);
-        previewFrames.push(frame);
-        var previewButton = frame.add("iconbutton", undefined, previewImage, { style: "button" });
+        var previewImage = ScriptUI.newImage(previewFile);
+        var selectedFile = new File(String(items[i].selected_path || ""));
+        if (!items[i].selected_path || !selectedFile.exists) {
+            throw new Error("Не найдено превью с рамкой. Перезапустите Python-сервер из обновлённой папки.");
+        }
+        var selectedImage = ScriptUI.newImage(selectedFile);
+        var previewButton = cell.add("image", undefined, previewImage);
+        previewButton.gfpNormalImage = previewImage;
+        previewButton.gfpSelectedImage = selectedImage;
+        previewButton.gfpSelected = false;
         previewButton.preferredSize = [buttonSize, buttonSize];
         previewButton.minimumSize = previewButton.preferredSize;
         previewButton.maximumSize = previewButton.preferredSize;
@@ -525,7 +551,6 @@ function gfpShowDialog(payload) {
             initialIndex = i;
             foundRecommendation = true;
         }
-        var recommendationLabel = String(items[i].recommendation_label || recommendation.label || "");
         var fullFileName = String(matchInfo.name || items[i].name || "");
         var displayFileName = fullFileName.replace(/^.*[\\\/]/, "");
         var extensionPos = displayFileName.lastIndexOf(".");
@@ -538,11 +563,8 @@ function gfpShowDialog(payload) {
         if (!displayFileName.length) {
             displayFileName = "—";
         }
-        previewButton.helpTip = fullFileName + "\nСходство: " + similarityText + (isActiveFile ? "\nТекущий открытый файл" : "") + (isRecommended ? "\nРекомендовано: " + recommendationLabel : "");
         previewButton.gfpIndex = i;
-        previewButton.onClick = function () {
-            gfpHandlePreviewClick(Number(this.gfpIndex));
-        };
+        cell.gfpIndex = i;
 
         var similarityCaption = isActiveFile ? ("ТЕКУЩИЙ · " + similarityText) : similarityText;
         if (isRecommended) {
@@ -551,7 +573,6 @@ function gfpShowDialog(payload) {
         var previewCaption = displayFileName + "\n" + similarityCaption;
         var activeLabel = cell.add("statictext", undefined, previewCaption, { multiline: true });
         activeLabel.justify = "center";
-        activeLabel.helpTip = previewButton.helpTip;
         activeLabel.preferredSize = [buttonSize, 32];
         if (isRecommended) {
             try {
@@ -562,6 +583,18 @@ function gfpShowDialog(payload) {
         }
         previewButtons.push(previewButton);
     }
+
+    grid.addEventListener("mousedown", function (event) {
+        if (event.button > 0) return;
+        var control = event.target;
+        while (control && control != grid) {
+            if (typeof control.gfpIndex == "number") {
+                gfpHandlePreviewClick(Number(control.gfpIndex));
+                return;
+            }
+            control = control.parent;
+        }
+    }, true);
 
     var initialFaceScaleMatch = GFP_SETTINGS.face_scale_match === true;
     var chFaceScaleMatch = w.add("checkbox", undefined, "Подгонять масштаб лица");
@@ -586,13 +619,12 @@ function gfpShowDialog(payload) {
     var cancelButton = buttons.add("button", undefined, "Отмена", { name: "cancel" });
 
     function gfpRefreshSelectionFrame(index) {
-        for (var fi = 0; fi < previewFrames.length; fi++) {
-            var frame = previewFrames[fi];
+        for (var fi = 0; fi < previewButtons.length; fi++) {
+            var button = previewButtons[fi];
             var selected = fi == index;
-            if (frame.gfpSelected != selected) {
-                frame.gfpSelected = selected;
-                frame.graphics.backgroundColor = selected ? frame.gfpSelectedBrush : frame.gfpIdleBrush;
-                frame.notify("onDraw");
+            if (button.gfpSelected != selected) {
+                button.gfpSelected = selected;
+                button.image = selected ? button.gfpSelectedImage : button.gfpNormalImage;
             }
         }
     }
@@ -609,12 +641,17 @@ function gfpShowDialog(payload) {
         selectedIndex = index;
         gfpRefreshSelectionFrame(index);
         var isActiveFile = payload.matches[index] && payload.matches[index].is_active === true;
+        // Move focus BEFORE disabling its current owner. Static images cannot
+        // receive keyboard focus. Focusing the checkbox does not change its value.
+        if (isActiveFile) {
+            try { chFaceScaleMatch.active = true; } catch (focusTransferError) {}
+        }
         insertButton.enabled = !isActiveFile;
         status.text = isActiveFile
             ? "Текущий открытый файл — показан для сравнения и не вставляется сам в себя."
             : "Выбран кадр " + String(index + 1) + " из " + String(payload.matches.length) + ".";
         try {
-            previewButtons[index].active = true;
+            if (insertButton.enabled) insertButton.active = true;
         } catch (focusError) {
         }
         w.update();
@@ -703,6 +740,8 @@ function gfpShowDialog(payload) {
     for (var ci = 0; ci < previewButtons.length; ci++) {
         try {
             previewButtons[ci].image = null;
+            previewButtons[ci].gfpNormalImage = null;
+            previewButtons[ci].gfpSelectedImage = null;
         } catch (imageError) {
         }
     }
@@ -794,10 +833,13 @@ function gfpInsertCandidate(payload, index) {
         var sourceCropWidth = expectedWidth;
         var sourceCropHeight = expectedHeight;
 
-        // RAW всегда требует пересчёта после фактического открытия Camera Raw.
-        // При включённой подгонке масштаба тот же пересчёт выполняется для любого
-        // формата, чтобы коэффициент строился по реальному открытому документу.
-        if (item.is_raw || faceScaleEnabled) {
+        if (!item.is_raw && (openedSourceWidth != analysisSourceWidth || openedSourceHeight != analysisSourceHeight)) {
+            throw new Error("Размер открытого исходного кадра не совпадает с размером, использованным распознаванием.");
+        }
+        var placementOffsetX = 0;
+        var placementOffsetY = 0;
+        // Recompute from actual document dimensions in both insertion modes.
+        {
             var kps = item.candidate_kps_normalized || [];
             var offsets = item.target_eye_offsets || [];
             if (kps.length < 2 || offsets.length < 2) {
@@ -827,27 +869,28 @@ function gfpInsertCandidate(payload, index) {
                 if (!(eyeWidth > 1) || !(faceHeight > 1) || !(targetFaceWidth > 1) || !(targetFaceHeight > 1)) {
                     throw new Error("Не удалось надёжно рассчитать размер лица для масштабирования.");
                 }
-                faceScale = Math.max(targetFaceWidth / eyeWidth, targetFaceHeight / faceHeight);
+                // Eyes are the primary size cue. Mouth movement must not force
+                // the larger of two ratios, as it did in earlier versions.
+                faceScale = gfpEstimateFaceScale(targetFaceWidth / eyeWidth, targetFaceHeight / faceHeight);
                 if (!isFinite(faceScale) || faceScale < 0.25 || faceScale > 4.0) {
                     throw new Error("Получен недопустимый коэффициент масштаба лица: " + String(faceScale));
                 }
-                sourceCropWidth = Math.max(1, Math.ceil(expectedWidth / faceScale));
-                sourceCropHeight = Math.max(1, Math.ceil(expectedHeight / faceScale));
             }
 
-            cropLeft = Math.round(((eye0x - Number(offsets[0][0]) / faceScale) +
-                (eye1x - Number(offsets[1][0]) / faceScale)) * 0.5);
-            cropTop = Math.round(((eye0y - Number(offsets[0][1]) / faceScale) +
-                (eye1y - Number(offsets[1][1]) / faceScale)) * 0.5);
-            cropRight = cropLeft + sourceCropWidth;
-            cropBottom = cropTop + sourceCropHeight;
-            if (cropLeft < 0 || cropTop < 0 || cropRight > openedSourceWidth || cropBottom > openedSourceHeight) {
-                throw new Error(faceScaleEnabled
-                    ? "Подгонка масштаба требует фрагмент за пределами исходного кадра. Этот донор нельзя вставить с выбранным масштабом."
-                    : "После открытия RAW рассчитанный фрагмент выходит за границы документа.");
-            }
-        } else if (openedSourceWidth != analysisSourceWidth || openedSourceHeight != analysisSourceHeight) {
-            throw new Error("Размер открытого исходного кадра не совпадает с размером, использованным распознаванием.");
+            var placement = gfpFacePlacement(
+                (eye0x + eye1x) * 0.5, (eye0y + eye1y) * 0.5,
+                (Number(offsets[0][0]) + Number(offsets[1][0])) * 0.5,
+                (Number(offsets[0][1]) + Number(offsets[1][1])) * 0.5,
+                faceScale, expectedWidth, expectedHeight, openedSourceWidth, openedSourceHeight
+            );
+            cropLeft = placement.left;
+            cropTop = placement.top;
+            cropRight = placement.right;
+            cropBottom = placement.bottom;
+            sourceCropWidth = cropRight - cropLeft;
+            sourceCropHeight = cropBottom - cropTop;
+            placementOffsetX = placement.offsetX;
+            placementOffsetY = placement.offsetY;
         }
 
         sourceDocument.crop([
@@ -886,7 +929,7 @@ function gfpInsertCandidate(payload, index) {
         var layerWidth = Math.round(layerRight - layerLeft);
         var layerHeight = Math.round(layerBottom - layerTop);
 
-        if (faceScaleEnabled && Math.abs(faceScale - 1.0) > 0.0005) {
+        if (faceScaleEnabled && faceScale != 1.0) {
             // Равномерный масштаб — единственная дополнительная трансформация.
             // Поворот не выполняется. TOPLEFT соответствует геометрии crop:
             // offsets/scale были рассчитаны относительно его верхнего левого угла.
@@ -905,15 +948,15 @@ function gfpInsertCandidate(payload, index) {
                 targetHistory = null;
                 throw new Error("Photoshop округлил масштабированный слой меньше целевой области. Операция отменена.");
             }
-        } else if (layerWidth != expectedWidth || layerHeight != expectedHeight) {
+        } else if (layerWidth != sourceCropWidth || layerHeight != sourceCropHeight) {
             target.activeHistoryState = targetHistory;
             targetHistory = null;
             throw new Error("Photoshop изменил размер вставленного слоя. Операция отменена: масштабирование выключено.");
         }
 
         insertedLayer.translate(
-            UnitValue(Number(payload.target.selection.left) - layerLeft, "px"),
-            UnitValue(Number(payload.target.selection.top) - layerTop, "px")
+            UnitValue(Number(payload.target.selection.left) + placementOffsetX - layerLeft, "px"),
+            UnitValue(Number(payload.target.selection.top) + placementOffsetY - layerTop, "px")
         );
         insertedLayer.name = "Face from " + String(item.name);
 
@@ -1247,45 +1290,14 @@ function gfpEnsureServerAvailable() {
         return ping;
     }
 
-    var state = gfpLoadClientState();
-    var rememberedPath = String(state.server_launcher_path || "");
-    var stateMatches = String(state.server_host || "") == String(GFP_API_HOST) &&
-        Number(state.server_port || 0) == Number(GFP_API_PORT_SEND);
-    if (rememberedPath && !stateMatches) {
-        // Never launch a remembered executable that belongs to another server
-        // address/port configuration.
-        return null;
-    }
-    if (!rememberedPath && String(GFP_API_HOST).toLowerCase() != "127.0.0.1" && String(GFP_API_HOST).toLowerCase() != "localhost") {
-        // A fresh remote configuration cannot be started by executing a local
-        // BAT whose relationship to that remote host is unknown.
-        return null;
-    }
-    var launcher = gfpFindServerLauncher(stateMatches ? state : null);
-    if (!launcher) {
-        return null;
-    }
-    GFP_LAST_SERVER_LAUNCHER = launcher.fsName;
-    var launchResult = null;
-    try {
-        launchResult = launcher.execute();
-    } catch (launchError) {
-        return null;
-    }
-    // Match the proven img2img-helper pattern: only an explicit false means
-    // that the OS rejected File.execute(). Some Photoshop/ExtendScript builds
-    // do not reliably return a strict boolean true on successful hand-off.
-    if (launchResult === false) {
-        GFP_SERVER_START_ERROR = "File.execute() вернул false для: " + launcher.fsName;
-        return null;
-    }
-
+    // The server is started manually. A missed callback does not prove that
+    // its process is absent: it may still be loading models or be busy.
     GFP_SERVER_START_OK = false;
     GFP_SERVER_START_ERROR = "";
     GFP_SERVER_START_RESPONSE = null;
     GFP_SERVER_START_CANCELLED = false;
     try {
-        app.doForcedProgress("Запуск Group Face Picker server", "gfpPollServerStartup();");
+        app.doForcedProgress("Ожидание Group Face Picker server", "gfpPollServerStartup();");
     } catch (progressError) {
         if (gfpIsUserCancelError(progressError)) {
             GFP_SERVER_START_CANCELLED = true;
@@ -1330,7 +1342,7 @@ function gfpPollServerStartup() {
             return true;
         }
         var progress = Math.min(950, Math.round((elapsed / GFP_SERVER_START_TIMEOUT) * 950));
-        if (!gfpUpdateNativeProgress(progress, 1000, "Ожидание запуска Python-сервера...")) {
+        if (!gfpUpdateNativeProgress(progress, 1000, "Ожидание Python-сервера (запустите run_server.bat вручную)...")) {
             GFP_SERVER_START_CANCELLED = true;
             GFP_SERVER_START_ERROR = "";
             return false;
@@ -1687,8 +1699,8 @@ function gfpShowSettingsDialog() {
     var rememberedLauncher = gfpLoadClientState();
     var launcherHint = serverPanel.add("statictext", undefined,
         rememberedLauncher.server_launcher_path ?
-            ("Автозапуск: " + String(rememberedLauncher.server_launcher_path)) :
-            "Автозапуск: путь к run_server.bat ещё не запомнен.",
+            ("Запускайте вручную: " + String(rememberedLauncher.server_launcher_path)) :
+            "Запускайте сервер вручную через run_server.bat.",
         { multiline: true });
     launcherHint.preferredSize = [470, 32];
 
@@ -1801,11 +1813,11 @@ function gfpShowSettingsDialog() {
     insertPanel.margins = 10;
     var chCollectStatistics = insertPanel.add("checkbox", undefined, "Собирать статистику для обучения");
     chCollectStatistics.value = current.collect_statistics === true;
-    chCollectStatistics.helpTip = "После успешной вставки сохраняется только пара: выбранное лицо > текущее лицо. Данные находятся в training_data рядом с Python-сервером и объединяются через merge_training_data.bat.";
+    chCollectStatistics.helpTip = "После успешной вставки сохраняется базовая пара: выбранное лицо > текущее лицо. Если вы заменили автоматически предложенный кадр, обучатель дополнительно использует: выбранное лицо > отвергнутая рекомендация. Данные находятся в training_data рядом с Python-сервером.";
     var recommendationRow = insertPanel.add("group");
     recommendationRow.orientation = "row";
     recommendationRow.alignChildren = ["left", "center"];
-    var recommendationLabel = recommendationRow.add("statictext", undefined, "Подсветка лучшего дубля");
+    var recommendationLabel = recommendationRow.add("statictext", undefined, "Рекомендация дубля");
     recommendationLabel.preferredSize = [230, 20];
     var dlRecommendation = recommendationRow.add("dropdownlist", undefined);
     dlRecommendation.preferredSize = [220, 24];
@@ -1817,7 +1829,7 @@ function gfpShowSettingsDialog() {
     ]);
     gfpRestoreValueDropdown(dlRecommendation, current.recommendation_model, "public");
     var recommendationHint = insertPanel.add("statictext", undefined,
-        "Тонкая зелёная рамка показывает один рекомендованный дубль. Публичная FBP оценивает удачность портрета, а личная модель может использовать ваш накопленный выбор.",
+        "Подпись «ЛУЧШИЙ» отмечает рекомендованный дубль. Публичная FBP оценивает удачность портрета, а личная модель может использовать ваш накопленный выбор.",
         { multiline: true });
     recommendationHint.preferredSize = [470, 34];
     var recommendationStatusText = "Публичная FBP: нужен install.bat. Личная модель: положите personal_preference.onnx в папку personal_model рядом с Python-сервером.";
@@ -1970,6 +1982,10 @@ function gfpShowSettingsDialog() {
                             rollbackConfig.server_host = localCurrent.server_host;
                             rollbackConfig.server_port = localCurrent.server_port;
                             rollbackConfig.face_scale_match = localCurrent.face_scale_match === true;
+                            // collect_statistics is a Photoshop-side option and is
+                            // absent from server settings. Preserve it explicitly
+                            // during rollback, just like face_scale_match.
+                            rollbackConfig.collect_statistics = localCurrent.collect_statistics === true;
                             gfpSaveConfig(rollbackConfig);
                             gfpApplyConfig(rollbackConfig);
                         }

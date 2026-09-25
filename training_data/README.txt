@@ -3,8 +3,15 @@ Group Face Picker training data
 
 Statistics collection is controlled only from the JSX Settings dialog and is OFF by default.
 When "Собирать статистику для обучения" is enabled, a successful face insertion stores:
-- events/<event-id>.json  - one explicit pairwise preference: chosen face > current face
+- events/<event-id>.json  - the original explicit preference: chosen face > current face
 - faces/<sha256>.jpg      - 320x320 cached face crops referenced by events
+
+If Group Face Picker showed an automatic recommendation and you chose a different face, the same
+event also stores the rejected recommended face. The updated trainer can then add one extra explicit
+pair: chosen face > rejected recommendation. No other visible candidates are treated as rejected.
+
+The event schema stays at version 1. Existing datasets need no conversion: old events remain valid,
+and older trainers simply ignore the optional recommendation metadata in newer events.
 
 The same face image is stored only once because filenames use SHA-256 content hashes.
 Events use unique/idempotent IDs, so copying the same dataset more than once is safe.

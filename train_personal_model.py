@@ -31,6 +31,7 @@ class PairExample:
     current_path: Path
     event_ids: tuple[str, ...]
     collector_ids: tuple[str, ...]
+    sources: tuple[str, ...]
 
 
 class UnionFind:
@@ -113,6 +114,30 @@ def load_pairs(training_dir: Path) -> tuple[list[PairExample], dict[str, int]]:
     event_count = 0
     collectors: set[str] = set()
     verified_faces: set[str] = set()
+    base_pair_observations = 0
+    recommendation_overrides = 0
+    recommendation_pair_observations = 0
+    recommendation_same_as_current = 0
+    recommendation_metadata_invalid = 0
+
+    def add_pair(
+        preferred_id: str,
+        less_id: str,
+        preferred_path: Path,
+        less_path: Path,
+        event_id: str,
+        collector_id: str,
+        source: str,
+    ) -> None:
+        pair_key = hashlib.sha256((preferred_id + ">" + less_id).encode("ascii")).hexdigest()
+        raw_by_orientation[(preferred_id, less_id)].append({
+            "event_id": event_id,
+            "collector_id": collector_id,
+            "chosen_path": preferred_path,
+            "current_path": less_path,
+            "pair_key": pair_key,
+            "source": source,
+        })
 
     for path in sorted(events_dir.glob("*.json")):
         event_count += 1
@@ -141,13 +166,51 @@ def load_pairs(training_dir: Path) -> tuple[list[PairExample], dict[str, int]]:
             collector_id = str(event.get("collector_id") or "").strip().lower()
             if collector_id:
                 collectors.add(collector_id)
-            raw_by_orientation[(chosen_id, current_id)].append({
-                "event_id": event_id,
-                "collector_id": collector_id,
-                "chosen_path": chosen_path,
-                "current_path": current_path,
-                "pair_key": expected_pair,
-            })
+
+            # Canonical v1 pair.  This is identical to the old trainer, so every
+            # previously collected dataset remains fully usable without migration.
+            add_pair(chosen_id, current_id, chosen_path, current_path, event_id, collector_id, "current")
+            base_pair_observations += 1
+
+            # Newer v1 events may additionally carry the automatically recommended
+            # face.  It becomes a second *explicit* preference only if the user
+            # overrode that recommendation.  Merely accepting the initial choice
+            # does not fabricate a new comparison.
+            context = event.get("context") if isinstance(event.get("context"), dict) else {}
+            recommended_asset = event.get("recommended")
+            recommendation_overridden = context.get("recommendation_overridden") is True
+            effective_mode = str(context.get("recommendation_effective_mode") or "off").strip().lower()
+            if isinstance(recommended_asset, dict) and recommendation_overridden and effective_mode in ("public", "personal", "combined"):
+                # Recommendation metadata is an optional extension of the v1 event.
+                # It must never invalidate the canonical chosen > current pair.
+                try:
+                    recommended_id, recommended_path = _face_ref(
+                        event, "recommended", training_dir, verified_faces
+                    )
+                except Exception as exc:
+                    recommendation_metadata_invalid += 1
+                    print(
+                        f"WARNING: событие {path.name}: дополнительная рекомендация пропущена: {exc}",
+                        file=sys.stderr,
+                    )
+                else:
+                    if recommended_id != chosen_id:
+                        recommendation_overrides += 1
+                        if recommended_id == current_id:
+                            # Same information as chosen > current; keep only one raw
+                            # observation so counters and weighting are not inflated.
+                            recommendation_same_as_current += 1
+                        else:
+                            add_pair(
+                                chosen_id,
+                                recommended_id,
+                                chosen_path,
+                                recommended_path,
+                                event_id,
+                                collector_id,
+                                "recommendation",
+                            )
+                            recommendation_pair_observations += 1
         except Exception as exc:
             invalid += 1
             print(f"WARNING: пропущено повреждённое событие {path.name}: {exc}", file=sys.stderr)
@@ -173,14 +236,28 @@ def load_pairs(training_dir: Path) -> tuple[list[PairExample], dict[str, int]]:
             current_id=current_id,
             chosen_path=Path(first["chosen_path"]),
             current_path=Path(first["current_path"]),
-            event_ids=tuple(str(e["event_id"]) for e in entries),
+            event_ids=tuple(sorted({str(e["event_id"]) for e in entries})),
             collector_ids=tuple(sorted({str(e["collector_id"]) for e in entries if e["collector_id"]})),
+            sources=tuple(sorted({str(e["source"]) for e in entries})),
         ))
 
+    unique_base_pairs = sum(1 for pair in pairs if "current" in pair.sources)
+    unique_recommendation_pairs = sum(1 for pair in pairs if "recommendation" in pair.sources)
+    additional_unique_recommendation_pairs = sum(
+        1 for pair in pairs if "recommendation" in pair.sources and "current" not in pair.sources
+    )
     stats = {
         "events_found": event_count,
         "events_invalid": invalid,
         "unique_pairs": len(pairs),
+        "unique_base_pairs": unique_base_pairs,
+        "unique_recommendation_pairs": unique_recommendation_pairs,
+        "additional_unique_recommendation_pairs": additional_unique_recommendation_pairs,
+        "base_pair_observations": base_pair_observations,
+        "recommendation_overrides": recommendation_overrides,
+        "recommendation_pair_observations": recommendation_pair_observations,
+        "recommendation_same_as_current": recommendation_same_as_current,
+        "recommendation_metadata_invalid": recommendation_metadata_invalid,
         "duplicate_same_direction_events": duplicate_events,
         "contradictory_pairs_excluded": len(contradictory_unordered),
         "collectors": len(collectors),
@@ -487,6 +564,9 @@ def write_report(output_dir: Path, metadata: dict[str, Any]) -> None:
 
 - Событий найдено: {metadata['dataset']['events_found']}
 - Уникальных непротиворечивых пар: {metadata['dataset']['unique_pairs']}
+- Базовых пар `chosen > current`: {metadata['dataset']['unique_base_pairs']}
+- Дополнительных уникальных пар `chosen > rejected recommendation`: {metadata['dataset']['additional_unique_recommendation_pairs']}
+- Отклонений автоматической рекомендации в новых событиях: {metadata['dataset']['recommendation_overrides']}
 - Train pairs: {metadata['dataset']['train_pairs']}
 - Validation pairs: {metadata['dataset']['validation_pairs']}
 - Способ разделения: `{metadata['dataset']['split_method']}`
@@ -499,8 +579,10 @@ def write_report(output_dir: Path, metadata: dict[str, Any]) -> None:
 
 ## Важно
 
-Эта точность означает долю отложенных пар, для которых модель правильно предсказала
-`chosen > current`. Она не является универсальной оценкой красоты человека.
+Эта точность означает долю отложенных pairwise-сравнений, для которых модель правильно
+предсказала ваше предпочтение. Старые события дают `chosen > current`; новые события могут
+дополнительно дать `chosen > rejected recommendation`, если вы заменили предложенный кадр.
+Она не является универсальной оценкой красоты человека.
 
 Если `split_method` содержит `face-overlap-possible`, validation менее строгая: соберите больше
 независимых сравнений и переобучите модель.
@@ -535,6 +617,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Dataset:      {training_dir}")
         print(f"Events:       {dataset_stats['events_found']}")
         print(f"Unique pairs: {dataset_stats['unique_pairs']}")
+        print(f"  base chosen>current:                 {dataset_stats['unique_base_pairs']}")
+        print(f"  extra chosen>rejected recommendation:{dataset_stats['additional_unique_recommendation_pairs']}")
+        print(f"Recommendation overrides recorded:     {dataset_stats['recommendation_overrides']}")
         print(f"Collectors:   {dataset_stats['collectors']}")
         if dataset_stats["events_invalid"]:
             print(f"Invalid events skipped: {dataset_stats['events_invalid']}")

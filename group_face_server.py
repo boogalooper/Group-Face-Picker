@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 APP_NAME = "Group Face Picker"
-VERSION = "0.6.8"
+VERSION = "0.6.21"
 SETTINGS_SCHEMA_VERSION = 9
 SERVER_INSTANCE_ID = uuid.uuid4().hex[:12]
 CACHE_VERSION = 13
@@ -71,8 +71,8 @@ RECOMMENDATION_LABELS = {
     "personal": "Моя обученная модель",
     "combined": "Публичная FBP + моя модель",
 }
-RECOMMENDATION_BORDER_COLOR = (44, 184, 74)
-RECOMMENDATION_BORDER_MIN_PX = 2
+SELECTION_BORDER_COLOR = (13, 140, 255)
+SELECTION_BORDER_MIN_PX = 2
 
 ROOT = Path(__file__).resolve().parent
 MODEL_ROOT = ROOT / "models" / "insightface"
@@ -466,6 +466,7 @@ class QueryContext:
     target_face_width: float
     target_face_height: float
     candidates: List[QueryCandidate]
+    recommendation: Dict[str, Any]
 
 
 class PublicPreferenceScorer:
@@ -827,7 +828,6 @@ def _score_candidates_for_recommendation(
                 "personal_score": None,
                 "effective_score": None,
                 "is_recommended": False,
-                "variant_tag": "",
             }
             for _ in candidates
         ],
@@ -934,7 +934,6 @@ def _score_candidates_for_recommendation(
     if best_index >= 0:
         info["recommended_index"] = int(best_index)
         info["items"][best_index]["is_recommended"] = True
-        info["items"][best_index]["variant_tag"] = "best_" + effective_mode
         info["status"] = "ok" if effective_mode == mode else "partial"
         if mode == "combined" and effective_mode in ("public", "personal"):
             info["message"] = (
@@ -946,7 +945,7 @@ def _score_candidates_for_recommendation(
                 RECOMMENDATION_LABELS[mode], RECOMMENDATION_LABELS[effective_mode]
             )
         else:
-            info["message"] = "Тонкой зелёной рамкой отмечен лучший дубль по критерию: %s." % RECOMMENDATION_LABELS[effective_mode]
+            info["message"] = "Подписью «ЛУЧШИЙ» отмечен дубль по критерию: %s." % RECOMMENDATION_LABELS[effective_mode]
     else:
         info["status"] = "unavailable"
         info["message"] = "Модель(и) загружены, но не удалось получить минимум две сопоставимые оценки."
@@ -1894,17 +1893,17 @@ def _preview_variant_path(face: FaceRecord, size: int) -> Path:
     return master.with_name(master.stem + "_%03d.png" % int(size))
 
 
-def _write_recommended_preview(source_path: Path, target_path: Path) -> None:
+def _write_selected_preview(source_path: Path, target_path: Path) -> None:
     from PIL import Image, ImageDraw
 
     with Image.open(source_path) as source:
         preview = source.convert("RGB")
         draw = ImageDraw.Draw(preview)
-        border = max(RECOMMENDATION_BORDER_MIN_PX, int(round(min(preview.width, preview.height) / 28.0)))
+        border = max(SELECTION_BORDER_MIN_PX, min(4, int(round(min(preview.width, preview.height) / 64.0))))
         for offset in range(border):
             draw.rectangle(
                 [offset, offset, max(offset, preview.width - 1 - offset), max(offset, preview.height - 1 - offset)],
-                outline=RECOMMENDATION_BORDER_COLOR,
+                outline=SELECTION_BORDER_COLOR,
             )
         temp = target_path.with_suffix(target_path.suffix + ".tmp")
         preview.save(temp, format="PNG", compress_level=1)
@@ -3163,8 +3162,8 @@ def _render_previews(candidates: List[QueryCandidate], job_id: Optional[str] = N
         _update_job(job_id, progress=0.90, status="running", text="Оценка лучших дублей...")
     _check_job_cancelled(job_id)
     recommendation = _score_candidates_for_recommendation(candidates, job_id=job_id)
-    _check_job_cancelled(job_id)
     recommended_index = int(recommendation.get("recommended_index", -1))
+    _check_job_cancelled(job_id)
     if job_id:
         _update_job(job_id, progress=0.93, status="running", text="Подготовка превью 0/%d..." % count)
 
@@ -3177,12 +3176,8 @@ def _render_previews(candidates: List[QueryCandidate], job_id: Optional[str] = N
     def prepare_one(index: int, candidate: QueryCandidate) -> Tuple[int, Dict[str, Any]]:
         _check_job_cancelled(job_id)
         item_recommendation = recommendation["items"][index]
-        variant_tag = str(item_recommendation.get("variant_tag") or "")
         base_path = _preview_variant_path(candidate.face, thumb)
-        recommended_path = (
-            base_path.with_name(base_path.stem + "_" + variant_tag + base_path.suffix)
-            if variant_tag else None
-        )
+        selected_path = base_path.with_name(base_path.stem + "_selected_blue_v2.png")
         generated_preview = None
         if not base_path.is_file():
             master = Path(candidate.face.preview_master_path)
@@ -3193,30 +3188,15 @@ def _render_previews(candidates: List[QueryCandidate], job_id: Optional[str] = N
             # faster and has no visual penalty; disk-size difference is tiny.
             generated_preview.save(temp, format="PNG", compress_level=1)
             os.replace(str(temp), str(base_path))
-        path = base_path
-        if recommended_path is not None:
-            if not recommended_path.is_file():
-                if generated_preview is not None:
-                    from PIL import ImageDraw
-                    highlighted = generated_preview.copy()
-                    draw = ImageDraw.Draw(highlighted)
-                    border = max(RECOMMENDATION_BORDER_MIN_PX, int(round(min(highlighted.width, highlighted.height) / 28.0)))
-                    for offset in range(border):
-                        draw.rectangle(
-                            [offset, offset, max(offset, highlighted.width - 1 - offset), max(offset, highlighted.height - 1 - offset)],
-                            outline=RECOMMENDATION_BORDER_COLOR,
-                        )
-                    temp = recommended_path.with_suffix(recommended_path.suffix + ".tmp")
-                    highlighted.save(temp, format="PNG", compress_level=1)
-                    os.replace(str(temp), str(recommended_path))
-                    highlighted.close()
-                else:
-                    _write_recommended_preview(base_path, recommended_path)
-            path = recommended_path
+        # Recommendation is text-only. Selection is controlled by JSX, which
+        # swaps these two cached images without changing the container background.
+        if not selected_path.is_file():
+            _write_selected_preview(base_path, selected_path)
         if generated_preview is not None:
             generated_preview.close()
         return index, {
-            "path": str(path),
+            "path": str(base_path),
+            "selected_path": str(selected_path),
             "name": candidate.name,
             "width": int(thumb),
             "height": int(thumb),
@@ -3411,6 +3391,7 @@ def _select_child(payload: Dict[str, Any], job_id: Optional[str] = None) -> Dict
             target_face_width=float(target_face_dims[0]),
             target_face_height=float(target_face_dims[1]),
             candidates=candidates,
+            recommendation=dict(previews.get("recommendation") or {}),
         )
         with QUERY_LOCK:
             QUERIES[query_id] = context
@@ -3511,16 +3492,17 @@ def _training_face_asset(candidate: QueryCandidate) -> Dict[str, Any]:
 
 
 def _record_preference(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Save one explicit user preference after Photoshop insertion succeeded.
+    """Save explicit user preference data after Photoshop insertion succeeded.
 
-    Only ``chosen > current`` is recorded. Other visible candidates are not
-    treated as rejected because the user may not have compared every preview.
-    The query id + selected index form an idempotent event key so a retried API
-    call cannot create a duplicate training event.
+    The original ``chosen > current`` pair remains the canonical event and is
+    kept unchanged for backward compatibility.  When a recommendation was
+    available, its face and provenance are stored as optional metadata.  A
+    trainer can then add ``chosen > recommended`` only when the user actually
+    overrode that recommendation.  Other visible candidates are never treated
+    as rejected because the user may not have compared them.
     """
-    # Statistics are controlled only by the persisted Settings value. The
-    # request flag is an additional guard from the JSX snapshot; both must be
-    # explicitly true so a stale/external request cannot enable collection.
+    # The JSX snapshots its persisted collection setting into this request.
+    # A false/missing flag must never create training data.
     if not _config_bool(payload.get("collect_statistics", False), False):
         return {"saved": False, "reason": "disabled"}
 
@@ -3541,6 +3523,19 @@ def _record_preference(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise UserVisibleError("The current face is missing from the preview context; statistics were not saved.")
     baseline = context.candidates[active_index]
 
+    recommendation = context.recommendation if isinstance(context.recommendation, dict) else {}
+    try:
+        recommended_index = int(recommendation.get("recommended_index", -1))
+    except (TypeError, ValueError):
+        recommended_index = -1
+    if recommended_index < 0 or recommended_index >= len(context.candidates):
+        recommended_index = -1
+    recommended_candidate = context.candidates[recommended_index] if recommended_index >= 0 else None
+    recommendation_requested_mode = str(recommendation.get("mode") or "off")
+    recommendation_effective_mode = str(recommendation.get("effective_mode") or "off")
+    recommendation_status = str(recommendation.get("status") or "disabled")
+    recommendation_overridden = recommended_index >= 0 and selected_index != recommended_index
+
     event_seed = (query_id + "|" + str(selected_index)).encode("utf-8", "surrogatepass")
     event_id = hashlib.sha256(event_seed).hexdigest()[:32]
 
@@ -3549,6 +3544,14 @@ def _record_preference(payload: Dict[str, Any]) -> Dict[str, Any]:
         TRAINING_FACES_DIR.mkdir(parents=True, exist_ok=True)
         baseline_asset = _training_face_asset(baseline)
         chosen_asset = _training_face_asset(chosen)
+        recommended_asset = None
+        if recommended_candidate is not None:
+            if recommended_index == selected_index:
+                recommended_asset = dict(chosen_asset)
+            elif recommended_index == active_index:
+                recommended_asset = dict(baseline_asset)
+            else:
+                recommended_asset = _training_face_asset(recommended_candidate)
         pair_key = hashlib.sha256(
             (chosen_asset["face_id"] + ">" + baseline_asset["face_id"]).encode("ascii")
         ).hexdigest()
@@ -3567,8 +3570,18 @@ def _record_preference(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "selected_index": selected_index,
                 "current_index": active_index,
                 "face_scale_match": bool(payload.get("face_scale_match", False)),
+                "recommended_index": recommended_index,
+                "recommendation_requested_mode": recommendation_requested_mode,
+                "recommendation_effective_mode": recommendation_effective_mode,
+                "recommendation_status": recommendation_status,
+                "recommendation_overridden": bool(recommendation_overridden),
             },
         }
+        if recommended_asset is not None:
+            # Optional field; schema_version intentionally stays at 1.  Older
+            # merge/train tools ignore unknown fields, while the updated trainer
+            # can use an explicit rejected recommendation as an extra pair.
+            event["recommended"] = recommended_asset
         target = TRAINING_EVENTS_DIR / (event_id + ".json")
         encoded = (json.dumps(event, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
         if target.is_file():
@@ -3583,11 +3596,14 @@ def _record_preference(payload: Dict[str, Any]) -> Dict[str, Any]:
             saved = True
 
     LOGGER.info(
-        "[TRAINING] %s event=%s chosen=%s current=%s pair=%s",
+        "[TRAINING] %s event=%s chosen=%s current=%s recommended=%s mode=%s overridden=%s pair=%s",
         "Saved" if saved else "Already present",
         event_id,
         chosen.name,
         baseline.name,
+        recommended_candidate.name if recommended_candidate is not None else "-",
+        recommendation_effective_mode,
+        recommendation_overridden,
         pair_key[:12],
     )
     return {
@@ -3837,8 +3853,10 @@ def _start_settings_job(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _handle_command(payload: Dict[str, Any]) -> Dict[str, Any]:
-    _cleanup_old_state()
     command = str(payload.get("command") or "")
+    # Control requests must not wait for disk cache I/O during analysis.
+    if command not in ("ping", "job_status", "cancel_job"):
+        _cleanup_old_state()
     if command == "ping":
         return _json_response("answer", {
             "version": VERSION,
@@ -3846,7 +3864,7 @@ def _handle_command(payload: Dict[str, Any]) -> Dict[str, Any]:
             "instance_id": SERVER_INSTANCE_ID,
             "provider": ENGINE.provider_name(),
             "settings": _get_runtime_config(),
-            "engine": ENGINE.current_state(),
+            "engine": {"mode": ENGINE._mode, "provider": ENGINE.provider_name(), "det_size": ENGINE._det_size},
             "recommendation_backends": RECOMMENDER.backend_status(),
             "server_root": str(ROOT),
             "run_server_path": str(ROOT / "run_server.bat"),
