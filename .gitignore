@@ -18,3 +18,4 @@ training_data/collector.json
 runtime/training_venv/*
 models/torch/*
 personal_model/*
+training_data/diagnostic_holdout.json

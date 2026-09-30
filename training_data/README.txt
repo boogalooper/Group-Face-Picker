@@ -37,9 +37,20 @@ TRAINING A PERSONAL MODEL
    - personal_preference.json
    - training_report.md
 
+On the first real training run the trainer also creates:
+   - training_data\diagnostic_holdout.json
+
+Keep this file on the main training computer. It fixes a small diagnostic set so later reports can
+measure progress on the same pairs. New events are not added to it automatically. The merge utility
+intentionally does not import diagnostic_holdout.json from other computers.
+
 The trainer removes duplicate exact pairs, excludes contradictory A>B / B>A pairs and tries to split
-validation without sharing the same face crop between train and validation. The model is intended to
-rank different frames of the same person. See the main README.md section "Обучение персональной модели".
+validation without sharing the same face crop between train and validation. It reports base
+chosen>current accuracy separately from the harder chosen>rejected-recommendation accuracy. After
+selecting the best epoch, the final ONNX head is trained again from scratch on all unique
+non-contradictory pairs, so validation/diagnostic data are not permanently withheld from the working
+model. The model is intended to rank different frames of the same person. See the main README.md
+section "Обучение персональной модели".
 
 Group Face Picker can use personal_model\personal_preference.onnx directly for preview recommendation.
 Choose "My trained model" or the combined public+personal mode in the JSX Settings dialog.

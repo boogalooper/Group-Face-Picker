@@ -18,7 +18,9 @@ DEFAULT_DATA = ROOT / "training_data"
 DEFAULT_OUTPUT = ROOT / "personal_model"
 SCHEMA_VERSION = 1
 MODEL_SCHEMA_VERSION = 1
+DIAGNOSTIC_SCHEMA_VERSION = 1
 DEFAULT_SEED = 20260908
+DEFAULT_DIAGNOSTIC_FRACTION = 0.10
 _ML_CACHE = None
 
 
@@ -316,6 +318,134 @@ def split_pairs_no_face_leakage(
     return train, val, "pair-random-face-overlap-possible"
 
 
+def _stable_pair_order_key(pair_key: str, seed: int) -> str:
+    return hashlib.sha256(f"{seed}:{pair_key}".encode("ascii")).hexdigest()
+
+
+def _diagnostic_target_size(pair_count: int, fraction: float) -> int:
+    if pair_count < 4:
+        return 0
+    requested = max(1, int(round(pair_count * fraction)))
+    # Keep the diagnostic anchor useful without taking too much data away from
+    # model selection.  The final exported model is refit on 100% of pairs, so
+    # this only affects early-stopping/model-selection training.
+    requested = max(20 if pair_count >= 80 else 1, requested)
+    requested = min(250, requested)
+    return min(requested, max(1, pair_count // 4))
+
+
+def load_or_create_diagnostic_holdout(
+    training_dir: Path,
+    pairs: list[PairExample],
+    fraction: float,
+    seed: int,
+    reset: bool = False,
+) -> tuple[list[PairExample], dict[str, Any]]:
+    """Return a fixed pair-level diagnostic anchor persisted across retraining.
+
+    The manifest stores only pair keys from the dataset present at creation time.
+    New pairs are deliberately *not* added later, so the diagnostic score remains
+    directly comparable between subsequent training runs.
+    """
+    manifest_path = training_dir / "diagnostic_holdout.json"
+    pair_by_key = {pair.pair_key: pair for pair in pairs}
+
+    manifest: dict[str, Any] | None = None
+    if manifest_path.is_file() and not reset:
+        try:
+            loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                raise ValueError("manifest is not an object")
+            if int(loaded.get("schema_version") or 0) != DIAGNOSTIC_SCHEMA_VERSION:
+                raise ValueError("unsupported diagnostic manifest schema")
+            keys = loaded.get("pair_keys")
+            if not isinstance(keys, list) or not all(isinstance(item, str) for item in keys):
+                raise ValueError("pair_keys is invalid")
+            manifest = loaded
+        except Exception as exc:
+            raise ValueError(
+                f"Повреждён {manifest_path.name}: {exc}. "
+                "Удалите его или запустите обучение с --reset-diagnostic-holdout."
+            ) from exc
+
+    created = manifest is None
+    if created:
+        target = _diagnostic_target_size(len(pairs), fraction)
+        ordered = sorted(pairs, key=lambda p: (_stable_pair_order_key(p.pair_key, seed), p.pair_key))
+
+        # Ensure the fixed anchor contains at least a small useful sample of the
+        # harder rejected-recommendation comparisons when they exist.  Without
+        # this, a 10% random anchor can contain only a handful of them and the
+        # source-specific metric becomes too noisy to be useful.
+        recommendation_candidates = [pair for pair in ordered if "recommendation" in pair.sources]
+        recommendation_target = 0
+        if recommendation_candidates and target > 0:
+            recommendation_target = min(
+                len(recommendation_candidates),
+                max(4 if len(recommendation_candidates) >= 8 else 1,
+                    int(round(len(recommendation_candidates) * 0.15))),
+                max(1, target // 3),
+            )
+        selected = recommendation_candidates[:recommendation_target]
+        selected_keys = {pair.pair_key for pair in selected}
+        for pair in ordered:
+            if len(selected) >= target:
+                break
+            if pair.pair_key not in selected_keys:
+                selected.append(pair)
+                selected_keys.add(pair.pair_key)
+
+        manifest = {
+            "schema_version": DIAGNOSTIC_SCHEMA_VERSION,
+            "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "seed": int(seed),
+            "fraction_at_creation": float(fraction),
+            "dataset_unique_pairs_at_creation": len(pairs),
+            "recommendation_pairs_at_creation": sum(1 for pair in pairs if "recommendation" in pair.sources),
+            "recommendation_pairs_selected": sum(1 for pair in selected if "recommendation" in pair.sources),
+            "pair_keys": [pair.pair_key for pair in selected],
+        }
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    keys = [str(item) for item in manifest.get("pair_keys", [])]
+    available = [pair_by_key[key] for key in keys if key in pair_by_key]
+    missing = len(keys) - len(available)
+    info = {
+        "manifest_file": manifest_path.name,
+        "created_now": created,
+        "pairs_in_manifest": len(keys),
+        "pairs_available": len(available),
+        "pairs_missing": missing,
+        "dataset_unique_pairs_at_creation": int(manifest.get("dataset_unique_pairs_at_creation") or 0),
+        "created_utc": str(manifest.get("created_utc") or ""),
+    }
+    return available, info
+
+
+def exclude_diagnostic_face_leakage(
+    pairs: list[PairExample], diagnostic_pairs: list[PairExample]
+) -> tuple[list[PairExample], int]:
+    diagnostic_keys = {pair.pair_key for pair in diagnostic_pairs}
+    diagnostic_faces = {
+        face_id
+        for pair in diagnostic_pairs
+        for face_id in (pair.chosen_id, pair.current_id)
+    }
+    development: list[PairExample] = []
+    guard_excluded = 0
+    for pair in pairs:
+        if pair.pair_key in diagnostic_keys:
+            continue
+        if pair.chosen_id in diagnostic_faces or pair.current_id in diagnostic_faces:
+            guard_excluded += 1
+            continue
+        development.append(pair)
+    return development, guard_excluded
+
+
 def _import_ml():
     global _ML_CACHE
     if _ML_CACHE is not None:
@@ -421,6 +551,31 @@ def pair_metrics(weight: Any, diffs: Any, torch: Any, F: Any) -> tuple[float, fl
     return accuracy, mean_margin, loss
 
 
+def subset_pair_metrics(
+    weight: Any,
+    pairs: list[PairExample],
+    embeddings: dict[str, Any],
+    source: str | None = None,
+) -> dict[str, Any]:
+    _np, torch, _nn, F, _Image, _weights_enum, _mobilenet = _import_ml()
+    selected = pairs if source is None else [pair for pair in pairs if source in pair.sources]
+    if not selected:
+        return {
+            "pairs": 0,
+            "accuracy": None,
+            "mean_margin": None,
+            "loss": None,
+        }
+    diffs = tensor_pair_diffs(selected, embeddings, torch)
+    accuracy, mean_margin, loss = pair_metrics(weight, diffs, torch, F)
+    return {
+        "pairs": len(selected),
+        "accuracy": accuracy,
+        "mean_margin": mean_margin,
+        "loss": loss,
+    }
+
+
 def train_head(
     train_pairs: list[PairExample],
     val_pairs: list[PairExample],
@@ -494,6 +649,47 @@ def train_head(
     }
 
 
+def refit_head_all_pairs(
+    pairs: list[PairExample],
+    embeddings: dict[str, Any],
+    seed: int,
+    epochs: int,
+    lr: float,
+    weight_decay: float,
+) -> tuple[Any, dict[str, Any]]:
+    """Fit the final export head from scratch on all available pairs.
+
+    The epoch count is selected beforehand using the development train/validation
+    split.  This keeps model selection honest while ensuring the working ONNX is
+    not permanently deprived of the held-out examples.
+    """
+    _np, torch, _nn, F, _Image, _weights_enum, _mobilenet = _import_ml()
+    torch.manual_seed(seed)
+    diffs = tensor_pair_diffs(pairs, embeddings, torch)
+    if diffs.numel() == 0:
+        raise ValueError("Не удалось сформировать пары для финального обучения")
+    dim = int(diffs.shape[1])
+    weight = torch.nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+    optimizer = torch.optim.AdamW([weight], lr=lr, weight_decay=weight_decay)
+    epochs = max(1, int(epochs))
+
+    for _epoch in range(1, epochs + 1):
+        optimizer.zero_grad(set_to_none=True)
+        margins = diffs @ weight
+        loss = F.softplus(-margins).mean()
+        loss.backward()
+        optimizer.step()
+
+    final_weight = weight.detach().clone()
+    accuracy, mean_margin, final_loss = pair_metrics(final_weight, diffs, torch, F)
+    return final_weight, {
+        "epochs": epochs,
+        "all_pairs_accuracy": accuracy,
+        "all_pairs_mean_margin": mean_margin,
+        "all_pairs_loss": final_loss,
+    }
+
+
 def export_onnx(weight: Any, output_path: Path, model_info: dict[str, Any]) -> None:
     _np, torch, nn, F, _Image, weights_enum, mobilenet = _import_ml()
     backbone, dim, _weights_name = build_backbone(torch, nn, mobilenet, weights_enum)
@@ -557,7 +753,18 @@ def write_report(output_dir: Path, metadata: dict[str, Any]) -> None:
 
     metrics = metadata["metrics"]
     val = metrics.get("validation_pair_accuracy")
+
+    def metric_text(block: dict[str, Any] | None) -> str:
+        if not block or not block.get("pairs"):
+            return "n/a (0 пар)"
+        accuracy = block.get("accuracy")
+        if accuracy is None:
+            return f"n/a ({block['pairs']} пар)"
+        return f"{accuracy*100:.1f}% ({block['pairs']} пар)"
+
     val_text = "нет отдельной validation выборки" if val is None else f"{val*100:.1f}%"
+    diagnostic = metrics.get("stable_diagnostic") or {}
+    final_refit = metrics.get("final_refit") or {}
     report = f"""# Personal Preference Model — training report
 
 Дата обучения: {metadata['trained_utc']}
@@ -567,28 +774,51 @@ def write_report(output_dir: Path, metadata: dict[str, Any]) -> None:
 - Базовых пар `chosen > current`: {metadata['dataset']['unique_base_pairs']}
 - Дополнительных уникальных пар `chosen > rejected recommendation`: {metadata['dataset']['additional_unique_recommendation_pairs']}
 - Отклонений автоматической рекомендации в новых событиях: {metadata['dataset']['recommendation_overrides']}
+- Фиксированный diagnostic holdout: {metadata['dataset']['diagnostic_pairs']} пар
+- Пар, исключённых из model-selection из-за пересечения лиц с diagnostic: {metadata['dataset']['diagnostic_guard_pairs_excluded']}
+- Development pairs после diagnostic guard: {metadata['dataset']['development_pairs']}
 - Train pairs: {metadata['dataset']['train_pairs']}
 - Validation pairs: {metadata['dataset']['validation_pairs']}
 - Способ разделения: `{metadata['dataset']['split_method']}`
 - Коллекторов/экземпляров Group Face Picker: {metadata['dataset']['collectors']}
 - Исключено противоречивых пар: {metadata['dataset']['contradictory_pairs_excluded']}
-- Validation pair accuracy: **{val_text}**
-- Train pair accuracy: **{metrics['train_pair_accuracy']*100:.1f}%**
+- Strict validation — все пары: **{val_text}**
+- Strict validation — `chosen > current`: **{metric_text(metrics.get('validation_base'))}**
+- Strict validation — `chosen > rejected recommendation`: **{metric_text(metrics.get('validation_recommendation'))}**
+- Selection train — все пары: **{metrics['train_pair_accuracy']*100:.1f}%**
+- Selection train — `chosen > current`: **{metric_text(metrics.get('train_base'))}**
+- Selection train — `chosen > rejected recommendation`: **{metric_text(metrics.get('train_recommendation'))}**
+- Stable diagnostic — все пары: **{metric_text(diagnostic.get('all'))}**
+- Stable diagnostic — `chosen > current`: **{metric_text(diagnostic.get('base'))}**
+- Stable diagnostic — `chosen > rejected recommendation`: **{metric_text(diagnostic.get('recommendation'))}**
+- Best epoch по strict validation: **{metrics['best_epoch']}**
+- Финальная ONNX обучена на: **{metadata['dataset']['final_refit_pairs']} / {metadata['dataset']['unique_pairs']} пар**
+- Accuracy финальной ONNX на полном обучающем наборе: **{final_refit.get('all_pairs_accuracy', 0.0)*100:.1f}%**
 - Backbone: `{metadata['model']['backbone']}`
 - Выход: `0..1`, больше = ближе к вашим накопленным предпочтениям.
 
 ## Важно
 
-Эта точность означает долю отложенных pairwise-сравнений, для которых модель правильно
-предсказала ваше предпочтение. Старые события дают `chosen > current`; новые события могут
-дополнительно дать `chosen > rejected recommendation`, если вы заменили предложенный кадр.
-Она не является универсальной оценкой красоты человека.
+`Strict validation` используется для выбора количества эпох и по-прежнему старается не допускать
+пересечения одинаковых face-id между train и validation. Её состав может меняться при росте графа
+сравнений, поэтому она полезна для текущего обучения, но не всегда напрямую сравнима между запусками.
+
+`Stable diagnostic` создаётся один раз в `diagnostic_holdout.json` и затем использует те же пары.
+Эта метрика предназначена именно для сравнения последующих обучений. Новые пары автоматически в
+этот holdout не добавляются. Пары, содержащие те же face-id, исключаются из model-selection train/val,
+чтобы diagnostic не видел те же самые сохранённые кропы во время выбора best epoch.
+
+После выбора `best_epoch` итоговая `personal_preference.onnx` обучается заново с нуля на всех
+доступных непротиворечивых парах. Поэтому diagnostic остаётся честным для выбора режима обучения,
+но сама рабочая ONNX использует 100% накопленного датасета.
+
+Старые события дают `chosen > current`; новые события могут дополнительно дать
+`chosen > rejected recommendation`, если вы заменили предложенный кадр. Вторая категория обычно
+существенно сложнее, поэтому её accuracy показывается отдельно. Метрики не являются универсальной
+оценкой красоты человека.
 
 Если `split_method` содержит `face-overlap-possible`, validation менее строгая: соберите больше
 независимых сравнений и переобучите модель.
-
-Текущая версия Photo Select AI пока не подключает этот файл автоматически. Не заменяйте им
-публичный FBP вручную: интерфейс персональной модели будет добавлен отдельным обновлением.
 """
     (output_dir / "training_report.md").write_text(report, encoding="utf-8")
 
@@ -606,6 +836,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--weight-decay", type=float, default=0.002)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--device", choices=("cpu", "cuda", "auto"), default="auto")
+    parser.add_argument(
+        "--diagnostic-fraction",
+        type=float,
+        default=DEFAULT_DIAGNOSTIC_FRACTION,
+        help="fixed diagnostic holdout fraction used only for cross-run comparison (default 0.10)",
+    )
+    parser.add_argument(
+        "--reset-diagnostic-holdout",
+        action="store_true",
+        help="recreate diagnostic_holdout.json; this breaks comparability with previous reports",
+    )
     parser.add_argument("--check-data", action="store_true", help="validate/count dataset and exit before loading ML dependencies")
     args = parser.parse_args(argv)
 
@@ -636,8 +877,35 @@ def main(argv: list[str] | None = None) -> int:
             print("Dataset check: OK")
             return 0
 
+        output_dir.mkdir(parents=True, exist_ok=True)
         validation_fraction = max(0.05, min(0.40, float(args.validation)))
-        train_pairs, val_pairs, split_method = split_pairs_no_face_leakage(pairs, validation_fraction, int(args.seed))
+        diagnostic_fraction = max(0.02, min(0.25, float(args.diagnostic_fraction)))
+        diagnostic_pairs, diagnostic_info = load_or_create_diagnostic_holdout(
+            training_dir,
+            pairs,
+            diagnostic_fraction,
+            int(args.seed),
+            reset=bool(args.reset_diagnostic_holdout),
+        )
+        if diagnostic_info["pairs_missing"]:
+            print(
+                "WARNING: часть фиксированного diagnostic holdout отсутствует в текущем датасете: "
+                f"{diagnostic_info['pairs_missing']} пар.",
+                file=sys.stderr,
+            )
+
+        development_pairs, diagnostic_guard_excluded = exclude_diagnostic_face_leakage(
+            pairs, diagnostic_pairs
+        )
+        if len(development_pairs) < 2:
+            raise ValueError(
+                "После исключения фиксированного diagnostic holdout осталось слишком мало пар "
+                "для model-selection обучения. Удалите diagnostic_holdout.json и повторите обучение."
+            )
+
+        train_pairs, val_pairs, split_method = split_pairs_no_face_leakage(
+            development_pairs, validation_fraction, int(args.seed)
+        )
         if not train_pairs:
             raise ValueError("Не удалось сформировать train выборку")
 
@@ -653,14 +921,21 @@ def main(argv: list[str] | None = None) -> int:
         print("============================================================")
         print("Group Face Picker - personal preference training")
         print("============================================================")
+        print(
+            f"Stable diagnostic: {len(diagnostic_pairs)} pairs "
+            f"({'created now' if diagnostic_info['created_now'] else 'reused'})"
+        )
+        if diagnostic_guard_excluded:
+            print(f"Diagnostic face-leakage guard excluded from model selection: {diagnostic_guard_excluded}")
         print(f"Train / val:   {len(train_pairs)} / {len(val_pairs)}")
         print(f"Split:         {split_method}")
         if len(pairs) < 100:
             print("WARNING: датасет пока маленький. Модель будет экспериментальной; продолжайте собирать статистику.")
 
-        all_pairs = train_pairs + val_pairs
-        embeddings, backbone_info = extract_embeddings(all_pairs, max(1, int(args.batch_size)), device)
-        weight, metrics = train_head(
+        # Extract once for the full dataset.  The final refit will use all pairs,
+        # while the first fit below is only for honest model selection.
+        embeddings, backbone_info = extract_embeddings(pairs, max(1, int(args.batch_size)), device)
+        selection_weight, metrics = train_head(
             train_pairs,
             val_pairs,
             embeddings,
@@ -671,10 +946,63 @@ def main(argv: list[str] | None = None) -> int:
             max(5, int(args.patience)),
         )
 
-        output_dir.mkdir(parents=True, exist_ok=True)
+        metrics["train_base"] = subset_pair_metrics(
+            selection_weight, train_pairs, embeddings, "current"
+        )
+        metrics["train_recommendation"] = subset_pair_metrics(
+            selection_weight, train_pairs, embeddings, "recommendation"
+        )
+        metrics["validation_base"] = subset_pair_metrics(
+            selection_weight, val_pairs, embeddings, "current"
+        )
+        metrics["validation_recommendation"] = subset_pair_metrics(
+            selection_weight, val_pairs, embeddings, "recommendation"
+        )
+        metrics["stable_diagnostic"] = {
+            "all": subset_pair_metrics(selection_weight, diagnostic_pairs, embeddings),
+            "base": subset_pair_metrics(selection_weight, diagnostic_pairs, embeddings, "current"),
+            "recommendation": subset_pair_metrics(
+                selection_weight, diagnostic_pairs, embeddings, "recommendation"
+            ),
+        }
+
+        print()
+        diagnostic_all = metrics["stable_diagnostic"]["all"]
+        if diagnostic_all["accuracy"] is not None:
+            print(
+                f"Stable diagnostic accuracy: {diagnostic_all['accuracy']*100:.1f}% "
+                f"({diagnostic_all['pairs']} pairs)"
+            )
+        recommendation_diag = metrics["stable_diagnostic"]["recommendation"]
+        if recommendation_diag["accuracy"] is not None:
+            print(
+                "Stable diagnostic rejected-recommendation accuracy: "
+                f"{recommendation_diag['accuracy']*100:.1f}% "
+                f"({recommendation_diag['pairs']} pairs)"
+            )
+
+        best_epoch = max(1, int(metrics["best_epoch"]))
+        print()
+        print(f"Final refit on all {len(pairs)} pairs for {best_epoch} epochs...")
+        final_weight, final_refit_metrics = refit_head_all_pairs(
+            pairs,
+            embeddings,
+            int(args.seed),
+            best_epoch,
+            float(args.lr),
+            max(0.0, float(args.weight_decay)),
+        )
+        final_refit_metrics["base"] = subset_pair_metrics(
+            final_weight, pairs, embeddings, "current"
+        )
+        final_refit_metrics["recommendation"] = subset_pair_metrics(
+            final_weight, pairs, embeddings, "recommendation"
+        )
+        metrics["final_refit"] = final_refit_metrics
+
         model_path = output_dir / "personal_preference.onnx"
         model_info = dict(backbone_info)
-        export_onnx(weight, model_path, model_info)
+        export_onnx(final_weight, model_path, model_info)
 
         val_acc = metrics["validation_pair_accuracy"]
         metadata = {
@@ -692,10 +1020,16 @@ def main(argv: list[str] | None = None) -> int:
             },
             "dataset": {
                 **dataset_stats,
+                "diagnostic_pairs": len(diagnostic_pairs),
+                "diagnostic_guard_pairs_excluded": diagnostic_guard_excluded,
+                "development_pairs": len(development_pairs),
                 "train_pairs": len(train_pairs),
                 "validation_pairs": len(val_pairs),
+                "final_refit_pairs": len(pairs),
                 "split_method": split_method,
                 "validation_fraction_requested": validation_fraction,
+                "diagnostic_fraction_requested": diagnostic_fraction,
+                "diagnostic_holdout": diagnostic_info,
             },
             "metrics": {
                 **metrics,
@@ -707,6 +1041,7 @@ def main(argv: list[str] | None = None) -> int:
                 "weight_decay": float(args.weight_decay),
                 "epochs_requested": int(args.epochs),
                 "patience": int(args.patience),
+                "diagnostic_fraction": diagnostic_fraction,
                 "device": device,
                 "torch": str(torch.__version__),
             },
@@ -720,6 +1055,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Report: {output_dir / 'training_report.md'}")
         if val_acc is not None and not math.isnan(val_acc):
             print(f"Validation pair accuracy: {val_acc*100:.1f}%")
+        print(
+            "Final ONNX training-set accuracy: "
+            f"{metrics['final_refit']['all_pairs_accuracy']*100:.1f}%"
+        )
         if split_method != "connected-components-no-face-overlap":
             print("WARNING: validation содержит возможное пересечение лиц между train и validation.")
         return 0

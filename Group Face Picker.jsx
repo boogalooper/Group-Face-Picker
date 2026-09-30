@@ -18,7 +18,7 @@ var GFP_SHIFT_LAUNCH = !!ScriptUI.environment.keyboardState.shiftKey;
 
 var GFP_NAME = "Group Face Picker";
 var GFP_UUID = "9a189321-e07f-40ff-8394-156a4bd48cf5";
-var GFP_VERSION = "0.6.21";
+var GFP_VERSION = "0.6.22";
 var GFP_DEFAULT_HOST = "127.0.0.1";
 var GFP_DEFAULT_PORT_SEND = 6420;
 var GFP_DEFAULT_PORT_LISTEN = 6421;
