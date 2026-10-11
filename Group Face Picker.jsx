@@ -18,7 +18,7 @@ var GFP_SHIFT_LAUNCH = !!ScriptUI.environment.keyboardState.shiftKey;
 
 var GFP_NAME = "Group Face Picker";
 var GFP_UUID = "9a189321-e07f-40ff-8394-156a4bd48cf5";
-var GFP_VERSION = "0.6.22";
+var GFP_VERSION = "0.6.28";
 var GFP_DEFAULT_HOST = "127.0.0.1";
 var GFP_DEFAULT_PORT_SEND = 6420;
 var GFP_DEFAULT_PORT_LISTEN = 6421;
@@ -97,6 +97,7 @@ function gfpMain() {
         }
         if (!ping || ping.type != "answer") {
             var startupDetails = GFP_LAST_SERVER_LAUNCHER ? ("\n\nПроверенный путь автозапуска:\n" + GFP_LAST_SERVER_LAUNCHER) : "";
+            if (GFP_SERVER_START_ERROR) startupDetails += "\n\n" + GFP_SERVER_START_ERROR;
             if (confirm("Python-сервер не запущен или недоступен по текущему адресу. Время ожидания истекло. Запустите run_server.bat вручную." + startupDetails + "\n\nОткрыть настройки подключения?")) {
                 // Чтение Quick Mask могло временно перевести документ в обычный
                 // режим выделения. Настройки не должны оставлять документ изменённым.
@@ -136,7 +137,7 @@ function gfpMain() {
                 throw new Error("Сервер не вернул идентификатор анализа.");
             }
             try {
-                app.doForcedProgress("Подготовка превью лиц", "gfpPollSelectionJob();");
+                app.doForcedProgress("Инициализация модели распознавания лиц", "gfpPollSelectionJob();");
             } catch (progressError) {
                 if (gfpIsUserCancelError(progressError)) {
                     GFP_PENDING_JOB_CANCELLED = true;
@@ -1290,14 +1291,33 @@ function gfpEnsureServerAvailable() {
         return ping;
     }
 
-    // The server is started manually. A missed callback does not prove that
-    // its process is absent: it may still be loading models or be busy.
     GFP_SERVER_START_OK = false;
     GFP_SERVER_START_ERROR = "";
     GFP_SERVER_START_RESPONSE = null;
     GFP_SERVER_START_CANCELLED = false;
+    GFP_LAST_SERVER_LAUNCHER = "";
+    var host = String(GFP_API_HOST).toLowerCase();
+    var saved = gfpLoadClientState();
+    // A remote address must never start a server on the Photoshop computer.
+    if (host == "127.0.0.1" || host == "localhost" || host == "::1") {
+        var sameEndpoint = !saved.server_host ||
+            (String(saved.server_host).toLowerCase() == host && Number(saved.server_port) == Number(GFP_API_PORT_SEND));
+        var launcher = gfpFindServerLauncher(sameEndpoint ? saved : null);
+        if (launcher) {
+            GFP_LAST_SERVER_LAUNCHER = launcher.fsName;
+            try {
+                if (!launcher.execute()) {
+                    GFP_SERVER_START_ERROR = "Не удалось запустить: " + launcher.fsName;
+                    return null;
+                }
+            } catch (launchError) {
+                GFP_SERVER_START_ERROR = gfpErrorText(launchError);
+                return null;
+            }
+        }
+    }
     try {
-        app.doForcedProgress("Ожидание Group Face Picker server", "gfpPollServerStartup();");
+        app.doForcedProgress("Инициализация модели распознавания лиц", "gfpPollServerStartup();");
     } catch (progressError) {
         if (gfpIsUserCancelError(progressError)) {
             GFP_SERVER_START_CANCELLED = true;
@@ -1342,7 +1362,7 @@ function gfpPollServerStartup() {
             return true;
         }
         var progress = Math.min(950, Math.round((elapsed / GFP_SERVER_START_TIMEOUT) * 950));
-        if (!gfpUpdateNativeProgress(progress, 1000, "Ожидание Python-сервера (запустите run_server.bat вручную)...")) {
+        if (!gfpUpdateNativeProgress(progress, 1000, (GFP_LAST_SERVER_LAUNCHER ? "Запуск Python-сервера..." : "Ожидание Python-сервера (запустите run_server.bat вручную)..."))) {
             GFP_SERVER_START_CANCELLED = true;
             GFP_SERVER_START_ERROR = "";
             return false;
@@ -1699,8 +1719,8 @@ function gfpShowSettingsDialog() {
     var rememberedLauncher = gfpLoadClientState();
     var launcherHint = serverPanel.add("statictext", undefined,
         rememberedLauncher.server_launcher_path ?
-            ("Запускайте вручную: " + String(rememberedLauncher.server_launcher_path)) :
-            "Запускайте сервер вручную через run_server.bat.",
+            ("Автозапуск локального сервера: " + String(rememberedLauncher.server_launcher_path)) :
+            "Один раз запустите run_server.bat и JSX: путь сохранится для автозапуска.",
         { multiline: true });
     launcherHint.preferredSize = [470, 32];
 

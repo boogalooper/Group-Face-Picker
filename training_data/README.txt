@@ -3,8 +3,8 @@ Group Face Picker training data
 
 Statistics collection is controlled only from the JSX Settings dialog and is OFF by default.
 When "Собирать статистику для обучения" is enabled, a successful face insertion stores:
-- events/<event-id>.json  - the original explicit preference: chosen face > current face
-- faces/<sha256>.jpg      - 320x320 cached face crops referenced by events
+- <computer-id>/events/<event-id>.json  - the original explicit preference: chosen face > current face
+- <computer-id>/faces/<sha256>.jpg      - 320x320 cached face crops referenced by events
 
 If Group Face Picker showed an automatic recommendation and you chose a different face, the same
 event also stores the rejected recommended face. The updated trainer can then add one extra explicit
@@ -15,21 +15,23 @@ and older trainers simply ignore the optional recommendation metadata in newer e
 
 The same face image is stored only once because filenames use SHA-256 content hashes.
 Events use unique/idempotent IDs, so copying the same dataset more than once is safe.
-A local collector.json is created automatically on the first saved event. It contains a random
-instance id only (no hostname or username) and is not imported by the merge utility.
+The computer ID is stable across application folder moves/copies on the same computer.
+Windows uses a namespaced hash of MachineGuid; raw machine identifiers are not stored.
 
-To combine statistics from several computers, copy each computer's complete training_data folder
-and run, for example:
+Copy each other computer's complete ID folder into this training_data folder.
+The trainer automatically reads every immediate subfolder containing events, plus legacy
+training_data/events and training_data/faces. No merge command is required.
+Existing JSON/JPEG bytes, filenames and relative references remain unchanged.
+To import old data, put its events and faces together in training_data/old-PC2/.
+An old collector.json can remain in place; new collection does not use it.
+When copying again, merge folder contents and preserve existing files.
 
-  merge_training_data.bat "D:\PC1\training_data" "E:\PC2\training_data"
-
-The merge utility verifies hashes, copies only missing face crops and deduplicates events.
 Do not manually rename files inside faces or events.
 
 
 TRAINING A PERSONAL MODEL
 =========================
-1. Merge statistics from other computers with merge_training_data.bat.
+1. Copy ID folders from other computers into training_data (no conversion needed).
 2. Run train_personal_model.bat from the Group Face Picker root.
 3. The first run creates runtime\training_venv and downloads the pretrained MobileNetV3-Small backbone.
 4. Outputs are written to personal_model\:
@@ -41,13 +43,12 @@ On the first real training run the trainer also creates:
    - training_data\diagnostic_holdout.json
 
 Keep this file on the main training computer. It fixes a small diagnostic set so later reports can
-measure progress on the same pairs. New events are not added to it automatically. The merge utility
-intentionally does not import diagnostic_holdout.json from other computers.
+measure progress on the same pairs. New events are not added to it automatically. Do not copy diagnostic_holdout.json from other computers.
 
 The trainer removes duplicate exact pairs, excludes contradictory A>B / B>A pairs and tries to split
 validation without sharing the same face crop between train and validation. It reports base
 chosen>current accuracy separately from the harder chosen>rejected-recommendation accuracy. After
-selecting the best epoch, the final ONNX head is trained again from scratch on all unique
+selecting L2 regularization using three grouped splits, the final ONNX head is trained again from scratch on all unique
 non-contradictory pairs, so validation/diagnostic data are not permanently withheld from the working
 model. The model is intended to rank different frames of the same person. See the main README.md
 section "Обучение персональной модели".

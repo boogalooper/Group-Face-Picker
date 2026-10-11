@@ -22,6 +22,21 @@ DIAGNOSTIC_SCHEMA_VERSION = 1
 DEFAULT_SEED = 20260908
 DEFAULT_DIAGNOSTIC_FRACTION = 0.10
 _ML_CACHE = None
+# Coordinates are relative to the existing 224x224 input; no dataset conversion.
+FACE_REGIONS = ((0, 0, 224, 224), (34, 22, 190, 202),
+                (22, 45, 202, 134), (34, 112, 190, 213))
+
+
+def region_embeddings(backbone: Any, x: Any, mean: Any, std: Any, torch: Any) -> Any:
+    F = torch.nn.functional
+    rows = []
+    for left, top, right, bottom in FACE_REGIONS:
+        crop = x[:, :, top:bottom, left:right]
+        if right - left != 224 or bottom - top != 224:
+            crop = F.interpolate(crop, size=(224, 224), mode="bilinear", align_corners=False)
+        rows.append(F.normalize(backbone((crop - mean) / std), p=2, dim=1))
+    return torch.cat(rows, dim=1) / math.sqrt(len(FACE_REGIONS))
+
 
 
 @dataclass(frozen=True)
@@ -84,7 +99,7 @@ def resolve_training_dir(path: Path) -> Path:
     raise ValueError(f"Не найдена папка training_data: {path}")
 
 
-def _face_ref(event: dict[str, Any], key: str, training_dir: Path, verified_faces: set[str]) -> tuple[str, Path]:
+def _face_ref(event: dict[str, Any], key: str, training_dir: Path, verified_faces: set[Path]) -> tuple[str, Path]:
     asset = event.get(key)
     if not isinstance(asset, dict):
         raise ValueError(f"В событии отсутствует объект {key}")
@@ -98,24 +113,24 @@ def _face_ref(event: dict[str, Any], key: str, training_dir: Path, verified_face
     path = training_dir / "faces" / f"{face_id}.jpg"
     if not path.is_file():
         raise ValueError(f"Отсутствует файл лица: {path}")
-    if face_id not in verified_faces:
+    if path not in verified_faces:
         if sha256_file(path) != face_id:
             raise ValueError(f"SHA-256 файла не совпадает с именем: {path.name}")
-        verified_faces.add(face_id)
+        verified_faces.add(path)
     return face_id, path
 
 
 def load_pairs(training_dir: Path) -> tuple[list[PairExample], dict[str, int]]:
-    events_dir = training_dir / "events"
-    faces_dir = training_dir / "faces"
-    if not events_dir.is_dir() or not faces_dir.is_dir():
-        raise ValueError("training_data должна содержать подпапки events и faces")
+    # Read legacy flat data and each self-contained computer folder together.
+    sources = [training_dir] + sorted(p for p in training_dir.iterdir() if p.is_dir())
+    event_paths = [(source, path) for source in sources
+                   for path in sorted((source / "events").glob("*.json"))]
 
     raw_by_orientation: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     invalid = 0
     event_count = 0
     collectors: set[str] = set()
-    verified_faces: set[str] = set()
+    verified_faces: set[Path] = set()
     base_pair_observations = 0
     recommendation_overrides = 0
     recommendation_pair_observations = 0
@@ -141,7 +156,7 @@ def load_pairs(training_dir: Path) -> tuple[list[PairExample], dict[str, int]]:
             "source": source,
         })
 
-    for path in sorted(events_dir.glob("*.json")):
+    for source_dir, path in event_paths:
         event_count += 1
         try:
             event = json.loads(path.read_text(encoding="utf-8"))
@@ -158,8 +173,8 @@ def load_pairs(training_dir: Path) -> tuple[list[PairExample], dict[str, int]]:
                 or any(ch not in "0123456789abcdef" for ch in event_id)
             ):
                 raise ValueError("event_id does not match filename or format")
-            chosen_id, chosen_path = _face_ref(event, "chosen", training_dir, verified_faces)
-            current_id, current_path = _face_ref(event, "current", training_dir, verified_faces)
+            chosen_id, chosen_path = _face_ref(event, "chosen", source_dir, verified_faces)
+            current_id, current_path = _face_ref(event, "current", source_dir, verified_faces)
             if chosen_id == current_id:
                 raise ValueError("chosen and current are the same face")
             expected_pair = hashlib.sha256((chosen_id + ">" + current_id).encode("ascii")).hexdigest()
@@ -187,7 +202,7 @@ def load_pairs(training_dir: Path) -> tuple[list[PairExample], dict[str, int]]:
                 # It must never invalidate the canonical chosen > current pair.
                 try:
                     recommended_id, recommended_path = _face_ref(
-                        event, "recommended", training_dir, verified_faces
+                        event, "recommended", source_dir, verified_faces
                     )
                 except Exception as exc:
                     recommendation_metadata_invalid += 1
@@ -250,6 +265,7 @@ def load_pairs(training_dir: Path) -> tuple[list[PairExample], dict[str, int]]:
     )
     stats = {
         "events_found": event_count,
+        "data_folders": len({source for source, _ in event_paths}),
         "events_invalid": invalid,
         "unique_pairs": len(pairs),
         "unique_base_pairs": unique_base_pairs,
@@ -290,23 +306,38 @@ def split_pairs_no_face_leakage(
     train: list[PairExample] = []
 
     if len(groups) >= 2:
-        # Greedy component assignment keeps every face on only one side while
-        # getting close to the requested validation size.
-        val_groups: list[list[PairExample]] = []
-        train_groups: list[list[PairExample]] = []
-        val_count = 0
-        for group in groups:
-            if val_count < target and len(groups) - len(val_groups) > 1:
-                val_groups.append(group)
-                val_count += len(group)
-            else:
-                train_groups.append(group)
-        if not train_groups:
-            train_groups.append(val_groups.pop())
-        val = [p for group in val_groups for p in group]
-        train = [p for group in train_groups for p in group]
-        if train and val:
-            return train, val, "connected-components-no-face-overlap"
+        # Assign whole face-connected components. Optimize size AND comparison
+        # type counts; the old largest-first fill concentrated hard pairs in val.
+        counts = [(len(g), sum("recommendation" in p.sources for p in g)) for g in groups]
+        totals = (len(pairs), sum(c[1] for c in counts))
+        targets = (target, totals[1] * validation_fraction)
+
+        def cost(n: int, r: int) -> float:
+            base_total = totals[0] - totals[1]
+            return ((n - targets[0]) / max(1, targets[0])) ** 2 + (
+                (r - targets[1]) / max(1, targets[1])) ** 2 + (
+                ((n - r) - (targets[0] - targets[1])) /
+                max(1, base_total * validation_fraction)) ** 2
+
+        best = None
+        best_cost = float("inf")
+        for attempt in range(128):
+            order = list(range(len(groups)))
+            rng.shuffle(order)
+            selected: set[int] = set()
+            n = r = 0
+            for i in order:
+                dn, dr = counts[i]
+                if n + dn < len(pairs) and cost(n + dn, r + dr) < cost(n, r):
+                    selected.add(i)
+                    n += dn
+                    r += dr
+            if selected and cost(n, r) < best_cost:
+                best, best_cost = selected, cost(n, r)
+        if best is not None:
+            val = [p for i, group in enumerate(groups) if i in best for p in group]
+            train = [p for i, group in enumerate(groups) if i not in best for p in group]
+            return train, val, "stratified-connected-components-no-face-overlap"
 
     # Rare fallback: all comparisons form one connected graph. We still retain
     # a validation set, but report that face leakage could not be eliminated.
@@ -328,7 +359,7 @@ def _diagnostic_target_size(pair_count: int, fraction: float) -> int:
     requested = max(1, int(round(pair_count * fraction)))
     # Keep the diagnostic anchor useful without taking too much data away from
     # model selection.  The final exported model is refit on 100% of pairs, so
-    # this only affects early-stopping/model-selection training.
+    # this only affects regularization/model-selection training.
     requested = max(20 if pair_count >= 80 else 1, requested)
     requested = min(250, requested)
     return min(requested, max(1, pair_count // 4))
@@ -515,9 +546,7 @@ def extract_embeddings(
             batch_items = items[start:start + batch_size]
             tensors = [load_face_tensor(path, Image, torch) for _face_id, path in batch_items]
             x = torch.stack(tensors, dim=0).to(device)
-            x = (x - mean) / std
-            emb = backbone(x)
-            emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+            emb = region_embeddings(backbone, x, mean, std, torch)
             emb = emb.cpu()
             for (face_id, _path), row in zip(batch_items, emb):
                 embeddings[face_id] = row.clone()
@@ -525,7 +554,8 @@ def extract_embeddings(
             print(f"  {done}/{len(items)}", end="\r", flush=True)
     print()
     return embeddings, {
-        "embedding_dim": dim,
+        "embedding_dim": dim * len(FACE_REGIONS),
+        "face_regions": [list(r) for r in FACE_REGIONS],
         "backbone": "torchvision.mobilenet_v3_small",
         "backbone_weights": weights_name,
         "input_size": 224,
@@ -576,118 +606,46 @@ def subset_pair_metrics(
     }
 
 
-def train_head(
-    train_pairs: list[PairExample],
-    val_pairs: list[PairExample],
-    embeddings: dict[str, Any],
-    seed: int,
-    epochs: int,
-    lr: float,
-    weight_decay: float,
-    patience: int,
-) -> tuple[Any, dict[str, Any]]:
-    _np, torch, _nn, F, _Image, _weights_enum, _mobilenet = _import_ml()
-    torch.manual_seed(seed)
-    train_diffs = tensor_pair_diffs(train_pairs, embeddings, torch)
-    val_diffs = tensor_pair_diffs(val_pairs, embeddings, torch) if val_pairs else None
-    dim = int(train_diffs.shape[1])
-
-    weight = torch.nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-    optimizer = torch.optim.AdamW([weight], lr=lr, weight_decay=weight_decay)
-    best_weight = weight.detach().clone()
-    best_val = -float("inf")
-    best_epoch = 0
-    stale = 0
-
-    for epoch in range(1, epochs + 1):
-        optimizer.zero_grad(set_to_none=True)
-        margins = train_diffs @ weight
-        loss = F.softplus(-margins).mean()
-        loss.backward()
-        optimizer.step()
-
-        train_acc, train_margin, train_loss = pair_metrics(weight.detach(), train_diffs, torch, F)
-        if val_diffs is not None and val_diffs.numel() > 0:
-            val_acc, val_margin, val_loss = pair_metrics(weight.detach(), val_diffs, torch, F)
-            metric = -val_loss
-        else:
-            val_acc, val_margin, val_loss = float("nan"), float("nan"), float("nan")
-            metric = -train_loss
-
-        if metric > best_val + 1e-9:
-            best_val = metric
-            best_weight = weight.detach().clone()
-            best_epoch = epoch
-            stale = 0
-        else:
-            stale += 1
-
-        if epoch == 1 or epoch % 25 == 0:
-            val_text = "n/a" if math.isnan(val_acc) else f"{val_acc*100:.1f}% / loss={val_loss:.4f}"
-            print(
-                f"epoch {epoch:4d} | loss={float(loss.item()):.4f} | "
-                f"train={train_acc*100:.1f}% | val={val_text}"
-            )
-        if stale >= patience:
-            break
-
-    final_train_acc, final_train_margin, final_train_loss = pair_metrics(best_weight, train_diffs, torch, F)
-    if val_diffs is not None and val_diffs.numel() > 0:
-        final_val_acc, final_val_margin, final_val_loss = pair_metrics(best_weight, val_diffs, torch, F)
-    else:
-        final_val_acc, final_val_margin, final_val_loss = float("nan"), float("nan"), float("nan")
-
-    return best_weight, {
-        "best_epoch": best_epoch,
-        "epochs_run": epoch,
-        "train_pair_accuracy": final_train_acc,
-        "validation_pair_accuracy": final_val_acc,
-        "train_mean_margin": final_train_margin,
-        "validation_mean_margin": final_val_margin,
-        "train_pair_loss": final_train_loss,
-        "validation_pair_loss": final_val_loss,
-    }
+def fit_regularized_head(pairs: list[PairExample], embeddings: dict[str, Any], c: float) -> Any:
+    import numpy as np
+    from sklearn.linear_model import LogisticRegression
+    _np, torch, *_ = _import_ml()
+    diffs = tensor_pair_diffs(pairs, embeddings, torch).numpy()
+    # Mirroring makes both labels explicit. No bias: reversing a pair must
+    # negate its margin, not change its definition.
+    model = LogisticRegression(C=c, fit_intercept=False, solver="lbfgs",
+                               max_iter=300, tol=1e-7)
+    model.fit(np.concatenate([diffs, -diffs]),
+              np.concatenate([np.ones(len(diffs)), np.zeros(len(diffs))]))
+    return torch.from_numpy(model.coef_[0].astype(np.float32))
 
 
-def refit_head_all_pairs(
-    pairs: list[PairExample],
-    embeddings: dict[str, Any],
-    seed: int,
-    epochs: int,
-    lr: float,
-    weight_decay: float,
-) -> tuple[Any, dict[str, Any]]:
-    """Fit the final export head from scratch on all available pairs.
-
-    The epoch count is selected beforehand using the development train/validation
-    split.  This keeps model selection honest while ensuring the working ONNX is
-    not permanently deprived of the held-out examples.
-    """
-    _np, torch, _nn, F, _Image, _weights_enum, _mobilenet = _import_ml()
-    torch.manual_seed(seed)
-    diffs = tensor_pair_diffs(pairs, embeddings, torch)
-    if diffs.numel() == 0:
-        raise ValueError("Не удалось сформировать пары для финального обучения")
-    dim = int(diffs.shape[1])
-    weight = torch.nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-    optimizer = torch.optim.AdamW([weight], lr=lr, weight_decay=weight_decay)
-    epochs = max(1, int(epochs))
-
-    for _epoch in range(1, epochs + 1):
-        optimizer.zero_grad(set_to_none=True)
-        margins = diffs @ weight
-        loss = F.softplus(-margins).mean()
-        loss.backward()
-        optimizer.step()
-
-    final_weight = weight.detach().clone()
-    accuracy, mean_margin, final_loss = pair_metrics(final_weight, diffs, torch, F)
-    return final_weight, {
-        "epochs": epochs,
-        "all_pairs_accuracy": accuracy,
-        "all_pairs_mean_margin": mean_margin,
-        "all_pairs_loss": final_loss,
-    }
+def select_regularization(pairs: list[PairExample], embeddings: dict[str, Any],
+                          fraction: float, seed: int) -> tuple[float, list[dict[str, Any]]]:
+    seeds = (seed, seed + 173, seed + 947)
+    # Preserve the initially tested default partitions exactly.
+    if seed == DEFAULT_SEED:
+        seeds = (seed, 173, 947)
+    splits = [split_pairs_no_face_leakage(pairs, fraction, value) for value in seeds]
+    if any("face-overlap-possible" in method for _, _, method in splits):
+        print("WARNING: некоторые разбиения содержат пересечения face-id; смотрите JSON.", file=sys.stderr)
+    candidates = []
+    for c in (0.1, 1.0, 10.0, 100.0):
+        folds = []
+        for i, (train, val, method) in enumerate(splits):
+            weight = fit_regularized_head(train, embeddings, c)
+            score = subset_pair_metrics(weight, val, embeddings)
+            score.update({"seed": seeds[i], "split_method": method,
+                          "train_pairs": len(train), "validation_pairs": len(val)})
+            folds.append(score)
+            print(f"C={c:g}, split {i+1}/3: accuracy={score['accuracy']*100:.1f}%, loss={score['loss']:.4f}")
+        row = {"C": c, "folds": folds,
+               "mean_loss": sum(f["loss"] for f in folds) / len(folds),
+               "mean_accuracy": sum(f["accuracy"] for f in folds) / len(folds)}
+        candidates.append(row)
+    selected = min(candidates, key=lambda row: row["mean_loss"])
+    print(f"Selected C={selected['C']:g}; mean validation accuracy={selected['mean_accuracy']*100:.1f}%")
+    return selected["C"], candidates
 
 
 def export_onnx(weight: Any, output_path: Path, model_info: dict[str, Any]) -> None:
@@ -700,16 +658,14 @@ def export_onnx(weight: Any, output_path: Path, model_info: dict[str, Any]) -> N
             self.backbone = backbone_model
             self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1))
             self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1))
-            self.head = nn.Linear(dim, 1, bias=False)
+            self.head = nn.Linear(dim * len(FACE_REGIONS), 1, bias=False)
             with torch.no_grad():
                 self.head.weight.copy_(head_weight.view(1, -1))
             for p in self.parameters():
                 p.requires_grad_(False)
 
         def forward(self, x: Any) -> Any:
-            x = (x - self.mean) / self.std
-            embedding = self.backbone(x)
-            embedding = F.normalize(embedding, p=2, dim=1)
+            embedding = region_embeddings(self.backbone, x, self.mean, self.std, torch)
             raw = self.head(embedding)
             return torch.sigmoid(raw)
 
@@ -735,6 +691,8 @@ def export_onnx(weight: Any, output_path: Path, model_info: dict[str, Any]) -> N
     onnx_model = onnx.load(str(temp))
     onnx.checker.check_model(onnx_model)
     session = ort.InferenceSession(str(temp), providers=["CPUExecutionProvider"])
+    generator = torch.Generator().manual_seed(123)
+    example = torch.rand((3, 3, 224, 224), generator=generator)
     sample = example.numpy()
     ort_out = session.run(None, {"image": sample})[0]
     with torch.inference_mode():
@@ -747,80 +705,175 @@ def export_onnx(weight: Any, output_path: Path, model_info: dict[str, Any]) -> N
     model_info["onnx_self_test_max_abs_error"] = max_error
 
 
+
+DIAGNOSTIC_HISTORY_SCHEMA_VERSION = 1
+
+
+def _read_json_object(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def load_previous_training_metadata(
+    training_dir: Path, output_dir: Path
+) -> dict[str, Any] | None:
+    """Best-effort read of the previous successful diagnostic result.
+
+    0.6.23 persists the latest comparable metric in training_data so it survives
+    replacing the application folder.  For the first upgrade from 0.6.22 we
+    fall back to the existing personal_preference.json and migrate on success.
+    A missing or damaged history must never prevent a new training run.
+    """
+    history = _read_json_object(training_dir / "diagnostic_history.json")
+    if history and int(history.get("schema_version") or 0) == DIAGNOSTIC_HISTORY_SCHEMA_VERSION:
+        snapshot = history.get("latest")
+        if isinstance(snapshot, dict):
+            return snapshot
+    return _read_json_object(output_dir / "personal_preference.json")
+
+
+def save_diagnostic_history(training_dir: Path, metadata: dict[str, Any]) -> None:
+    """Persist the latest successful Stable diagnostic next to training data."""
+    snapshot = {
+        "trained_utc": metadata.get("trained_utc"),
+        "dataset": {
+            "diagnostic_holdout": (metadata.get("dataset") or {}).get("diagnostic_holdout") or {},
+        },
+        "metrics": {
+            "stable_diagnostic": (metadata.get("metrics") or {}).get("stable_diagnostic") or {},
+        },
+    }
+    payload = {
+        "schema_version": DIAGNOSTIC_HISTORY_SCHEMA_VERSION,
+        "latest": snapshot,
+    }
+    path = training_dir / "diagnostic_history.json"
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temp, path)
+
+
+def stable_diagnostic_comparison(
+    previous: dict[str, Any] | None,
+    current_diagnostic_info: dict[str, Any],
+    current_metrics: dict[str, Any],
+) -> dict[str, Any]:
+    """Compare Stable diagnostic only when the fixed holdout is unchanged.
+
+    The holdout creation timestamp is persisted in diagnostic_holdout.json and was
+    already included in 0.6.22 metadata, so the first 0.6.23 run can compare
+    directly with an existing 0.6.22 result.
+    """
+    result: dict[str, Any] = {"status": "no_previous"}
+    if not previous:
+        return result
+
+    result["previous_trained_utc"] = str(previous.get("trained_utc") or "")
+    try:
+        prev_dataset = previous.get("dataset") or {}
+        prev_info = prev_dataset.get("diagnostic_holdout") or {}
+        prev_metrics = (previous.get("metrics") or {}).get("stable_diagnostic") or {}
+        cur_metrics = current_metrics.get("stable_diagnostic") or {}
+
+        prev_created = str(prev_info.get("created_utc") or "")
+        cur_created = str(current_diagnostic_info.get("created_utc") or "")
+        prev_manifest_count = int(prev_info.get("pairs_in_manifest") or 0)
+        cur_manifest_count = int(current_diagnostic_info.get("pairs_in_manifest") or 0)
+        prev_missing = int(prev_info.get("pairs_missing") or 0)
+        cur_missing = int(current_diagnostic_info.get("pairs_missing") or 0)
+
+        if not prev_created or not cur_created or prev_created != cur_created:
+            result["status"] = "holdout_changed"
+            return result
+        if prev_manifest_count != cur_manifest_count:
+            result["status"] = "holdout_changed"
+            return result
+        if prev_missing or cur_missing:
+            result["status"] = "incomplete_holdout"
+            return result
+
+        previous_blocks: dict[str, Any] = {}
+        changes: dict[str, float | None] = {}
+        for key in ("all", "base", "recommendation"):
+            prev_block = prev_metrics.get(key) or {}
+            cur_block = cur_metrics.get(key) or {}
+            prev_pairs = int(prev_block.get("pairs") or 0)
+            cur_pairs = int(cur_block.get("pairs") or 0)
+            prev_acc = prev_block.get("accuracy")
+            cur_acc = cur_block.get("accuracy")
+            previous_blocks[key] = {
+                "pairs": prev_pairs,
+                "accuracy": prev_acc if isinstance(prev_acc, (int, float)) else None,
+            }
+            if prev_pairs != cur_pairs:
+                result["status"] = "holdout_changed"
+                return result
+            if isinstance(prev_acc, (int, float)) and isinstance(cur_acc, (int, float)):
+                changes[key] = (float(cur_acc) - float(prev_acc)) * 100.0
+            else:
+                changes[key] = None
+
+        result.update({
+            "status": "comparable",
+            "previous": previous_blocks,
+            "change_percentage_points": changes,
+        })
+        return result
+    except Exception:
+        result["status"] = "invalid_previous"
+        return result
+
 def write_report(output_dir: Path, metadata: dict[str, Any]) -> None:
-    json_path = output_dir / "personal_preference.json"
-    json_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-    metrics = metadata["metrics"]
-    val = metrics.get("validation_pair_accuracy")
-
-    def metric_text(block: dict[str, Any] | None) -> str:
-        if not block or not block.get("pairs"):
-            return "n/a (0 пар)"
-        accuracy = block.get("accuracy")
-        if accuracy is None:
-            return f"n/a ({block['pairs']} пар)"
-        return f"{accuracy*100:.1f}% ({block['pairs']} пар)"
-
-    val_text = "нет отдельной validation выборки" if val is None else f"{val*100:.1f}%"
-    diagnostic = metrics.get("stable_diagnostic") or {}
-    final_refit = metrics.get("final_refit") or {}
-    report = f"""# Personal Preference Model — training report
-
-Дата обучения: {metadata['trained_utc']}
-
-- Событий найдено: {metadata['dataset']['events_found']}
-- Уникальных непротиворечивых пар: {metadata['dataset']['unique_pairs']}
-- Базовых пар `chosen > current`: {metadata['dataset']['unique_base_pairs']}
-- Дополнительных уникальных пар `chosen > rejected recommendation`: {metadata['dataset']['additional_unique_recommendation_pairs']}
-- Отклонений автоматической рекомендации в новых событиях: {metadata['dataset']['recommendation_overrides']}
-- Фиксированный diagnostic holdout: {metadata['dataset']['diagnostic_pairs']} пар
-- Пар, исключённых из model-selection из-за пересечения лиц с diagnostic: {metadata['dataset']['diagnostic_guard_pairs_excluded']}
-- Development pairs после diagnostic guard: {metadata['dataset']['development_pairs']}
-- Train pairs: {metadata['dataset']['train_pairs']}
-- Validation pairs: {metadata['dataset']['validation_pairs']}
-- Способ разделения: `{metadata['dataset']['split_method']}`
-- Коллекторов/экземпляров Group Face Picker: {metadata['dataset']['collectors']}
-- Исключено противоречивых пар: {metadata['dataset']['contradictory_pairs_excluded']}
-- Strict validation — все пары: **{val_text}**
-- Strict validation — `chosen > current`: **{metric_text(metrics.get('validation_base'))}**
-- Strict validation — `chosen > rejected recommendation`: **{metric_text(metrics.get('validation_recommendation'))}**
-- Selection train — все пары: **{metrics['train_pair_accuracy']*100:.1f}%**
-- Selection train — `chosen > current`: **{metric_text(metrics.get('train_base'))}**
-- Selection train — `chosen > rejected recommendation`: **{metric_text(metrics.get('train_recommendation'))}**
-- Stable diagnostic — все пары: **{metric_text(diagnostic.get('all'))}**
-- Stable diagnostic — `chosen > current`: **{metric_text(diagnostic.get('base'))}**
-- Stable diagnostic — `chosen > rejected recommendation`: **{metric_text(diagnostic.get('recommendation'))}**
-- Best epoch по strict validation: **{metrics['best_epoch']}**
-- Финальная ONNX обучена на: **{metadata['dataset']['final_refit_pairs']} / {metadata['dataset']['unique_pairs']} пар**
-- Accuracy финальной ONNX на полном обучающем наборе: **{final_refit.get('all_pairs_accuracy', 0.0)*100:.1f}%**
-- Backbone: `{metadata['model']['backbone']}`
-- Выход: `0..1`, больше = ближе к вашим накопленным предпочтениям.
-
-## Важно
-
-`Strict validation` используется для выбора количества эпох и по-прежнему старается не допускать
-пересечения одинаковых face-id между train и validation. Её состав может меняться при росте графа
-сравнений, поэтому она полезна для текущего обучения, но не всегда напрямую сравнима между запусками.
-
-`Stable diagnostic` создаётся один раз в `diagnostic_holdout.json` и затем использует те же пары.
-Эта метрика предназначена именно для сравнения последующих обучений. Новые пары автоматически в
-этот holdout не добавляются. Пары, содержащие те же face-id, исключаются из model-selection train/val,
-чтобы diagnostic не видел те же самые сохранённые кропы во время выбора best epoch.
-
-После выбора `best_epoch` итоговая `personal_preference.onnx` обучается заново с нуля на всех
-доступных непротиворечивых парах. Поэтому diagnostic остаётся честным для выбора режима обучения,
-но сама рабочая ONNX использует 100% накопленного датасета.
-
-Старые события дают `chosen > current`; новые события могут дополнительно дать
-`chosen > rejected recommendation`, если вы заменили предложенный кадр. Вторая категория обычно
-существенно сложнее, поэтому её accuracy показывается отдельно. Метрики не являются универсальной
-оценкой красоты человека.
-
-Если `split_method` содержит `face-overlap-possible`, validation менее строгая: соберите больше
-независимых сравнений и переобучите модель.
-"""
-    (output_dir / "training_report.md").write_text(report, encoding="utf-8")
+    (output_dir / "personal_preference.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    m = metadata["metrics"]
+    d = metadata["dataset"]
+    diag = m["stable_diagnostic"]
+    def percent(block):
+        return "n/a" if block.get("accuracy") is None else f"{block['accuracy']*100:.1f}% ({block['pairs']} пар)"
+    lines = ["# Personal Preference Model — training report", "",
+             "Дата обучения: " + metadata["trained_utc"], "",
+             f"- Событий: {d['events_found']}; пропущено: {d['events_invalid']}",
+             f"- Уникальных пар: {d['unique_pairs']}",
+             f"- Папок данных: {d['data_folders']}",
+             f"- Development pairs: {d['development_pairs']}",
+             f"- Диагностических пар: {d['diagnostic_pairs']}",
+             f"- Исключено из подбора из-за пересечения с diagnostic: {d['diagnostic_guard_pairs_excluded']}",
+             f"- Средняя validation accuracy на трёх разбиениях: {m['validation_pair_accuracy']*100:.1f}%",
+             f"- Выбранная регуляризация C: {metadata['training']['regularization_C']:g}",
+             "- Stable diagnostic — все: " + percent(diag["all"]),
+             "- Stable diagnostic — chosen > current: " + percent(diag["base"]),
+             "- Stable diagnostic — chosen > rejected recommendation: " + percent(diag["recommendation"]),
+             f"- Финальная ONNX обучена на {d['final_refit_pairs']} парах",
+             f"- Точность финальной ONNX на обучающих парах: {m['final_refit']['all_pairs_accuracy']*100:.1f}%", "",
+             "## Проверенные варианты", "",
+             "| C | Средняя validation accuracy | Средняя validation loss |",
+             "|---|---:|---:|"]
+    for row in m["cross_validation"]:
+        lines.append(f"| {row['C']:g} | {row['mean_accuracy']*100:.1f}% | {row['mean_loss']:.4f} |")
+    comparison = m["stable_diagnostic_comparison"]
+    lines += ["", "Сравнение с предыдущей диагностикой: " + str(comparison.get("status"))]
+    if comparison.get("status") == "comparable":
+        for key, value in comparison["change_percentage_points"].items():
+            if value is not None:
+                lines.append(f"- {key}: {value:+.1f} п.п.")
+    lines += ["", "## Как трактовать результат", "",
+              "Модель использует весь кроп, центральную часть, области глаз и рта. "
+              "Формат исходных JPEG/JSON не изменяется. Обработка лица требует четырёх проходов backbone.",
+              "Регуляризация выбирается по средней ошибке трёх разбиений; одинаковые face-id "
+              "не разделяются между train и validation, когда граф позволяет это. "
+              "Разные кадры одного человека могут оставаться с обеих сторон.",
+              "Диагностическая выборка не используется для выбора C. Для её оценки модель "
+              "обучается на development pairs. Финальная ONNX затем обучается на всех парах; "
+              "её точность на обучающем наборе не является независимой оценкой качества.",
+              "Три validation-разбиения частично пересекаются и не являются тремя независимыми тестами.",
+              "Повторный подбор алгоритма по одной и той же диагностике постепенно уменьшает её независимость.", ""]
+    (output_dir / "training_report.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -830,10 +883,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--validation", type=float, default=0.20, help="validation fraction (default 0.20)")
     parser.add_argument("--min-pairs", type=int, default=20, help="refuse training below this many unique pairs")
     parser.add_argument("--batch-size", type=int, default=32, help="embedding extraction batch size")
-    parser.add_argument("--epochs", type=int, default=500)
-    parser.add_argument("--patience", type=int, default=60)
-    parser.add_argument("--lr", type=float, default=0.02)
-    parser.add_argument("--weight-decay", type=float, default=0.002)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--device", choices=("cpu", "cuda", "auto"), default="auto")
     parser.add_argument(
@@ -856,6 +905,7 @@ def main(argv: list[str] | None = None) -> int:
         pairs, dataset_stats = load_pairs(training_dir)
         min_pairs = max(2, int(args.min_pairs))
         print(f"Dataset:      {training_dir}")
+        print(f"Data folders: {dataset_stats['data_folders']}")
         print(f"Events:       {dataset_stats['events_found']}")
         print(f"Unique pairs: {dataset_stats['unique_pairs']}")
         print(f"  base chosen>current:                 {dataset_stats['unique_base_pairs']}")
@@ -878,6 +928,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         output_dir.mkdir(parents=True, exist_ok=True)
+        previous_training_metadata = load_previous_training_metadata(training_dir, output_dir)
         validation_fraction = max(0.05, min(0.40, float(args.validation)))
         diagnostic_fraction = max(0.02, min(0.25, float(args.diagnostic_fraction)))
         diagnostic_pairs, diagnostic_info = load_or_create_diagnostic_holdout(
@@ -910,6 +961,7 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("Не удалось сформировать train выборку")
 
         _np, torch, _nn, _F, _Image, _weights_enum, _mobilenet = _import_ml()
+        torch.set_num_threads(min(4, max(1, os.cpu_count() or 1)))
         if args.device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
         elif args.device == "cuda" and not torch.cuda.is_available():
@@ -935,70 +987,32 @@ def main(argv: list[str] | None = None) -> int:
         # Extract once for the full dataset.  The final refit will use all pairs,
         # while the first fit below is only for honest model selection.
         embeddings, backbone_info = extract_embeddings(pairs, max(1, int(args.batch_size)), device)
-        selection_weight, metrics = train_head(
-            train_pairs,
-            val_pairs,
-            embeddings,
-            int(args.seed),
-            max(10, int(args.epochs)),
-            float(args.lr),
-            max(0.0, float(args.weight_decay)),
-            max(5, int(args.patience)),
-        )
-
-        metrics["train_base"] = subset_pair_metrics(
-            selection_weight, train_pairs, embeddings, "current"
-        )
-        metrics["train_recommendation"] = subset_pair_metrics(
-            selection_weight, train_pairs, embeddings, "recommendation"
-        )
-        metrics["validation_base"] = subset_pair_metrics(
-            selection_weight, val_pairs, embeddings, "current"
-        )
-        metrics["validation_recommendation"] = subset_pair_metrics(
-            selection_weight, val_pairs, embeddings, "recommendation"
-        )
-        metrics["stable_diagnostic"] = {
-            "all": subset_pair_metrics(selection_weight, diagnostic_pairs, embeddings),
-            "base": subset_pair_metrics(selection_weight, diagnostic_pairs, embeddings, "current"),
-            "recommendation": subset_pair_metrics(
-                selection_weight, diagnostic_pairs, embeddings, "recommendation"
-            ),
+        c, cv = select_regularization(development_pairs, embeddings, validation_fraction, int(args.seed))
+        selected = min(cv, key=lambda row: row["mean_loss"])
+        selection_weight = fit_regularized_head(development_pairs, embeddings, c)
+        metrics = {
+            "cross_validation": cv,
+            "validation_pair_accuracy": selected["mean_accuracy"],
+            "validation_pair_loss": selected["mean_loss"],
+            "stable_diagnostic": {
+                "all": subset_pair_metrics(selection_weight, diagnostic_pairs, embeddings),
+                "base": subset_pair_metrics(selection_weight, diagnostic_pairs, embeddings, "current"),
+                "recommendation": subset_pair_metrics(selection_weight, diagnostic_pairs, embeddings, "recommendation"),
+            },
         }
-
-        print()
-        diagnostic_all = metrics["stable_diagnostic"]["all"]
-        if diagnostic_all["accuracy"] is not None:
-            print(
-                f"Stable diagnostic accuracy: {diagnostic_all['accuracy']*100:.1f}% "
-                f"({diagnostic_all['pairs']} pairs)"
-            )
-        recommendation_diag = metrics["stable_diagnostic"]["recommendation"]
-        if recommendation_diag["accuracy"] is not None:
-            print(
-                "Stable diagnostic rejected-recommendation accuracy: "
-                f"{recommendation_diag['accuracy']*100:.1f}% "
-                f"({recommendation_diag['pairs']} pairs)"
-            )
-
-        best_epoch = max(1, int(metrics["best_epoch"]))
-        print()
-        print(f"Final refit on all {len(pairs)} pairs for {best_epoch} epochs...")
-        final_weight, final_refit_metrics = refit_head_all_pairs(
-            pairs,
-            embeddings,
-            int(args.seed),
-            best_epoch,
-            float(args.lr),
-            max(0.0, float(args.weight_decay)),
-        )
-        final_refit_metrics["base"] = subset_pair_metrics(
-            final_weight, pairs, embeddings, "current"
-        )
-        final_refit_metrics["recommendation"] = subset_pair_metrics(
-            final_weight, pairs, embeddings, "recommendation"
-        )
-        metrics["final_refit"] = final_refit_metrics
+        metrics["stable_diagnostic_comparison"] = stable_diagnostic_comparison(previous_training_metadata, diagnostic_info, metrics)
+        for name, block in metrics["stable_diagnostic"].items():
+            if block["accuracy"] is not None:
+                print(f"Stable diagnostic {name}: {block['accuracy']*100:.1f}% ({block['pairs']} pairs)")
+        print(f"Final regularized refit on all {len(pairs)} pairs...")
+        final_weight = fit_regularized_head(pairs, embeddings, c)
+        full_score = subset_pair_metrics(final_weight, pairs, embeddings)
+        metrics["final_refit"] = {
+            "all_pairs_accuracy": full_score["accuracy"],
+            "all_pairs_loss": full_score["loss"],
+            "base": subset_pair_metrics(final_weight, pairs, embeddings, "current"),
+            "recommendation": subset_pair_metrics(final_weight, pairs, embeddings, "recommendation"),
+        }
 
         model_path = output_dir / "personal_preference.onnx"
         model_info = dict(backbone_info)
@@ -1037,16 +1051,22 @@ def main(argv: list[str] | None = None) -> int:
             },
             "training": {
                 "seed": int(args.seed),
-                "lr": float(args.lr),
-                "weight_decay": float(args.weight_decay),
-                "epochs_requested": int(args.epochs),
-                "patience": int(args.patience),
+                "method": "multiregion_pairwise_logistic_L2",
+                "regularization_C": c,
+                "selection_objective": "mean validation loss over three grouped splits",
                 "diagnostic_fraction": diagnostic_fraction,
                 "device": device,
                 "torch": str(torch.__version__),
             },
         }
         write_report(output_dir, metadata)
+        try:
+            save_diagnostic_history(training_dir, metadata)
+        except Exception as exc:
+            print(
+                f"WARNING: не удалось обновить diagnostic_history.json: {exc}",
+                file=sys.stderr,
+            )
 
         print()
         print("Готово.")
@@ -1059,7 +1079,7 @@ def main(argv: list[str] | None = None) -> int:
             "Final ONNX training-set accuracy: "
             f"{metrics['final_refit']['all_pairs_accuracy']*100:.1f}%"
         )
-        if split_method != "connected-components-no-face-overlap":
+        if "face-overlap-possible" in split_method:
             print("WARNING: validation содержит возможное пересечение лиц между train и validation.")
         return 0
     except Exception as exc:

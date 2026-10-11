@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 APP_NAME = "Group Face Picker"
-VERSION = "0.6.22"
+VERSION = "0.6.28"
 SETTINGS_SCHEMA_VERSION = 9
 SERVER_INSTANCE_ID = uuid.uuid4().hex[:12]
 CACHE_VERSION = 13
@@ -91,42 +91,39 @@ for directory in (CACHE_DIR, LOG_DIR):
 LOG_FILE = LOG_DIR / "group-face-server.log"
 CONFIG_FILE = ROOT / "gfp_config.json"
 TRAINING_DATA_DIR = ROOT / "training_data"
-TRAINING_EVENTS_DIR = TRAINING_DATA_DIR / "events"
-TRAINING_FACES_DIR = TRAINING_DATA_DIR / "faces"
 TRAINING_SCHEMA_VERSION = 1
 TRAINING_DATA_LOCK = threading.RLock()
-TRAINING_COLLECTOR_FILE = TRAINING_DATA_DIR / "collector.json"
+TRAINING_COMPUTER_ID = ""
 
 
 def _load_or_create_collector_id() -> str:
-    """Return a stable random id for this local Group Face Picker instance.
+    """Stable computer ID, independent of copied program/data folders.
 
-    The id is intentionally not derived from hostname, username or path. Fresh
-    copies on different computers therefore get independent ids even when the
-    machines were cloned or the project lives at the same path. ``collector.json``
-    is local provenance only; merge_training_data never imports it.
+    Windows MachineGuid is hashed with an application namespace; raw machine
+    identifiers are never stored in the training dataset.
     """
+    global TRAINING_COMPUTER_ID
     with TRAINING_DATA_LOCK:
-        TRAINING_DATA_DIR.mkdir(parents=True, exist_ok=True)
-        if TRAINING_COLLECTOR_FILE.is_file():
+        if TRAINING_COMPUTER_ID:
+            return TRAINING_COMPUTER_ID
+        machine_key = ""
+        if os.name == "nt":
             try:
-                payload = json.loads(TRAINING_COLLECTOR_FILE.read_text(encoding="utf-8"))
-                collector_id = str(payload.get("collector_id") or "").strip().lower()
-                if len(collector_id) == 32 and all(ch in "0123456789abcdef" for ch in collector_id):
-                    return collector_id
-            except Exception:
-                LOGGER.warning("Could not read training collector id; a new local id will be created.")
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                    r"SOFTWARE\Microsoft\Cryptography", 0,
+                                    winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
+                    machine_key = str(winreg.QueryValueEx(key, "MachineGuid")[0]).strip().lower()
+            except OSError:
+                pass
+        if not machine_key:
+            machine_key = socket.gethostname().lower() + "|" + str(uuid.getnode())
+        TRAINING_COMPUTER_ID = uuid.uuid5(
+            uuid.NAMESPACE_URL, "group-face-picker:computer:" + machine_key
+        ).hex
+        return TRAINING_COMPUTER_ID
 
-        collector_id = uuid.uuid4().hex
-        payload = {
-            "schema_version": 1,
-            "collector_id": collector_id,
-            "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-        }
-        temp = TRAINING_COLLECTOR_FILE.with_suffix(".json.tmp")
-        temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(str(temp), str(TRAINING_COLLECTOR_FILE))
-        return collector_id
+
 DEFAULT_CONFIG = {
     "server_host": DEFAULT_SERVER_HOST,
     "server_port": DEFAULT_SERVER_PORT,
@@ -3257,6 +3254,12 @@ def _select_child(payload: Dict[str, Any], job_id: Optional[str] = None) -> Dict
     # updates use the same outer lock so an analysis cannot mix two engine/config
     # revisions midway through a group.
     with SETTINGS_APPLY_LOCK, SELECTION_LOCK:
+        _check_job_cancelled(job_id)
+        _update_job(job_id, progress=0.0, status="running",
+                    text="Инициализация модели распознавания лиц")
+        ENGINE.prepare()
+        _check_job_cancelled(job_id)
+        _update_job(job_id, progress=0.01, status="running", text="Идёт поиск дублей...")
         source_path = Path(str(payload.get("source_path") or "")).resolve()
         if not source_path.is_file():
             raise UserVisibleError("The active Photoshop document has no readable source file on disk.")
@@ -3463,7 +3466,7 @@ def _prepare_crop(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
-def _training_face_asset(candidate: QueryCandidate) -> Dict[str, Any]:
+def _training_face_asset(candidate: QueryCandidate, faces_dir: Path) -> Dict[str, Any]:
     """Persist one cached 320px face crop by content hash.
 
     Content-addressed filenames make datasets from several computers naturally
@@ -3474,7 +3477,7 @@ def _training_face_asset(candidate: QueryCandidate) -> Dict[str, Any]:
         raise UserVisibleError("Training preview is missing from the group cache. Run the face selection again.")
     data = master.read_bytes()
     face_id = hashlib.sha256(data).hexdigest()
-    target = TRAINING_FACES_DIR / (face_id + ".jpg")
+    target = faces_dir / (face_id + ".jpg")
     if target.is_file():
         if hashlib.sha256(target.read_bytes()).hexdigest() != face_id:
             raise UserVisibleError("Training face-store hash mismatch: %s" % target.name)
@@ -3540,10 +3543,14 @@ def _record_preference(payload: Dict[str, Any]) -> Dict[str, Any]:
     event_id = hashlib.sha256(event_seed).hexdigest()[:32]
 
     with TRAINING_DATA_LOCK:
-        TRAINING_EVENTS_DIR.mkdir(parents=True, exist_ok=True)
-        TRAINING_FACES_DIR.mkdir(parents=True, exist_ok=True)
-        baseline_asset = _training_face_asset(baseline)
-        chosen_asset = _training_face_asset(chosen)
+        collector_id = _load_or_create_collector_id()
+        training_dir = TRAINING_DATA_DIR / collector_id
+        events_dir = training_dir / "events"
+        faces_dir = training_dir / "faces"
+        events_dir.mkdir(parents=True, exist_ok=True)
+        faces_dir.mkdir(parents=True, exist_ok=True)
+        baseline_asset = _training_face_asset(baseline, faces_dir)
+        chosen_asset = _training_face_asset(chosen, faces_dir)
         recommended_asset = None
         if recommended_candidate is not None:
             if recommended_index == selected_index:
@@ -3551,7 +3558,7 @@ def _record_preference(payload: Dict[str, Any]) -> Dict[str, Any]:
             elif recommended_index == active_index:
                 recommended_asset = dict(baseline_asset)
             else:
-                recommended_asset = _training_face_asset(recommended_candidate)
+                recommended_asset = _training_face_asset(recommended_candidate, faces_dir)
         pair_key = hashlib.sha256(
             (chosen_asset["face_id"] + ">" + baseline_asset["face_id"]).encode("ascii")
         ).hexdigest()
@@ -3560,7 +3567,7 @@ def _record_preference(payload: Dict[str, Any]) -> Dict[str, Any]:
             "event_id": event_id,
             "pair_key": pair_key,
             "created_utc": datetime.fromtimestamp(context.created_at, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-            "collector_id": _load_or_create_collector_id(),
+            "collector_id": collector_id,
             "app_version": VERSION,
             "preference": "chosen_over_current",
             "chosen": chosen_asset,
@@ -3582,7 +3589,7 @@ def _record_preference(payload: Dict[str, Any]) -> Dict[str, Any]:
             # merge/train tools ignore unknown fields, while the updated trainer
             # can use an explicit rejected recommendation as an extra pair.
             event["recommended"] = recommended_asset
-        target = TRAINING_EVENTS_DIR / (event_id + ".json")
+        target = events_dir / (event_id + ".json")
         encoded = (json.dumps(event, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
         if target.is_file():
             existing = target.read_bytes()
@@ -3610,7 +3617,7 @@ def _record_preference(payload: Dict[str, Any]) -> Dict[str, Any]:
         "saved": saved,
         "event_id": event_id,
         "pair_key": pair_key,
-        "training_dir": str(TRAINING_DATA_DIR),
+        "training_dir": str(training_dir),
     }
 
 
@@ -3631,7 +3638,7 @@ def _start_select_job(payload: Dict[str, Any]) -> Dict[str, Any]:
             "updated_at": time.time(),
             "status": "running",
             "progress": 0.01,
-            "text": "Проверка кэша группы...",
+            "text": "Инициализация модели распознавания лиц",
             "result": None,
             "error": "",
             "cancel_requested": False,
@@ -3954,14 +3961,13 @@ def main() -> int:
 
     print("=" * 64)
     print("%s server v%s" % (APP_NAME, VERSION))
-    print("The server is started manually and does not use system Python.")
+    print("Manual or Photoshop autostart; private Python runtime.")
     print("Log: %s" % LOG_FILE)
     print("=" * 64)
     try:
         _cleanup_disk_cache(force=True)
         LOGGER.info("Group-analysis cache TTL: %d hours since last use.", _get_runtime_config().get("cache_ttl_hours", DEFAULT_CACHE_TTL_HOURS))
-        LOGGER.info("Loading InsightFace buffalo_l... mode=%s, quality=%s, det-size=%d, scan threads=%d", _compute_mode(), _analysis_quality(), _det_size(), _scan_threads())
-        ENGINE.prepare()
+        LOGGER.info("Face model will initialize on the first selection job; control requests remain available.")
         LOGGER.info("Supported source formats: %s", ", ".join(sorted(SUPPORTED_EXTENSIONS)))
         backends = RECOMMENDER.backend_status()
         LOGGER.info("Recommendation backends: public=%s personal=%s", "ready" if backends.get("public", {}).get("ready") else backends.get("public", {}).get("error") or "missing", "ready" if backends.get("personal", {}).get("ready") else backends.get("personal", {}).get("error") or "missing")

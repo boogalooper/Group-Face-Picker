@@ -27,7 +27,7 @@ if errorlevel 1 goto :not_installed
 set "BASEPY=runtime\venv\Scripts\python.exe"
 set "TRAINDIR=runtime\training_venv"
 set "TRAINPY=%TRAINDIR%\Scripts\python.exe"
-set "READY=%TRAINDIR%\.gfp_training_ready_064"
+set "READY=%TRAINDIR%\.gfp_training_ready_0628"
 
 echo ============================================================
 echo Group Face Picker - personal model training
@@ -56,7 +56,7 @@ if not exist "%TRAINPY%" (
 )
 
 if exist "%READY%" (
-  "%TRAINPY%" -c "import torch, torchvision, onnx, onnxruntime, numpy, PIL" >nul 2>&1
+  "%TRAINPY%" -c "import torch, torchvision, onnx, onnxruntime, numpy, PIL, sklearn" >nul 2>&1
   if errorlevel 1 del /q "%READY%" >nul 2>&1
 )
 
@@ -68,7 +68,7 @@ if not exist "%READY%" (
   if errorlevel 1 goto :failed
   "%TRAINPY%" -m pip install -r training_requirements.txt
   if errorlevel 1 goto :failed
-  "%TRAINPY%" -c "import torch, torchvision, onnx, onnxruntime, numpy, PIL; print('Training runtime OK:', torch.__version__, torchvision.__version__)"
+  "%TRAINPY%" -c "import torch, torchvision, onnx, onnxruntime, numpy, PIL, sklearn; print('Training runtime OK:', torch.__version__, torchvision.__version__)"
   if errorlevel 1 goto :failed
   >"%READY%" echo ready
 ) else (

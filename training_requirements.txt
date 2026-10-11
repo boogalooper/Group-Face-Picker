@@ -4,3 +4,4 @@ numpy>=1.26,<3
 Pillow>=10.4,<13
 onnx==1.22.0
 onnxruntime==1.29.0
+scikit-learn==1.8.0
