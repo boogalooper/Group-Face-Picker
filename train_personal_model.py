@@ -954,12 +954,6 @@ def main(argv: list[str] | None = None) -> int:
                 "для model-selection обучения. Удалите diagnostic_holdout.json и повторите обучение."
             )
 
-        train_pairs, val_pairs, split_method = split_pairs_no_face_leakage(
-            development_pairs, validation_fraction, int(args.seed)
-        )
-        if not train_pairs:
-            raise ValueError("Не удалось сформировать train выборку")
-
         _np, torch, _nn, _F, _Image, _weights_enum, _mobilenet = _import_ml()
         torch.set_num_threads(min(4, max(1, os.cpu_count() or 1)))
         if args.device == "auto":
@@ -979,8 +973,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if diagnostic_guard_excluded:
             print(f"Diagnostic face-leakage guard excluded from model selection: {diagnostic_guard_excluded}")
-        print(f"Train / val:   {len(train_pairs)} / {len(val_pairs)}")
-        print(f"Split:         {split_method}")
+        print(f"Development:   {len(development_pairs)} pairs; selection over 3 grouped splits")
         if len(pairs) < 100:
             print("WARNING: датасет пока маленький. Модель будет экспериментальной; продолжайте собирать статистику.")
 
@@ -1037,10 +1030,12 @@ def main(argv: list[str] | None = None) -> int:
                 "diagnostic_pairs": len(diagnostic_pairs),
                 "diagnostic_guard_pairs_excluded": diagnostic_guard_excluded,
                 "development_pairs": len(development_pairs),
-                "train_pairs": len(train_pairs),
-                "validation_pairs": len(val_pairs),
+                "selection_splits": [
+                    {key: fold[key] for key in ("seed", "split_method", "train_pairs", "validation_pairs")}
+                    for fold in selected["folds"]
+                ],
                 "final_refit_pairs": len(pairs),
-                "split_method": split_method,
+                "split_method": "three-repeated-grouped-splits",
                 "validation_fraction_requested": validation_fraction,
                 "diagnostic_fraction_requested": diagnostic_fraction,
                 "diagnostic_holdout": diagnostic_info,
@@ -1079,7 +1074,7 @@ def main(argv: list[str] | None = None) -> int:
             "Final ONNX training-set accuracy: "
             f"{metrics['final_refit']['all_pairs_accuracy']*100:.1f}%"
         )
-        if "face-overlap-possible" in split_method:
+        if any("face-overlap-possible" in fold["split_method"] for fold in selected["folds"]):
             print("WARNING: validation содержит возможное пересечение лиц между train и validation.")
         return 0
     except Exception as exc:

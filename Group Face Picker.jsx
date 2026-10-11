@@ -18,7 +18,7 @@ var GFP_SHIFT_LAUNCH = !!ScriptUI.environment.keyboardState.shiftKey;
 
 var GFP_NAME = "Group Face Picker";
 var GFP_UUID = "9a189321-e07f-40ff-8394-156a4bd48cf5";
-var GFP_VERSION = "0.6.28";
+var GFP_VERSION = "0.6.36";
 var GFP_DEFAULT_HOST = "127.0.0.1";
 var GFP_DEFAULT_PORT_SEND = 6420;
 var GFP_DEFAULT_PORT_LISTEN = 6421;
@@ -443,6 +443,90 @@ function gfpEstimateFaceScale(eyeRatio, heightRatio) {
     return eyeRatio * Math.exp(weight * Math.log(relativeHeight));
 }
 
+// Fit translation and optional uniform scale from existing landmarks only.
+// Eyes dominate; robust auxiliary weights limit expression/pose influence.
+function gfpFitFaceGeometry(source, target, baseScale, allowScale) {
+    var fallback = { scale: baseScale, offsetX: 0, offsetY: 0 };
+    if (!source || !target || source.length < 5 || target.length < 5) return fallback;
+    if (!isFinite(baseScale) || baseScale <= 0) return fallback;
+    var i, j;
+    for (i = 0; i < 5; i++) {
+        if (!source[i] || !target[i]) return fallback;
+        for (j = 0; j < 2; j++) {
+            if (!isFinite(Number(source[i][j])) || !isFinite(Number(target[i][j]))) return fallback;
+        }
+    }
+    var sx = (Number(source[0][0]) + Number(source[1][0])) / 2;
+    var sy = (Number(source[0][1]) + Number(source[1][1])) / 2;
+    var tx = (Number(target[0][0]) + Number(target[1][0])) / 2;
+    var ty = (Number(target[0][1]) + Number(target[1][1])) / 2;
+    var eyeWidth = gfpDistance(Number(target[0][0]), Number(target[0][1]), Number(target[1][0]), Number(target[1][1]));
+    var sourceWidth = gfpDistance(Number(source[0][0]), Number(source[0][1]), Number(source[1][0]), Number(source[1][1]));
+    if (eyeWidth <= 1 || sourceWidth <= 1) return fallback;
+    var p = [], q = [];
+    for (i = 0; i < 5; i++) {
+        p.push([Number(source[i][0]) - sx, Number(source[i][1]) - sy]);
+        q.push([Number(target[i][0]) - tx, Number(target[i][1]) - ty]);
+    }
+    function eyeError(scale, dx, dy) {
+        var sum = 0;
+        for (var e = 0; e < 2; e++) {
+            var ex = scale * p[e][0] + dx - q[e][0];
+            var ey = scale * p[e][1] + dy - q[e][1];
+            sum += ex * ex + ey * ey;
+        }
+        return Math.sqrt(sum / 2);
+    }
+    var baselineError = eyeError(baseScale, 0, 0);
+    // A substantial angle/pose mismatch cannot be solved without rotation.
+    if (baselineError > eyeWidth * 0.15) return fallback;
+    var scale = baseScale, dx = 0, dy = 0;
+    var baseWeights = [1, 1, 0.25, 0.125, 0.125];
+    var auxiliaryUsed = false;
+    for (var iteration = 0; iteration < 3; iteration++) {
+        var weights = [], total = 0, px = 0, py = 0, qx = 0, qy = 0;
+        auxiliaryUsed = false;
+        for (i = 0; i < 5; i++) {
+            var weight = baseWeights[i];
+            if (i >= 2) {
+                // Gate against the original eye fit, so rejected landmarks
+                // cannot gain influence by pulling successive iterations.
+                var initialResidual = gfpDistance(baseScale * p[i][0], baseScale * p[i][1], q[i][0], q[i][1]);
+                var residual = gfpDistance(scale * p[i][0] + dx, scale * p[i][1] + dy, q[i][0], q[i][1]);
+                var ratio = Math.max(initialResidual, residual) / (eyeWidth * 0.25);
+                weight *= ratio >= 1 ? 0 : Math.pow(1 - ratio * ratio, 2);
+                if (weight > 0.001) auxiliaryUsed = true;
+            }
+            weights.push(weight);
+            total += weight;
+            px += weight * p[i][0]; py += weight * p[i][1];
+            qx += weight * q[i][0]; qy += weight * q[i][1];
+        }
+        if (!auxiliaryUsed) return fallback;
+        px /= total; py /= total; qx /= total; qy /= total;
+        scale = baseScale;
+        if (allowScale) {
+            // Regularize toward the established eye/height scale estimate.
+            var prior = 2 * sourceWidth * sourceWidth;
+            var numerator = prior * baseScale, denominator = prior;
+            for (i = 0; i < 5; i++) {
+                var ax = p[i][0] - px, ay = p[i][1] - py;
+                numerator += weights[i] * (ax * (q[i][0] - qx) + ay * (q[i][1] - qy));
+                denominator += weights[i] * (ax * ax + ay * ay);
+            }
+            scale = Math.max(baseScale * 0.95, Math.min(baseScale * 1.05, numerator / denominator));
+        }
+        dx = qx - scale * px; dy = qy - scale * py;
+        var shift = Math.sqrt(dx * dx + dy * dy);
+        var maxShift = eyeWidth * 0.03;
+        if (shift > maxShift) { dx *= maxShift / shift; dy *= maxShift / shift; }
+    }
+    if (scale < 0.25 || scale > 4.0) return fallback;
+    if (!isFinite(scale) || !isFinite(dx) || !isFinite(dy) ||
+        eyeError(scale, dx, dy) > Math.min(eyeWidth * 0.15, baselineError + eyeWidth * 0.02)) return fallback;
+    return { scale: scale, offsetX: dx, offsetY: dy };
+}
+
 function gfpFacePlacement(eyeX, eyeY, targetX, targetY, scale, width, height, sourceWidth, sourceHeight) {
     var values = [eyeX, eyeY, targetX, targetY, scale, width, height, sourceWidth, sourceHeight];
     for (var i = 0; i < values.length; i++) {
@@ -525,7 +609,6 @@ function gfpShowDialog(payload) {
         // Static previews have no native hover/pressed states.
         // Mouse presses are handled by the grid in the capture phase.
         var matchInfo = payload.matches[i] || {};
-        var isActiveFile = matchInfo.is_active === true;
         var cell = row.add("group");
         cell.orientation = "column";
         cell.alignChildren = ["center", "top"];
@@ -567,21 +650,10 @@ function gfpShowDialog(payload) {
         previewButton.gfpIndex = i;
         cell.gfpIndex = i;
 
-        var similarityCaption = isActiveFile ? ("ТЕКУЩИЙ · " + similarityText) : similarityText;
-        if (isRecommended) {
-            similarityCaption = "ЛУЧШИЙ · " + similarityCaption;
-        }
-        var previewCaption = displayFileName + "\n" + similarityCaption;
+        var previewCaption = displayFileName + "\n" + similarityText;
         var activeLabel = cell.add("statictext", undefined, previewCaption, { multiline: true });
         activeLabel.justify = "center";
         activeLabel.preferredSize = [buttonSize, 32];
-        if (isRecommended) {
-            try {
-                var greenBrush = activeLabel.graphics.newBrush(activeLabel.graphics.BrushType.SOLID_COLOR, [0.12, 0.55, 0.18, 1]);
-                activeLabel.graphics.foregroundColor = greenBrush;
-            } catch (brushError) {
-            }
-        }
         previewButtons.push(previewButton);
     }
 
@@ -686,7 +758,7 @@ function gfpShowDialog(payload) {
     };
     settingsButton.onClick = function () {
         if (gfpShowSettingsDialog()) {
-            status.text = "Настройки сохранены. Для обновления подсветки лучшего дубля перезапустите текущий поиск лица.";
+            status.text = "Настройки сохранены. Для обновления превью и их порядка повторите текущий поиск лица.";
             w.update();
         }
     };
@@ -878,12 +950,31 @@ function gfpInsertCandidate(payload, index) {
                 }
             }
 
-            var placement = gfpFacePlacement(
-                (eye0x + eye1x) * 0.5, (eye0y + eye1y) * 0.5,
-                (Number(offsets[0][0]) + Number(offsets[1][0])) * 0.5,
-                (Number(offsets[0][1]) + Number(offsets[1][1])) * 0.5,
-                faceScale, expectedWidth, expectedHeight, openedSourceWidth, openedSourceHeight
-            );
+            var sourcePoints = [];
+            for (var pointIndex = 0; pointIndex < kps.length; pointIndex++) {
+                sourcePoints.push([Number(kps[pointIndex][0]) * openedSourceWidth,
+                                   Number(kps[pointIndex][1]) * openedSourceHeight]);
+            }
+            var baseScale = faceScale;
+            var fit = gfpFitFaceGeometry(sourcePoints, item.target_kps_offsets, baseScale, faceScaleEnabled);
+            faceScale = fit.scale;
+            var sourceAnchorX = (eye0x + eye1x) * 0.5;
+            var sourceAnchorY = (eye0y + eye1y) * 0.5;
+            var targetAnchorX = (Number(offsets[0][0]) + Number(offsets[1][0])) * 0.5;
+            var targetAnchorY = (Number(offsets[0][1]) + Number(offsets[1][1])) * 0.5;
+            var placement;
+            try {
+                placement = gfpFacePlacement(sourceAnchorX, sourceAnchorY,
+                    targetAnchorX + fit.offsetX, targetAnchorY + fit.offsetY,
+                    faceScale, expectedWidth, expectedHeight, openedSourceWidth, openedSourceHeight);
+            } catch (placementError) {
+                if (faceScale == baseScale && fit.offsetX == 0 && fit.offsetY == 0) throw placementError;
+                // A small correction must not make a previously usable crop
+                // fail at the source edge. Retry the established eye fit.
+                faceScale = baseScale;
+                placement = gfpFacePlacement(sourceAnchorX, sourceAnchorY, targetAnchorX, targetAnchorY,
+                    faceScale, expectedWidth, expectedHeight, openedSourceWidth, openedSourceHeight);
+            }
             cropLeft = placement.left;
             cropTop = placement.top;
             cropRight = placement.right;
@@ -1385,6 +1476,7 @@ function gfpDefaultConfig() {
         group_boundary_search: false,
         face_scale_match: false,
         collect_statistics: false,
+        preview_sort: "filename",
         recommendation_model: "public"
     };
 }
@@ -1479,6 +1571,10 @@ function gfpNormalizeConfig(raw) {
     cfg.group_boundary_search = gfpBooleanValue(cfg.group_boundary_search, false);
     cfg.face_scale_match = gfpBooleanValue(cfg.face_scale_match, false);
     cfg.collect_statistics = gfpBooleanValue(cfg.collect_statistics, false);
+    cfg.preview_sort = gfpTrimString(cfg.preview_sort || "filename").toLowerCase();
+    if (cfg.preview_sort != "filename" && cfg.preview_sort != "similarity" && cfg.preview_sort != "attractiveness") {
+        cfg.preview_sort = "filename";
+    }
     cfg.recommendation_model = gfpTrimString(cfg.recommendation_model || "public").toLowerCase();
     if (cfg.recommendation_model != "off" && cfg.recommendation_model != "public" && cfg.recommendation_model != "personal" && cfg.recommendation_model != "combined") {
         cfg.recommendation_model = "public";
@@ -1691,7 +1787,7 @@ function gfpShowSettingsDialog() {
     var w = new Window("dialog", GFP_NAME + " — настройки");
     w.orientation = "column";
     w.alignChildren = ["fill", "top"];
-    w.spacing = 8;
+    w.spacing = 6;
     w.margins = 12;
 
     function addLabeledEdit(parent, labelText, valueText, editWidth) {
@@ -1709,25 +1805,22 @@ function gfpShowSettingsDialog() {
     var serverPanel = w.add("panel", undefined, "Сервер");
     serverPanel.orientation = "column";
     serverPanel.alignChildren = ["fill", "top"];
-    serverPanel.margins = 10;
+    serverPanel.margins = 8;
+    serverPanel.spacing = 5;
     var edServerHost = addLabeledEdit(serverPanel, "Адрес сервера", String(current.server_host), 220);
     var edPort = addLabeledEdit(serverPanel, "Порт сервера", String(current.server_port), 100);
-    var serverHint = serverPanel.add("statictext", undefined,
-        "Локально: 127.0.0.1. Для работы по сети укажите IP или имя компьютера, на котором запущен Python-сервер.",
-        { multiline: true });
-    serverHint.preferredSize = [470, 36];
     var rememberedLauncher = gfpLoadClientState();
-    var launcherHint = serverPanel.add("statictext", undefined,
-        rememberedLauncher.server_launcher_path ?
-            ("Автозапуск локального сервера: " + String(rememberedLauncher.server_launcher_path)) :
-            "Один раз запустите run_server.bat и JSX: путь сохранится для автозапуска.",
-        { multiline: true });
-    launcherHint.preferredSize = [470, 32];
+    edServerHost.helpTip = "Локально: 127.0.0.1. По сети — IP или имя компьютера сервера. Фотографии должны быть доступны серверу по тому же пути.\n" +
+        (rememberedLauncher.server_launcher_path ?
+            "Автозапуск: " + String(rememberedLauncher.server_launcher_path) :
+            "Один раз запустите run_server.bat и JSX, чтобы сохранить путь автозапуска.");
+    edPort.helpTip = "После изменения адреса или порта перезапустите сервер.";
 
     var performancePanel = w.add("panel", undefined, "Производительность распознавания");
     performancePanel.orientation = "column";
     performancePanel.alignChildren = ["fill", "top"];
-    performancePanel.margins = 10;
+    performancePanel.margins = 8;
+    performancePanel.spacing = 5;
 
     var modeRow = performancePanel.add("group");
     modeRow.orientation = "row";
@@ -1793,11 +1886,9 @@ function gfpShowSettingsDialog() {
     slPreviewThreads.onChange = updatePreviewThreadsLabel;
     updatePreviewThreadsLabel();
 
-    var perfHint = performancePanel.add("statictext", undefined,
-        "Быстрый режим заметно ускоряет детекцию, но может пропускать очень маленькие лица. " +
-        "Потоки анализа обрабатывают разные кадры через InsightFace. Потоки превью собирают PNG из уже сохранённых миниатюр лиц; можно использовать до 8 потоков.",
-        { multiline: true });
-    perfHint.preferredSize = [470, 48];
+    dlQuality.helpTip = "Быстрый режим ускоряет детекцию, но может пропускать очень маленькие лица.";
+    slThreads.helpTip = "Число одновременно анализируемых кадров. Пакетные вызовы распознавателя выполняются по одному.";
+    slPreviewThreads.helpTip = "Число потоков подготовки PNG из сохранённых миниатюр лиц, от 1 до 8.";
 
     if (liveEngine && liveEngine.provider) {
         var engineStatus = performancePanel.add("statictext", undefined,
@@ -1808,16 +1899,17 @@ function gfpShowSettingsDialog() {
     var previewPanel = w.add("panel", undefined, "Интерфейс");
     previewPanel.orientation = "column";
     previewPanel.alignChildren = ["fill", "top"];
-    previewPanel.margins = 10;
-    var previewInfo = previewPanel.add("statictext", undefined, "Размер квадратного превью", { multiline: true });
-    previewInfo.preferredSize = [460, 20];
+    previewPanel.margins = 8;
+    previewPanel.spacing = 5;
     var previewRow = previewPanel.add("group");
     previewRow.orientation = "row";
     previewRow.alignChildren = ["fill", "center"];
+    var previewLabel = previewRow.add("statictext", undefined, "Размер превью");
+    previewLabel.preferredSize = [230, 20];
     var slPreview = previewRow.add("slider", undefined, Number(current.preview_size), 64, 320);
-    slPreview.preferredSize = [340, 20];
+    slPreview.preferredSize = [180, 20];
     var stPreview = previewRow.add("statictext", undefined, String(current.preview_size) + " px");
-    stPreview.preferredSize = [70, 20];
+    stPreview.preferredSize = [60, 20];
     function updatePreviewLabel() {
         var v = Math.max(64, Math.min(320, Math.round(Number(slPreview.value) / 8) * 8));
         slPreview.value = v;
@@ -1827,13 +1919,24 @@ function gfpShowSettingsDialog() {
     slPreview.onChange = updatePreviewLabel;
     updatePreviewLabel();
 
-    var insertPanel = w.add("panel", undefined, "Вставка");
+    var insertPanel = w.add("panel", undefined, "Превью и рекомендации");
     insertPanel.orientation = "column";
     insertPanel.alignChildren = ["fill", "top"];
-    insertPanel.margins = 10;
-    var chCollectStatistics = insertPanel.add("checkbox", undefined, "Собирать статистику для обучения");
-    chCollectStatistics.value = current.collect_statistics === true;
-    chCollectStatistics.helpTip = "После успешной вставки сохраняется базовая пара: выбранное лицо > текущее лицо. Если вы заменили автоматически предложенный кадр, обучатель дополнительно использует: выбранное лицо > отвергнутая рекомендация. Данные находятся в training_data рядом с Python-сервером.";
+    insertPanel.margins = 8;
+    insertPanel.spacing = 5;
+    var sortRow = insertPanel.add("group");
+    sortRow.orientation = "row";
+    var sortLabel = sortRow.add("statictext", undefined, "Порядок превью");
+    sortLabel.preferredSize = [230, 20];
+    var dlPreviewSort = sortRow.add("dropdownlist", undefined);
+    dlPreviewSort.preferredSize = [220, 24];
+    gfpPopulateValueDropdown(dlPreviewSort, [
+        { label: "По порядку файлов", value: "filename" },
+        { label: "По степени похожести", value: "similarity" },
+        { label: "По оценке удачности", value: "attractiveness" }
+    ]);
+    gfpRestoreValueDropdown(dlPreviewSort, current.preview_sort, "filename");
+    dlPreviewSort.helpTip = "Порядок файлов — естественная сортировка имён, текущий кадр на своём месте. Похожесть — сходство с выбранным лицом. Удачность — оценка модели, выбранной ниже; без доступных оценок используется порядок файлов.";
     var recommendationRow = insertPanel.add("group");
     recommendationRow.orientation = "row";
     recommendationRow.alignChildren = ["left", "center"];
@@ -1848,10 +1951,7 @@ function gfpShowSettingsDialog() {
         { label: "Публичная FBP + моя модель", value: "combined" }
     ]);
     gfpRestoreValueDropdown(dlRecommendation, current.recommendation_model, "public");
-    var recommendationHint = insertPanel.add("statictext", undefined,
-        "Подпись «ЛУЧШИЙ» отмечает рекомендованный дубль. Публичная FBP оценивает удачность портрета, а личная модель может использовать ваш накопленный выбор.",
-        { multiline: true });
-    recommendationHint.preferredSize = [470, 34];
+    dlRecommendation.helpTip = "«ЛУЧШИЙ» — рекомендованный дубль. Публичная FBP оценивает удачность портрета, личная модель — ваши накопленные предпочтения.";
     var recommendationStatusText = "Публичная FBP: нужен install.bat. Личная модель: положите personal_preference.onnx в папку personal_model рядом с Python-сервером.";
     if (liveRecommendationBackends) {
         var publicState = liveRecommendationBackends.public || {};
@@ -1859,28 +1959,29 @@ function gfpShowSettingsDialog() {
         recommendationStatusText = "Публичная FBP: " + (publicState.loaded ? "загружена" : (publicState.installed ? "установлена; загрузится при первом поиске" : "не установлена")) +
             "; личная модель: " + (personalState.loaded ? "загружена" : (personalState.installed ? "установлена; загрузится при первом поиске" : "не найдена"));
     }
-    var recommendationStatus = insertPanel.add("statictext", undefined, recommendationStatusText, { multiline: true });
-    recommendationStatus.preferredSize = [470, 32];
+    dlRecommendation.helpTip += "\n" + recommendationStatusText;
+
+    var chCollectStatistics = w.add("checkbox", undefined, "Собирать статистику для обучения");
+    chCollectStatistics.value = current.collect_statistics === true;
+    chCollectStatistics.helpTip = "После успешной вставки сохраняется базовая пара: выбранное лицо > текущее лицо. Если вы заменили автоматически предложенный кадр, обучатель дополнительно использует: выбранное лицо > отвергнутая рекомендация. Данные находятся в training_data рядом с Python-сервером.";
 
     var cachePanel = w.add("panel", undefined, "Кэш и поиск");
     cachePanel.orientation = "column";
     cachePanel.alignChildren = ["fill", "top"];
-    cachePanel.margins = 10;
+    cachePanel.margins = 8;
+    cachePanel.spacing = 5;
     var edCacheTtl = addLabeledEdit(cachePanel, "Срок жизни кэша анализа, часов", String(current.cache_ttl_hours), 80);
     var chGroupBoundarySearch = cachePanel.add("checkbox", undefined, "Поиск границ группы");
     chGroupBoundarySearch.value = current.group_boundary_search === true;
     chGroupBoundarySearch.helpTip = "Включено: анализ начинается от открытого кадра и останавливается после уверенной смены состава группы. Выключено: все поддерживаемые файлы папки считаются одной группой.";
-    var boundaryHint = cachePanel.add("statictext", undefined,
-        "Если в папке гарантированно только одна группа, отключение поиска границ немного ускоряет первичный анализ.",
-        { multiline: true });
-    boundaryHint.preferredSize = [470, 32];
+    chGroupBoundarySearch.helpTip += " Если в папке только одна группа, отключение немного ускоряет первичный анализ.";
     var thresholdRow = cachePanel.add("group");
     thresholdRow.orientation = "row";
     thresholdRow.alignChildren = ["fill", "center"];
     var thresholdText = thresholdRow.add("statictext", undefined, "Порог совпадения лица");
     thresholdText.preferredSize = [230, 20];
     var slThreshold = thresholdRow.add("slider", undefined, Math.round(Number(current.match_threshold) * 100), 10, 60);
-    slThreshold.preferredSize = [220, 20];
+    slThreshold.preferredSize = [180, 20];
     var stThreshold = thresholdRow.add("statictext", undefined, String(Math.round(Number(current.match_threshold) * 100)) + "%");
     stThreshold.preferredSize = [60, 20];
     function updateThresholdLabel() {
@@ -1891,12 +1992,6 @@ function gfpShowSettingsDialog() {
     slThreshold.onChanging = updateThresholdLabel;
     slThreshold.onChange = updateThresholdLabel;
     updateThresholdLabel();
-
-    var note = w.add("statictext", undefined,
-        "Все параметры сервер пытается применить сразу. Изменение адреса сервера или порта требует перезапуска run_server.bat. " +
-        "При работе по сети исходные фотографии должны быть доступны Python-серверу по тому же пути (лучше UNC-путь).",
-        { multiline: true });
-    note.preferredSize = [490, 42];
 
     var buttons = w.add("group");
     buttons.orientation = "row";
@@ -1921,6 +2016,7 @@ function gfpShowSettingsDialog() {
             group_boundary_search: chGroupBoundarySearch.value === true,
             face_scale_match: current.face_scale_match === true,
             collect_statistics: chCollectStatistics.value === true,
+            preview_sort: gfpReadValueDropdown(dlPreviewSort, current.preview_sort || "filename"),
             recommendation_model: gfpReadValueDropdown(dlRecommendation, current.recommendation_model || "public")
         });
         w.close(1);
@@ -2088,7 +2184,7 @@ function gfpShowSettingsDialog() {
 function gfpSameConfigValues(a, b) {
     var left = gfpNormalizeConfig(a);
     var right = gfpNormalizeConfig(b);
-    var keys = ["server_host", "server_port", "preview_size", "cache_ttl_hours", "match_threshold", "compute_mode", "scan_threads", "preview_threads", "analysis_quality", "group_boundary_search", "recommendation_model"];
+    var keys = ["server_host", "server_port", "preview_size", "cache_ttl_hours", "match_threshold", "compute_mode", "scan_threads", "preview_threads", "analysis_quality", "group_boundary_search", "recommendation_model", "preview_sort"];
     for (var i = 0; i < keys.length; i++) {
         var key = keys[i];
         if (String(left[key]) != String(right[key])) {

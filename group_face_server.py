@@ -24,8 +24,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 APP_NAME = "Group Face Picker"
-VERSION = "0.6.28"
-SETTINGS_SCHEMA_VERSION = 9
+VERSION = "0.6.36"
+SETTINGS_SCHEMA_VERSION = 10
 SERVER_INSTANCE_ID = uuid.uuid4().hex[:12]
 CACHE_VERSION = 13
 QUERY_TTL_SECONDS = 30 * 60
@@ -72,6 +72,7 @@ RECOMMENDATION_LABELS = {
     "combined": "Публичная FBP + моя модель",
 }
 SELECTION_BORDER_COLOR = (13, 140, 255)
+CURRENT_BORDER_COLOR = (62, 164, 103)
 SELECTION_BORDER_MIN_PX = 2
 
 ROOT = Path(__file__).resolve().parent
@@ -91,6 +92,7 @@ for directory in (CACHE_DIR, LOG_DIR):
 LOG_FILE = LOG_DIR / "group-face-server.log"
 CONFIG_FILE = ROOT / "gfp_config.json"
 TRAINING_DATA_DIR = ROOT / "training_data"
+RECOGNITION_BATCH_SIZE = 8
 TRAINING_SCHEMA_VERSION = 1
 TRAINING_DATA_LOCK = threading.RLock()
 TRAINING_COMPUTER_ID = ""
@@ -136,6 +138,7 @@ DEFAULT_CONFIG = {
     "analysis_quality": DEFAULT_ANALYSIS_QUALITY,
     "group_boundary_search": DEFAULT_GROUP_BOUNDARY_SEARCH,
     "recommendation_model": DEFAULT_RECOMMENDATION_MODEL,
+    "preview_sort": "filename",
 }
 LOGGER = logging.getLogger(APP_NAME)
 LOGGER.setLevel(logging.INFO)
@@ -227,7 +230,11 @@ def _config_with_defaults(data: Optional[Dict[str, Any]] = None) -> Dict[str, An
     recommendation_model = str(raw.get("recommendation_model") or DEFAULT_RECOMMENDATION_MODEL).strip().lower()
     if recommendation_model not in RECOMMENDATION_MODEL_VALUES:
         recommendation_model = DEFAULT_RECOMMENDATION_MODEL
+    preview_sort = str(raw.get("preview_sort") or "filename").strip().lower()
+    if preview_sort not in ("filename", "similarity", "attractiveness"):
+        preview_sort = "filename"
     return {
+        "preview_sort": preview_sort,
         "server_host": server_host,
         "server_port": server_port,
         "preview_size": preview_size,
@@ -460,6 +467,7 @@ class QueryCandidate:
 class QueryContext:
     created_at: float
     target_eye_offsets: List[List[float]]
+    target_kps_offsets: List[List[float]]
     target_face_width: float
     target_face_height: float
     candidates: List[QueryCandidate]
@@ -953,6 +961,9 @@ class FaceEngine:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._app = None
+        self._warmed_app = None
+        self._batch_inference_lock = threading.Lock()
+        self._warmed_det_size = None
         self._providers: List[Any] = []
         self._using_cpu_fallback = False
         self._mode = DEFAULT_COMPUTE_MODE
@@ -966,11 +977,62 @@ class FaceEngine:
             det_size = _det_size()
             app, providers, fallback = self._create_app(mode, det_size)
             self._app = app
+            self._warmed_app = None
             self._providers = providers
             self._using_cpu_fallback = fallback
             self._mode = mode
             self._det_size = det_size
             LOGGER.info("Face engine ready. Mode: %s; Provider: %s; det-size: %dx%d", mode, self.provider_name(), det_size, det_size)
+
+    def warmup(self, cancel_check: Optional[Any] = None) -> None:
+        """Complete deferred detector/recognizer initialization before scanning.
+
+        Session construction alone does not run CUDA kernels or allocate all
+        inference buffers. Use the same public inference paths as real images,
+        including Auto-mode CPU fallback. A blank detector image alone would
+        never exercise recognition, so run ArcFace explicitly as well.
+        """
+        import numpy as np
+
+        check = cancel_check or (lambda: None)
+        with self._lock:
+            check()
+            self.prepare()
+            if self._warmed_app is self._app and self._warmed_det_size == self._det_size:
+                return
+            started = time.monotonic()
+            LOGGER.info("[INIT] Starting first detector and recognition inference.")
+            # Fallback can replace both sessions during either inference. Warm
+            # the resulting pair before marking that instance as ready.
+            for _attempt in range(3):
+                check()
+                current_app, current_size = self._app, self._det_size
+                self.detect_geometry(np.zeros((current_size, current_size, 3), dtype=np.uint8))
+                check()
+                embedding = self.recognize(
+                    np.zeros((112, 112, 3), dtype=np.uint8),
+                    [[38.2946, 51.6963], [73.5318, 51.5014],
+                     [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]],
+                )
+                check()
+                if not embedding:
+                    raise UserVisibleError("Face recognition warmup returned an empty embedding.")
+                batch = self.recognize_many([
+                    (np.zeros((112, 112, 3), dtype=np.uint8),
+                     [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366],
+                      [41.5493, 92.3655], [70.7299, 92.2041]])
+                    for _ in range(RECOGNITION_BATCH_SIZE)
+                ])
+                check()
+                if not all(batch):
+                    raise UserVisibleError("Face recognition batch warmup failed.")
+                if self._app is current_app and self._det_size == current_size:
+                    self._warmed_app = current_app
+                    self._warmed_det_size = current_size
+                    LOGGER.info("[INIT] First inference complete in %.2f s; face search may start.",
+                                time.monotonic() - started)
+                    return
+            raise UserVisibleError("Face engine changed repeatedly during initialization.")
 
     def provider_name(self) -> str:
         if not self._providers:
@@ -984,6 +1046,7 @@ class FaceEngine:
     def current_state(self) -> Dict[str, Any]:
         with self._lock:
             return {
+                "loaded": self._app is not None,
                 "mode": self._mode,
                 "provider": self.provider_name(),
                 "det_size": self._det_size,
@@ -1197,6 +1260,7 @@ class FaceEngine:
             LOGGER.info("Reconfiguring face engine: mode=%s, det-size=%d", mode, det_size)
             app, providers, fallback = self._create_app(mode, det_size)
             self._app = app
+            self._warmed_app = None
             self._providers = providers
             self._using_cpu_fallback = fallback
             self._mode = mode
@@ -1219,6 +1283,7 @@ class FaceEngine:
             if self._app is failed_app:
                 fallback_app, providers, _ = self._create_app("cpu", det_size)
                 self._app = fallback_app
+                self._warmed_app = None
                 self._providers = providers
                 self._using_cpu_fallback = True
             return self._app
@@ -1317,6 +1382,67 @@ class FaceEngine:
             return []
         emb = emb / norm
         return [float(value) for value in emb]
+
+    def recognize_many(self, crops: List[Tuple[Any, List[List[float]]]]) -> List[List[float]]:
+        """Bounded ArcFace batches with the exact existing alignment/normalization.
+
+        Failed or fixed-batch sessions use the established per-face path, which
+        also owns Auto CUDA -> CPU fallback. Ordering is preserved on failures.
+        """
+        import cv2
+        import numpy as np
+        from insightface.utils import face_align
+
+        results: List[List[float]] = [[] for _ in crops]
+        for start in range(0, len(crops), RECOGNITION_BATCH_SIZE):
+            chunk = crops[start:start + RECOGNITION_BATCH_SIZE]
+            app, _mode, _provider, _size = self._snapshot()
+            recognizer = app.models.get("recognition")
+            aligned, indices = [], []
+            batch_allowed = recognizer is not None and not getattr(recognizer, "_gfp_batch_disabled", False)
+            if batch_allowed:
+                shape = getattr(recognizer, "input_shape", ())
+                if shape and isinstance(shape[0], int) and shape[0] > 0:
+                    # A fixed batch dimension cannot accept arbitrary chunks.
+                    batch_allowed = False
+                if not callable(getattr(recognizer, "get_feat", None)):
+                    batch_allowed = False
+            if batch_allowed:
+                for offset, (rgb, kps) in enumerate(chunk):
+                    try:
+                        points = np.asarray(kps, dtype=np.float32)
+                        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                        aligned.append(face_align.norm_crop(bgr, landmark=points,
+                                                          image_size=recognizer.input_size[0]))
+                        indices.append(offset)
+                    except Exception:
+                        LOGGER.exception("[BATCH] Face alignment failed; retrying through single-face recognition.")
+                if aligned:
+                    # Recheck and disable under the same lock: waiting workers
+                    # must not retry a session that has already failed a batch.
+                    with self._batch_inference_lock:
+                        if not getattr(recognizer, "_gfp_batch_disabled", False):
+                            try:
+                                values = np.asarray(recognizer.get_feat(aligned), dtype=np.float32)
+                                if values.ndim != 2 or values.shape[0] != len(aligned) or values.shape[1] == 0:
+                                    raise ValueError("Unexpected ArcFace batch output shape")
+                                norms = np.linalg.norm(values, axis=1)
+                                if not (np.isfinite(values).all() and np.isfinite(norms).all()
+                                        and (norms > 1e-12).all()):
+                                    raise ValueError("Invalid ArcFace batch embeddings")
+                                for row, offset in enumerate(indices):
+                                    results[start + offset] = (values[row] / norms[row]).tolist()
+                            except Exception:
+                                recognizer._gfp_batch_disabled = True
+                                LOGGER.exception("[BATCH] ArcFace batch failed; using single-face recognition for this session.")
+            for offset, (rgb, kps) in enumerate(chunk):
+                if results[start + offset]:
+                    continue
+                try:
+                    results[start + offset] = self.recognize(rgb, kps)
+                except Exception:
+                    LOGGER.exception("[BATCH] Single-face recognition failed; skipping one face.")
+        return results
 
 
 ENGINE = FaceEngine()
@@ -1890,7 +2016,7 @@ def _preview_variant_path(face: FaceRecord, size: int) -> Path:
     return master.with_name(master.stem + "_%03d.png" % int(size))
 
 
-def _write_selected_preview(source_path: Path, target_path: Path) -> None:
+def _write_framed_preview(source_path: Path, target_path: Path, color: Tuple[int, int, int]) -> None:
     from PIL import Image, ImageDraw
 
     with Image.open(source_path) as source:
@@ -1900,11 +2026,46 @@ def _write_selected_preview(source_path: Path, target_path: Path) -> None:
         for offset in range(border):
             draw.rectangle(
                 [offset, offset, max(offset, preview.width - 1 - offset), max(offset, preview.height - 1 - offset)],
-                outline=SELECTION_BORDER_COLOR,
+                outline=color,
             )
         temp = target_path.with_suffix(target_path.suffix + ".tmp")
         preview.save(temp, format="PNG", compress_level=1)
         os.replace(str(temp), str(target_path))
+
+
+def _write_badged_preview(source_path: Path, target_path: Path, current: bool, recommended: bool) -> None:
+    from PIL import Image, ImageDraw, ImageFont
+
+    with Image.open(source_path) as source:
+        preview = source.convert("RGB")
+    size = max(9, min(13, int(round(preview.width / 14.0))))
+    font = None
+    for name in ("arial.ttf", "DejaVuSans.ttf"):
+        try:
+            font = ImageFont.truetype(name, size)
+            break
+        except OSError:
+            pass
+    # A missing system font should never prevent face selection.
+    labels = []
+    if current:
+        labels.append(("Текущий" if font is not None else "Current", CURRENT_BORDER_COLOR))
+    if recommended:
+        labels.append(("Лучший" if font is not None else "Best", SELECTION_BORDER_COLOR))
+    if font is None:
+        font = ImageFont.load_default()
+    draw = ImageDraw.Draw(preview, "RGBA")
+    y = 6  # Leave room for the blue selection border.
+    for label, color in labels:
+        left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
+        width, height = right - left + 6, bottom - top + 4
+        draw.rounded_rectangle((6, y, 6 + width, y + height), radius=3, fill=(*color, 255))
+        draw.text((9 - left, y + 2 - top), label, font=font, fill=(226, 230, 232, 235))
+        y += height + 3
+    temp = target_path.with_suffix(target_path.suffix + ".tmp")
+    preview.save(temp, format="PNG", compress_level=1)
+    preview.close()
+    os.replace(str(temp), str(target_path))
 
 
 def _touch_group_cache(index: GroupIndex) -> None:
@@ -2226,6 +2387,37 @@ def _cancel_job(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"cancelled": True, "job_id": job_id}
 
 
+def _recognize_image_faces(source: Any, geometries: List[DetectedFaceGeometry],
+                           width: int, height: int, path: Path) -> List[FaceRecord]:
+    """Prepare only one small batch at a time; never retain every crop in RAM."""
+    started = time.monotonic()
+    faces: List[FaceRecord] = []
+    for start in range(0, len(geometries), RECOGNITION_BATCH_SIZE):
+        prepared, valid = [], []
+        for geometry in geometries[start:start + RECOGNITION_BATCH_SIZE]:
+            try:
+                prepared.append(_recognition_crop_from_pil(source, geometry.bbox, geometry.kps, width, height))
+                valid.append(geometry)
+            except Exception:
+                LOGGER.exception("[INDEX] Could not prepare face for %s", path.name)
+        embeddings = ENGINE.recognize_many(prepared)
+        for geometry, embedding in zip(valid, embeddings):
+            if not embedding:
+                continue
+            try:
+                preview = _build_face_preview_jpeg_from_pil(source, geometry.bbox, width, height, FACE_CACHE_SIZE)
+                faces.append(FaceRecord(
+                    bbox=geometry.bbox,
+                    kps=[[float(point[0]), float(point[1])] for point in geometry.kps[:5]],
+                    embedding=embedding, preview_jpeg=preview,
+                ))
+            except Exception:
+                LOGGER.exception("[INDEX] Could not cache face for %s", path.name)
+    LOGGER.info("[RECOGNITION] %s: %d/%d faces, batch-limit=%d, recognition+previews=%.3f s",
+                path.name, len(faces), len(geometries), RECOGNITION_BATCH_SIZE, time.monotonic() - started)
+    return faces
+
+
 def _analyze_image_record(path: Path) -> ImageRecord:
     import numpy as np
 
@@ -2266,28 +2458,7 @@ def _analyze_image_record(path: Path) -> ImageRecord:
                     bbox=(bx1 * raw_sx, by1 * raw_sy, bx2 * raw_sx, by2 * raw_sy),
                     kps=[[point[0] * raw_sx, point[1] * raw_sy] for point in geometry.kps],
                 ))
-            faces: List[FaceRecord] = []
-            for geometry in geometries:
-                try:
-                    crop_rgb, local_kps = _recognition_crop_from_pil(
-                        source, geometry.bbox, geometry.kps, analysis_w, analysis_h
-                    )
-                    embedding = ENGINE.recognize(crop_rgb, local_kps)
-                    if not embedding:
-                        continue
-                    preview = _build_face_preview_jpeg_from_pil(
-                        source, geometry.bbox, analysis_w, analysis_h, FACE_CACHE_SIZE
-                    )
-                    faces.append(
-                        FaceRecord(
-                            bbox=geometry.bbox,
-                            kps=[[float(point[0]), float(point[1])] for point in geometry.kps[:5]],
-                            embedding=embedding,
-                            preview_jpeg=preview,
-                        )
-                    )
-                except Exception:
-                    LOGGER.exception("[INDEX] Could not recognize/cache RAW face for %s", path.name)
+            faces = _recognize_image_faces(source, geometries, analysis_w, analysis_h, path)
         finally:
             try:
                 source.close()
@@ -2361,28 +2532,7 @@ def _analyze_image_record(path: Path) -> ImageRecord:
             mapped = remapped
             full_w, full_h = int(source_full_w), int(source_full_h)
 
-        faces: List[FaceRecord] = []
-        for geometry in mapped:
-            try:
-                crop_rgb, local_kps = _recognition_crop_from_pil(
-                    source, geometry.bbox, geometry.kps, int(full_w), int(full_h)
-                )
-                embedding = ENGINE.recognize(crop_rgb, local_kps)
-                if not embedding:
-                    continue
-                preview = _build_face_preview_jpeg_from_pil(
-                    source, geometry.bbox, int(full_w), int(full_h), FACE_CACHE_SIZE
-                )
-                faces.append(
-                    FaceRecord(
-                        bbox=geometry.bbox,
-                        kps=[[float(point[0]), float(point[1])] for point in geometry.kps[:5]],
-                        embedding=embedding,
-                        preview_jpeg=preview,
-                    )
-                )
-            except Exception:
-                LOGGER.exception("[INDEX] Could not recognize/cache face for %s", path.name)
+        faces = _recognize_image_faces(source, mapped, int(full_w), int(full_h), path)
     finally:
         try:
             source.close()
@@ -3134,6 +3284,35 @@ def _choose_reference(index: GroupIndex, source_path: Path, selection: Dict[str,
     return record, face
 
 
+def _sort_preview_candidates(candidates: List[QueryCandidate], recommendation: Dict[str, Any],
+                             order: str) -> None:
+    """Reorder candidates AND their scores before assigning any preview indices."""
+    items = recommendation.get("items") or [{} for _ in candidates]
+    old_best = int(recommendation.get("recommended_index", -1))
+    indices = list(range(len(candidates)))
+
+    def name_key(i: int):
+        return (_natural_name_key(candidates[i].name), candidates[i].name.casefold())
+
+    def score(i: int):
+        value = items[i].get("effective_score")
+        return float(value) if value is not None and math.isfinite(float(value)) else None
+
+    if order == "similarity":
+        indices.sort(key=lambda i: (-float(candidates[i].similarity), name_key(i)))
+    elif order == "attractiveness":
+        indices.sort(key=lambda i: (score(i) is None, -(score(i) or 0.0), name_key(i)))
+        if not any(score(i) is not None for i in indices):
+            recommendation["message"] = (str(recommendation.get("message") or "") +
+                " Оценки удачности недоступны: превью расположены по именам файлов. "
+                "Для сортировки по оценке включите модель в настройке «Рекомендация дубля».").strip()
+    else:
+        indices.sort(key=name_key)
+    candidates[:] = [candidates[i] for i in indices]
+    recommendation["items"] = [items[i] for i in indices]
+    recommendation["recommended_index"] = indices.index(old_best) if old_best in indices else -1
+
+
 def _render_previews(candidates: List[QueryCandidate], job_id: Optional[str] = None) -> Dict[str, Any]:
     from PIL import Image, ImageOps
 
@@ -3159,6 +3338,7 @@ def _render_previews(candidates: List[QueryCandidate], job_id: Optional[str] = N
         _update_job(job_id, progress=0.90, status="running", text="Оценка лучших дублей...")
     _check_job_cancelled(job_id)
     recommendation = _score_candidates_for_recommendation(candidates, job_id=job_id)
+    _sort_preview_candidates(candidates, recommendation, str(_get_runtime_config().get("preview_sort", "filename")))
     recommended_index = int(recommendation.get("recommended_index", -1))
     _check_job_cancelled(job_id)
     if job_id:
@@ -3174,7 +3354,6 @@ def _render_previews(candidates: List[QueryCandidate], job_id: Optional[str] = N
         _check_job_cancelled(job_id)
         item_recommendation = recommendation["items"][index]
         base_path = _preview_variant_path(candidate.face, thumb)
-        selected_path = base_path.with_name(base_path.stem + "_selected_blue_v2.png")
         generated_preview = None
         if not base_path.is_file():
             master = Path(candidate.face.preview_master_path)
@@ -3185,14 +3364,26 @@ def _render_previews(candidates: List[QueryCandidate], job_id: Optional[str] = N
             # faster and has no visual penalty; disk-size difference is tiny.
             generated_preview.save(temp, format="PNG", compress_level=1)
             os.replace(str(temp), str(base_path))
-        # Recommendation is text-only. Selection is controlled by JSX, which
-        # swaps these two cached images without changing the container background.
+        # Status badges are part of both variants; selection only adds blue.
+        normal_path = base_path
+        is_recommended = bool(item_recommendation.get("is_recommended"))
+        if candidate.is_active or is_recommended:
+            suffix = "_badges_v3_%d%d" % (bool(candidate.is_active), is_recommended)
+            normal_path = base_path.with_name(base_path.stem + suffix + ".png")
+            if not normal_path.is_file():
+                _write_badged_preview(base_path, normal_path, candidate.is_active, is_recommended)
+        if candidate.is_active:
+            framed_path = normal_path.with_name(normal_path.stem + "_current_green_v2.png")
+            if not framed_path.is_file():
+                _write_framed_preview(normal_path, framed_path, CURRENT_BORDER_COLOR)
+            normal_path = framed_path
+        selected_path = normal_path.with_name(normal_path.stem + "_selected_blue_v2.png")
         if not selected_path.is_file():
-            _write_selected_preview(base_path, selected_path)
+            _write_framed_preview(normal_path, selected_path, SELECTION_BORDER_COLOR)
         if generated_preview is not None:
             generated_preview.close()
         return index, {
-            "path": str(base_path),
+            "path": str(normal_path),
             "selected_path": str(selected_path),
             "name": candidate.name,
             "width": int(thumb),
@@ -3257,7 +3448,7 @@ def _select_child(payload: Dict[str, Any], job_id: Optional[str] = None) -> Dict
         _check_job_cancelled(job_id)
         _update_job(job_id, progress=0.0, status="running",
                     text="Инициализация модели распознавания лиц")
-        ENGINE.prepare()
+        ENGINE.warmup(lambda: _check_job_cancelled(job_id))
         _check_job_cancelled(job_id)
         _update_job(job_id, progress=0.01, status="running", text="Идёт поиск дублей...")
         source_path = Path(str(payload.get("source_path") or "")).resolve()
@@ -3361,7 +3552,7 @@ def _select_child(payload: Dict[str, Any], job_id: Optional[str] = None) -> Dict
                 image.name, best_similarity, crop,
             )
 
-        candidates.sort(key=lambda item: (0 if item.is_active else 1, _natural_name_key(item.name), item.name.casefold()))
+        candidates.sort(key=lambda item: (_natural_name_key(item.name), item.name.casefold()))
         if len(candidates) <= 1:
             raise UserVisibleError(
                 "The selected child was not found in other images of the detected group with sufficient confidence. "
@@ -3391,6 +3582,10 @@ def _select_child(payload: Dict[str, Any], job_id: Optional[str] = None) -> Dict
         context = QueryContext(
             created_at=time.time(),
             target_eye_offsets=target_eye_offsets,
+            target_kps_offsets=[
+                [point[0] * ref_sx - selection["left"], point[1] * ref_sy - selection["top"]]
+                for point in reference.kps[:5]
+            ],
             target_face_width=float(target_face_dims[0]),
             target_face_height=float(target_face_dims[1]),
             candidates=candidates,
@@ -3452,6 +3647,7 @@ def _prepare_crop(payload: Dict[str, Any]) -> Dict[str, Any]:
             for point in candidate.face.kps[:5]
         ],
         "target_eye_offsets": context.target_eye_offsets,
+        "target_kps_offsets": context.target_kps_offsets,
         "face_scale_match": bool(live_scale_match),
         "target_face_width": float(context.target_face_width),
         "target_face_height": float(context.target_face_height),
@@ -3743,7 +3939,9 @@ def _apply_settings(payload: Dict[str, Any], job_id: Optional[str] = None) -> Di
             ANALYSIS_DET_SIZES[DEFAULT_ANALYSIS_QUALITY],
         ))
         engine_state_before = ENGINE.current_state()
-        engine_changed = (
+        # Before the first search, persist settings without creating sessions.
+        # prepare() reads the saved configuration when inference is requested.
+        engine_changed = engine_state_before["loaded"] and (
             new_settings.get("compute_mode") != current.get("compute_mode")
             or new_settings.get("analysis_quality") != current.get("analysis_quality")
             or str(engine_state_before.get("mode") or "") != str(new_settings.get("compute_mode") or "")
@@ -3780,7 +3978,7 @@ def _apply_settings(payload: Dict[str, Any], job_id: Optional[str] = None) -> Di
                 saved.get("analysis_quality"),
                 ANALYSIS_DET_SIZES[DEFAULT_ANALYSIS_QUALITY],
             ))
-            if int(final_state.get("det_size") or 0) != saved_det_size:
+            if final_state["loaded"] and int(final_state.get("det_size") or 0) != saved_det_size:
                 raise UserVisibleError(
                     "Settings were saved, but the live detector is %s instead of %d."
                     % (final_state.get("det_size"), saved_det_size)
@@ -3820,7 +4018,7 @@ def _apply_settings(payload: Dict[str, Any], job_id: Optional[str] = None) -> Di
             "restart_required": bool(restart_fields),
             "restart_fields": restart_fields,
             "engine": final_state,
-            "applied_now": ["preview_size", "cache_ttl_hours", "match_threshold", "scan_threads", "preview_threads", "compute_mode", "analysis_quality", "group_boundary_search", "recommendation_model"],
+            "applied_now": ["preview_size", "cache_ttl_hours", "match_threshold", "scan_threads", "preview_threads", "compute_mode", "analysis_quality", "group_boundary_search", "recommendation_model", "preview_sort"],
         }
         if job_id:
             _update_job(job_id, progress=0.95, status="running", text="Настройки сохранены.")
