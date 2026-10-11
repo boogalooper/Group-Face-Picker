@@ -18,7 +18,7 @@ var GFP_SHIFT_LAUNCH = !!ScriptUI.environment.keyboardState.shiftKey;
 
 var GFP_NAME = "Group Face Picker";
 var GFP_UUID = "9a189321-e07f-40ff-8394-156a4bd48cf5";
-var GFP_VERSION = "0.6.36";
+var GFP_VERSION = "0.6.42";
 var GFP_DEFAULT_HOST = "127.0.0.1";
 var GFP_DEFAULT_PORT_SEND = 6420;
 var GFP_DEFAULT_PORT_LISTEN = 6421;
@@ -548,281 +548,340 @@ function gfpFacePlacement(eyeX, eyeY, targetX, targetY, scale, width, height, so
         offsetX: (left - x) * scale, offsetY: (top - y) * scale};
 }
 
+function gfpPreviewOrder(matches, items, mode) {
+    function compareNames(a, b) {
+        var left = String(matches[a].name || items[a].name || "").toLowerCase().match(/\d+|\D+/g) || [];
+        var right = String(matches[b].name || items[b].name || "").toLowerCase().match(/\d+|\D+/g) || [];
+        for (var n = 0; n < Math.min(left.length, right.length); n++) {
+            var x = left[n], y = right[n];
+            if (x == y) continue;
+            if (/^\d+$/.test(x) && /^\d+$/.test(y)) {
+                var difference = Number(x) - Number(y);
+                if (difference) return difference;
+            } else return x < y ? -1 : 1;
+        }
+        if (left.length != right.length) return left.length - right.length;
+        var wholeLeft = String(matches[a].name || "").toLowerCase();
+        var wholeRight = String(matches[b].name || "").toLowerCase();
+        return wholeLeft == wholeRight ? a - b : (wholeLeft < wholeRight ? -1 : 1);
+    }
+    function score(index) {
+        var value = mode == "similarity" ? matches[index].similarity : items[index].recommendation_score;
+        return value === null || value === undefined || !isFinite(Number(value)) ? null : Number(value);
+    }
+    var order = [];
+    for (var i = 0; i < items.length; i++) order.push(i);
+    order.sort(function (a, b) {
+        if (mode != "filename") {
+            var x = score(a), y = score(b);
+            if (x === null && y !== null) return 1;
+            if (y === null && x !== null) return -1;
+            if (x !== null && y !== null && x != y) return y - x;
+        }
+        return compareNames(a, b);
+    });
+    return order;
+}
+
 function gfpShowDialog(payload) {
     var items = payload.previews && payload.previews.items ? payload.previews.items : [];
-    if (!items.length || items.length != payload.matches.length) {
-        throw new Error("Сервер не вернул корректный набор превью.");
-    }
+    if (!items.length || items.length != payload.matches.length) throw new Error("Сервер не вернул корректный набор превью.");
+    // selectedIndex always refers to the server query, never a visual slot.
+    var selectedIndex = -1, lastClickIndex = -1, lastClickTime = 0;
+    var previewButtons = [], loadedImages = [], displayOrder = [];
+    var initialIndex = 0, page = 0, pageSize = items.length, columns = 1;
+    var busy = false, initializing = true;
+    var recommendation = payload.previews.recommendation || {};
+    var sortMode = String(payload.previews.preview_sort || GFP_SETTINGS.preview_sort || "filename");
+    var requestedSize = Number(payload.previews.preview_size || GFP_SETTINGS.preview_size || 184);
+    var thumbWidth = Number(payload.previews.thumb_width) || requestedSize;
+    var screenWidth = 1280, screenHeight = 900;
+    try {
+        var screens = $.screens;
+        var screen = screens[0];
+        for (var sc = 0; sc < screens.length; sc++) if (screens[sc].primary) screen = screens[sc];
+        screenWidth = screen.right - screen.left;
+        screenHeight = screen.bottom - screen.top;
+    } catch (screenError) {}
+    for (var ri = 0; ri < items.length; ri++) if (items[ri].is_recommended === true) { initialIndex = ri; break; }
 
-    var selectedIndex = -1;
-    var lastClickIndex = -1;
-    var lastClickTime = 0;
-    var previewButtons = [];
-    var initialIndex = 0;
-    var foundRecommendation = false;
-    var recommendation = payload.previews && payload.previews.recommendation ? payload.previews.recommendation : {};
-    var columns = Math.max(1, Number(payload.previews.columns) || 1);
-    var thumbWidth = Math.max(32, Number(payload.previews.thumb_width) || 96);
-    var buttonSize = thumbWidth + 8;
-    var contentWidth = Math.max(420, columns * (buttonSize + 4));
+    function fixedSize(control, width, height) {
+        control.preferredSize = [width, height];
+        control.minimumSize = [width, height];
+        control.maximumSize = [width, height];
+        control.alignment = ["left", "center"];
+    }
 
     var w = new Window("dialog", String(payload.app_name) + " " + String(payload.version));
-    w.orientation = "column";
-    w.alignChildren = ["fill", "top"];
-    w.spacing = 7;
-    w.margins = 12;
-
+    w.orientation = "column"; w.alignChildren = ["fill", "top"]; w.spacing = 7; w.margins = 12;
     var topRow = w.add("group");
-    topRow.orientation = "row";
-    topRow.alignChildren = ["fill", "center"];
-    topRow.spacing = 8;
-
-    var header = topRow.add("statictext");
-    header.text = "Найдено кадров: " + String(items.length) + (recommendation && recommendation.status == "ok" && recommendation.label ? " · " + String(recommendation.label) : "");
-    header.preferredSize = [Math.max(260, contentWidth - 120), 20];
-
+    topRow.orientation = "row"; topRow.alignChildren = ["left", "center"]; topRow.spacing = 8; topRow.margins = 0;
+    var header = topRow.add("statictext", undefined, "Найдено кадров: " + items.length +
+        (recommendation.status == "ok" && recommendation.label ? " · " + recommendation.label : ""));
     var settingsButton = topRow.add("button", undefined, "⚙");
-    settingsButton.preferredSize = [34, 24];
-    settingsButton.helpTip = "Настройки Group Face Picker";
+    fixedSize(settingsButton, 34, 24); settingsButton.helpTip = "Глобальные настройки";
 
-    var grid = w.add("group");
-    grid.orientation = "column";
-    grid.alignChildren = ["left", "top"];
-    grid.spacing = 4;
-    grid.margins = 0;
+    var toolbar = w.add("group"); toolbar.orientation = "row"; toolbar.alignChildren = ["left", "center"]; toolbar.spacing = 8; toolbar.margins = 0;
+    var sortTitle = toolbar.add("statictext", undefined, "Порядок:"); fixedSize(sortTitle, 55, 20);
+    var dlSort = toolbar.add("dropdownlist"); fixedSize(dlSort, 185, 24);
+    gfpPopulateValueDropdown(dlSort, [
+        {label:"По порядку файлов", value:"filename"},
+        {label:"По похожести", value:"similarity"},
+        {label:"По удачности", value:"attractiveness"}
+    ]);
+    gfpRestoreValueDropdown(dlSort, sortMode, "filename");
+    dlSort.helpTip = "Перестраивает сетку без нового поиска; выбранный кадр сохраняется. Без оценок модели используется порядок файлов.";
+    var toolbarSpacer = toolbar.add("group");
+    var sizeControls = toolbar.add("group");
+    sizeControls.orientation = "row"; sizeControls.alignChildren = ["left", "center"];
+    sizeControls.spacing = 6; sizeControls.margins = 0;
+    fixedSize(sizeControls, 250, 24);
+    var sizeTitle = sizeControls.add("statictext", undefined, "Размер:"); fixedSize(sizeTitle, 44, 20);
+    var slSize = sizeControls.add("slider", undefined, requestedSize, 64, 320); fixedSize(slSize, 140, 20);
+    var sizeLabel = sizeControls.add("statictext", undefined, requestedSize + " px"); fixedSize(sizeLabel, 54, 20);
+    slSize.helpTip = "64–320 px. Превью обновляются после отпускания ползунка, без распознавания лиц.";
 
-    var row = null;
-    for (var i = 0; i < items.length; i++) {
-        if (i % columns == 0) {
-            row = grid.add("group");
-            row.orientation = "row";
-            row.alignChildren = ["left", "top"];
-            row.spacing = 4;
-            row.margins = 0;
-        }
-
-        var previewFile = new File(String(items[i].path));
-        if (!previewFile.exists) {
-            throw new Error("PNG-превью не найдено: " + previewFile.fsName);
-        }
-
-        // Static previews have no native hover/pressed states.
-        // Mouse presses are handled by the grid in the capture phase.
-        var matchInfo = payload.matches[i] || {};
-        var cell = row.add("group");
-        cell.orientation = "column";
-        cell.alignChildren = ["center", "top"];
-        cell.spacing = 1;
-        cell.margins = 0;
-
-        var previewImage = ScriptUI.newImage(previewFile);
-        var selectedFile = new File(String(items[i].selected_path || ""));
-        if (!items[i].selected_path || !selectedFile.exists) {
-            throw new Error("Не найдено превью с рамкой. Перезапустите Python-сервер из обновлённой папки.");
-        }
-        var selectedImage = ScriptUI.newImage(selectedFile);
-        var previewButton = cell.add("image", undefined, previewImage);
-        previewButton.gfpNormalImage = previewImage;
-        previewButton.gfpSelectedImage = selectedImage;
-        previewButton.gfpSelected = false;
-        previewButton.preferredSize = [buttonSize, buttonSize];
-        previewButton.minimumSize = previewButton.preferredSize;
-        previewButton.maximumSize = previewButton.preferredSize;
-        var similarity = Number(matchInfo.similarity);
-        var similarityText = isFinite(similarity) ? similarity.toFixed(3) : "—";
-        var isRecommended = items[i].is_recommended === true;
-        if (isRecommended && !foundRecommendation) {
-            initialIndex = i;
-            foundRecommendation = true;
-        }
-        var fullFileName = String(matchInfo.name || items[i].name || "");
-        var displayFileName = fullFileName.replace(/^.*[\\\/]/, "");
-        var extensionPos = displayFileName.lastIndexOf(".");
-        if (extensionPos > 0) {
-            displayFileName = displayFileName.substring(0, extensionPos);
-        }
-        if (displayFileName.length > 16) {
-            displayFileName = displayFileName.substring(0, 16);
-        }
-        if (!displayFileName.length) {
-            displayFileName = "—";
-        }
-        previewButton.gfpIndex = i;
-        cell.gfpIndex = i;
-
-        var previewCaption = displayFileName + "\n" + similarityText;
-        var activeLabel = cell.add("statictext", undefined, previewCaption, { multiline: true });
-        activeLabel.justify = "center";
-        activeLabel.preferredSize = [buttonSize, 32];
-        previewButtons.push(previewButton);
-    }
-
-    grid.addEventListener("mousedown", function (event) {
-        if (event.button > 0) return;
-        var control = event.target;
-        while (control && control != grid) {
-            if (typeof control.gfpIndex == "number") {
-                gfpHandlePreviewClick(Number(control.gfpIndex));
-                return;
-            }
-            control = control.parent;
-        }
-    }, true);
-
+    var grid = w.add("group"); grid.orientation = "column"; grid.alignChildren = ["left", "top"]; grid.spacing = 6; grid.margins = 0;
+    var pager = w.add("group"); pager.orientation = "row"; pager.alignment = ["center", "top"];
+    var previousPage = pager.add("button", undefined, "‹"); fixedSize(previousPage, 32, 22);
+    var pageLabel = pager.add("statictext", undefined, ""); pageLabel.preferredSize = [140, 20]; pageLabel.justify = "center";
+    var nextPage = pager.add("button", undefined, "›"); fixedSize(nextPage, 32, 22);
+    var divider = w.add("panel"); divider.preferredSize = [-1, 1];
+    var status = w.add("statictext", undefined, ""); status.preferredSize = [-1, 20];
+    status.helpTip = recommendation.message || "";
+    var bottom = w.add("group"); bottom.orientation = "row"; bottom.alignChildren = ["left", "center"];
+    bottom.spacing = 8; bottom.margins = 0;
     var initialFaceScaleMatch = GFP_SETTINGS.face_scale_match === true;
-    var chFaceScaleMatch = w.add("checkbox", undefined, "Подгонять масштаб лица");
+    var chFaceScaleMatch = bottom.add("checkbox", undefined, "Подгонять масштаб лица");
+    fixedSize(chFaceScaleMatch, 240, 24);
     chFaceScaleMatch.value = initialFaceScaleMatch;
-    chFaceScaleMatch.helpTip = "Оперативная настройка только для текущей/следующих вставок: равномерно подгоняет размер лица по геометрии без поворота.";
+    chFaceScaleMatch.helpTip = "Равномерная подгонка масштаба без поворота. Запоминается для следующих вставок.";
+    var bottomSpacer = bottom.add("group"); bottomSpacer.alignment = ["fill", "center"];
+    var actionButtons = bottom.add("group");
+    actionButtons.orientation = "row"; actionButtons.alignChildren = ["left", "center"];
+    actionButtons.spacing = 8; actionButtons.margins = 0; fixedSize(actionButtons, 270, 26);
+    var insertButton = actionButtons.add("button", undefined, "Вставить выбранное", {name:"ok"});
+    fixedSize(insertButton, 172, 26); insertButton.enabled = false;
+    var cancelButton = actionButtons.add("button", undefined, "Отмена", {name:"cancel"}); fixedSize(cancelButton, 90, 26);
+    var helper = w.add("statictext", undefined, "Стрелки — выбор · Enter — вставить · Двойной клик — вставить");
+    try { helper.graphics.foregroundColor = helper.graphics.newBrush(helper.graphics.BrushType.SOLID_COLOR, [0.65, 0.65, 0.65, 1]); } catch (colorError) {}
 
-    var defaultStatus = "Стрелки — выбор кадра. Enter — вставить. Двойной клик — вставить.";
-    if (recommendation && recommendation.message) {
-        defaultStatus = recommendation.message + "\n" + defaultStatus;
+    function visualPosition(index) {
+        for (var p = 0; p < displayOrder.length; p++) if (displayOrder[p] == index) return p;
+        return -1;
     }
-    var status = w.add("statictext", undefined, defaultStatus, { multiline: true });
-    status.preferredSize = [contentWidth, 34];
-
-    var buttons = w.add("group");
-    buttons.orientation = "row";
-    buttons.alignChildren = ["center", "center"];
-    buttons.alignment = ["center", "top"];
-    buttons.spacing = 10;
-
-    var insertButton = buttons.add("button", undefined, "Вставить выбранное", { name: "ok" });
-    insertButton.enabled = false;
-    var cancelButton = buttons.add("button", undefined, "Отмена", { name: "cancel" });
-
-    function gfpRefreshSelectionFrame(index) {
-        for (var fi = 0; fi < previewButtons.length; fi++) {
-            var button = previewButtons[fi];
-            var selected = fi == index;
+    function resetClicks() { lastClickIndex = -1; lastClickTime = 0; }
+    function clearImages() {
+        for (var i = 0; i < previewButtons.length; i++) {
+            // ScriptUI Image.image rejects null. Leave the native image intact;
+            // removing its parent below releases the old control.
+            previewButtons[i].gfpNormalImage = null; previewButtons[i].gfpSelectedImage = null;
+        }
+        previewButtons = [];
+    }
+    function imagePair(index) {
+        if (loadedImages[index]) return loadedImages[index];
+        var normal = new File(String(items[index].path)), selected = new File(String(items[index].selected_path || ""));
+        if (!normal.exists || !selected.exists) throw new Error("Превью не найдено. Повторите поиск лица.");
+        loadedImages[index] = { normal:ScriptUI.newImage(normal), selected:ScriptUI.newImage(selected) };
+        return loadedImages[index];
+    }
+    function updateStatus() {
+        if (selectedIndex < 0) { status.text = "Выберите кадр"; return; }
+        var match = payload.matches[selectedIndex], item = items[selectedIndex];
+        var score = Number(match.similarity);
+        var text = String(match.name || item.name) + " · Кадр " + (visualPosition(selectedIndex) + 1) + " из " + items.length;
+        if (isFinite(score)) text += " · Похожесть " + score.toFixed(3);
+        if (match.is_active === true) text += " · Текущий кадр";
+        if (item.is_recommended === true) text += " · Рекомендован моделью";
+        status.text = text;
+        status.helpTip = text + (recommendation.message ? "\n" + recommendation.message : "");
+    }
+    function refreshFrames() {
+        for (var i = 0; i < previewButtons.length; i++) {
+            var button = previewButtons[i], selected = button.gfpIndex == selectedIndex;
             if (button.gfpSelected != selected) {
                 button.gfpSelected = selected;
                 button.image = selected ? button.gfpSelectedImage : button.gfpNormalImage;
             }
         }
     }
-
-    function gfpSelectIndex(index) {
-        if (index < 0 || index >= payload.matches.length) {
-            selectedIndex = -1;
-            gfpRefreshSelectionFrame(-1);
-            insertButton.enabled = false;
-            status.text = defaultStatus;
-            w.update();
-            return;
+    function rebuildGrid(followSelection) {
+        clearImages();
+        while (grid.children.length) grid.remove(grid.children[0]);
+        var cellSize = thumbWidth + 8;
+        var maxColumns = Math.max(1, Math.floor((screenWidth - 64) / (cellSize + 6)));
+        columns = Math.max(1, Math.min(Number(payload.previews.columns) || 6, maxColumns, items.length));
+        var rows = Math.max(1, Math.floor((screenHeight - 270) / (cellSize + 27)));
+        pageSize = columns * rows;
+        if (followSelection && selectedIndex >= 0) page = Math.floor(Math.max(0, visualPosition(selectedIndex)) / pageSize);
+        page = Math.max(0, Math.min(Math.ceil(items.length / pageSize) - 1, page));
+        var start = page * pageSize, end = Math.min(items.length, start + pageSize), row = null;
+        for (var slot = start; slot < end; slot++) {
+            if ((slot - start) % columns == 0) {
+                row = grid.add("group"); row.orientation = "row"; row.alignChildren = ["left", "top"]; row.spacing = 6; row.margins = 0;
+            }
+            var index = displayOrder[slot], pair = imagePair(index);
+            var cell = row.add("group"); cell.orientation = "column"; cell.alignChildren = ["center", "top"]; cell.spacing = 2; cell.margins = 0; cell.gfpIndex = index;
+            var image = cell.add("image", undefined, pair.normal); image.gfpIndex = index;
+            image.gfpNormalImage = pair.normal; image.gfpSelectedImage = pair.selected; image.gfpSelected = false;
+            image.preferredSize = [cellSize, cellSize]; image.minimumSize = image.preferredSize; image.maximumSize = image.preferredSize;
+            var filename = String(payload.matches[index].name || items[index].name || "").replace(/^.*[\\\/]/, "");
+            var extension = filename.lastIndexOf("."); if (extension > 0) filename = filename.substring(0, extension);
+            var caption = cell.add("statictext", undefined, filename.length > 22 ? filename.substring(0, 21) + "…" : filename);
+            caption.justify = "center"; caption.preferredSize = [cellSize, 20]; caption.gfpIndex = index;
+            var tip = String(payload.matches[index].name) + "\nПохожесть: " + Number(payload.matches[index].similarity).toFixed(3);
+            if (items[index].recommendation_score !== null && items[index].recommendation_score !== undefined) tip += "\nОценка модели: " + Number(items[index].recommendation_score).toFixed(3);
+            image.helpTip = tip; caption.helpTip = tip;
+            previewButtons.push(image);
         }
+        var pageCount = Math.ceil(items.length / pageSize);
+        pager.visible = pageCount > 1; pager.maximumSize.height = pageCount > 1 ? 28 : 0;
+        pageLabel.text = "Страница " + (page + 1) + " из " + pageCount;
+        previousPage.enabled = page > 0; nextPage.enabled = page + 1 < pageCount;
+        var width = Math.max(650, columns * (cellSize + 6) - 6);
+        // Set all row widths afresh, including minimum/maximum bounds. A
+        // previous large layout must not push fixed controls off a smaller one.
+        fixedSize(header, width - 34 - topRow.spacing, 20);
+        fixedSize(topRow, width, 24); topRow.alignment = ["fill", "top"];
+        fixedSize(toolbarSpacer, Math.max(0, width - 55 - 185 - 250 - 3 * toolbar.spacing), 1);
+        fixedSize(toolbar, width, 24); toolbar.alignment = ["fill", "top"];
+        fixedSize(bottomSpacer, Math.max(0, width - 240 - 270 - 2 * bottom.spacing), 1);
+        fixedSize(bottom, width, 26); bottom.alignment = ["fill", "top"];
+        grid.preferredSize = [width, -1];
+        fixedSize(status, width, 20); status.alignment = ["fill", "top"];
+        refreshFrames(); updateStatus();
+        w.layout.layout(true);
+        var visibleRows = Math.ceil((end - start) / columns);
+        w.size = [width + 24, visibleRows * (cellSize + 28) + 180 + (pageCount > 1 ? 28 : 0)];
+        w.layout.resize();
+        if (!initializing) { w.center(); w.update(); }
+    }
+    function selectIndex(index) {
+        if (busy || index < 0 || index >= items.length) return;
         selectedIndex = index;
-        gfpRefreshSelectionFrame(index);
-        var isActiveFile = payload.matches[index] && payload.matches[index].is_active === true;
-        // Move focus BEFORE disabling its current owner. Static images cannot
-        // receive keyboard focus. Focusing the checkbox does not change its value.
-        if (isActiveFile) {
-            try { chFaceScaleMatch.active = true; } catch (focusTransferError) {}
-        }
-        insertButton.enabled = !isActiveFile;
-        status.text = isActiveFile
-            ? "Текущий открытый файл — показан для сравнения и не вставляется сам в себя."
-            : "Выбран кадр " + String(index + 1) + " из " + String(payload.matches.length) + ".";
-        try {
-            if (insertButton.enabled) insertButton.active = true;
-        } catch (focusError) {
-        }
+        var newPage = Math.floor(visualPosition(index) / pageSize);
+        if (newPage != page) { page = newPage; rebuildGrid(false); }
+        refreshFrames();
+        var active = payload.matches[index].is_active === true;
+        if (active) { try { chFaceScaleMatch.active = true; } catch (focusError) {} }
+        insertButton.enabled = !active;
+        updateStatus();
+        try { if (!active) insertButton.active = true; } catch (focusError) {}
         w.update();
     }
-
-    function gfpHandlePreviewClick(index) {
-        if (index < 0 || index >= payload.matches.length) {
-            return;
-        }
-        var now = (new Date()).getTime();
-        var isDouble = lastClickIndex == index && now - lastClickTime <= 650;
-        lastClickIndex = index;
-        lastClickTime = now;
-        gfpSelectIndex(index);
-        var isActiveFile = payload.matches[index] && payload.matches[index].is_active === true;
-        if (isDouble && !isActiveFile) {
-            selectedIndex = index;
-            lastClickTime = 0;
-            w.close(1);
-        }
+    function setBusy(value) {
+        busy = value; toolbar.enabled = !value; grid.enabled = !value; settingsButton.enabled = !value;
+        bottom.enabled = !value; pager.enabled = !value;
     }
-
-    insertButton.onClick = function () {
-        if (selectedIndex >= 0 && !(payload.matches[selectedIndex] && payload.matches[selectedIndex].is_active === true)) {
-            w.close(1);
+    function rememberOptions(render) {
+        var response = gfpApiRequest({command:"refresh_previews", query_id:payload.query_id,
+            preview_size:requestedSize, preview_sort:sortMode, render:render}, 60000);
+        if (!response || response.type != "answer" || !response.message) throw new Error(response && response.message ? String(response.message) : "Сервер не ответил при обновлении превью.");
+        return response.message;
+    }
+    function saveLocalOptions() {
+        GFP_SETTINGS.preview_size = requestedSize; GFP_SETTINGS.preview_sort = sortMode;
+        try { gfpSaveConfig(GFP_SETTINGS); } catch (saveError) { status.helpTip += "\nНе удалось сохранить клиентские настройки: " + gfpErrorText(saveError); }
+    }
+    grid.addEventListener("mousedown", function (event) {
+        if (busy || event.button > 0) return;
+        var control = event.target;
+        while (control && control != grid) {
+            if (typeof control.gfpIndex == "number") {
+                var index = Number(control.gfpIndex), now = (new Date()).getTime();
+                var doubleClick = lastClickIndex == index && now - lastClickTime <= 650;
+                lastClickIndex = index; lastClickTime = now;
+                selectIndex(index);
+                if (doubleClick && payload.matches[index].is_active !== true) w.close(1);
+                return;
+            }
+            control = control.parent;
+        }
+    }, true);
+    dlSort.onChange = function () {
+        if (initializing || busy) return;
+        var previous = sortMode;
+        sortMode = gfpReadValueDropdown(dlSort, "filename"); resetClicks();
+        try {
+            displayOrder = gfpPreviewOrder(payload.matches, items, sortMode);
+            rebuildGrid(true); rememberOptions(false); saveLocalOptions();
+        }
+        catch (error) {
+            sortMode = previous; initializing = true;
+            gfpRestoreValueDropdown(dlSort, previous, "filename"); initializing = false;
+            displayOrder = gfpPreviewOrder(payload.matches, items, sortMode); rebuildGrid(true);
+            alert("Не удалось сохранить порядок превью:\n" + gfpErrorText(error), GFP_NAME, true);
         }
     };
-    cancelButton.onClick = function () {
-        selectedIndex = -1;
-        w.close(2);
+    slSize.onChanging = function () { sizeLabel.text = Math.max(64, Math.min(320, Math.round(Number(slSize.value) / 8) * 8)) + " px"; };
+    slSize.onChange = function () {
+        if (initializing || busy) return;
+        var nextSize = Math.max(64, Math.min(320, Math.round(Number(slSize.value) / 8) * 8));
+        slSize.value = nextSize; sizeLabel.text = nextSize + " px";
+        if (nextSize == requestedSize) return;
+        var previous = requestedSize, previousItems = items, previousPreviews = payload.previews;
+        var previousThumb = thumbWidth, previousImages = loadedImages;
+        requestedSize = nextSize; resetClicks();
+        setBusy(true); status.text = "Обновление превью…"; w.update();
+        try {
+            var answer = rememberOptions(true);
+            if (!answer.previews || answer.previews.items.length != items.length) throw new Error("Сервер вернул неполный набор превью.");
+            for (var pi = 0; pi < answer.previews.items.length; pi++) {
+                var updatedItem = answer.previews.items[pi];
+                if (!new File(String(updatedItem.path)).exists || !new File(String(updatedItem.selected_path)).exists) {
+                    throw new Error("Сервер подготовил превью, но файл недоступен Photoshop.");
+                }
+            }
+            clearImages(); loadedImages = []; items = answer.previews.items; payload.previews = answer.previews;
+            thumbWidth = Number(answer.previews.thumb_width); requestedSize = Number(answer.preview_size);
+            displayOrder = gfpPreviewOrder(payload.matches, items, sortMode);
+            rebuildGrid(true); saveLocalOptions();
+        } catch (error) {
+            requestedSize = previous; slSize.value = previous; sizeLabel.text = previous + " px";
+            items = previousItems; payload.previews = previousPreviews; thumbWidth = previousThumb; loadedImages = previousImages;
+            displayOrder = gfpPreviewOrder(payload.matches, items, sortMode);
+            rebuildGrid(true);
+            updateStatus(); alert("Не удалось обновить превью:\n" + gfpErrorText(error), GFP_NAME, true);
+        } finally { setBusy(false); w.update(); }
     };
+    previousPage.onClick = function () { resetClicks(); selectIndex(displayOrder[Math.max(0, (page - 1) * pageSize)]); };
+    nextPage.onClick = function () { resetClicks(); selectIndex(displayOrder[Math.min(items.length - 1, (page + 1) * pageSize)]); };
     settingsButton.onClick = function () {
         if (gfpShowSettingsDialog()) {
-            status.text = "Настройки сохранены. Для обновления превью и их порядка повторите текущий поиск лица.";
-            w.update();
+            status.text = "Настройки сохранены. Для смены модели рекомендации повторите поиск лица."; w.update();
         }
     };
-
+    insertButton.onClick = function () { if (!busy && selectedIndex >= 0 && payload.matches[selectedIndex].is_active !== true) w.close(1); };
+    cancelButton.onClick = function () { selectedIndex = -1; w.close(2); };
     w.addEventListener("keydown", function (event) {
+        if (busy || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
         var key = event.keyName;
-        if (key == "Enter" && event.target && typeof event.target.gfpIndex == "number") {
-            event.preventDefault();
-            event.stopPropagation();
-            if (insertButton.enabled) w.close(1);
-            return;
-        }
+        // Let dropdown/slider use their native arrow keys.
+        if (event.target == dlSort || event.target == slSize) return;
         if (key != "Left" && key != "Right" && key != "Up" && key != "Down") return;
-        if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
-        event.preventDefault();
-        event.stopPropagation();
-        var next = selectedIndex >= 0 ? selectedIndex : initialIndex;
-        var col = next % columns;
+        event.preventDefault(); event.stopPropagation(); resetClicks();
+        var position = visualPosition(selectedIndex >= 0 ? selectedIndex : initialIndex), next = position, col = position % columns;
         if (key == "Left" && col > 0) next--;
         if (key == "Right" && col < columns - 1 && next + 1 < items.length) next++;
         if (key == "Up" && next >= columns) next -= columns;
-        if (key == "Down" && (Math.floor(next / columns) + 1) * columns < items.length) {
-            next = Math.min(next + columns, items.length - 1);
-        }
-        // Navigation must not complete a previous mouse double-click.
-        lastClickIndex = -1;
-        lastClickTime = 0;
-        gfpSelectIndex(next);
+        if (key == "Down" && (Math.floor(next / columns) + 1) * columns < items.length) next = Math.min(next + columns, items.length - 1);
+        selectIndex(displayOrder[next]);
     }, true);
-    w.onShow = function () {
-        gfpSelectIndex(initialIndex);
-    };
-
+    displayOrder = gfpPreviewOrder(payload.matches, items, sortMode);
+    selectedIndex = initialIndex;
+    rebuildGrid(true); initializing = false;
+    w.onShow = function () { selectIndex(initialIndex); };
     w.center();
     var dialogResult = w.show();
-    // Statistics collection is configured only in the Settings dialog.
-    // Snapshot the persisted setting into this query result; the preview
-    // window itself intentionally has no control that can change it.
     payload.collect_statistics = GFP_SETTINGS.collect_statistics === true;
     payload.face_scale_match = chFaceScaleMatch.value === true;
     if (payload.face_scale_match !== initialFaceScaleMatch) {
-        // This is a Photoshop-side operational preference. Remember only the
-        // last state for the next chooser; Python no longer stores it globally.
         GFP_SETTINGS.face_scale_match = payload.face_scale_match;
-        try {
-            gfpSaveConfig(GFP_SETTINGS);
-        } catch (saveScaleError) {
-            // Do not block a face replacement if only this convenience state
-            // could not be persisted. The current insertion still uses payload.
-        }
+        try { gfpSaveConfig(GFP_SETTINGS); } catch (saveScaleError) {}
     }
-    for (var ci = 0; ci < previewButtons.length; ci++) {
-        try {
-            previewButtons[ci].image = null;
-            previewButtons[ci].gfpNormalImage = null;
-            previewButtons[ci].gfpSelectedImage = null;
-        } catch (imageError) {
-        }
-    }
-
-    if (dialogResult != 1) {
-        return -1;
-    }
-    return selectedIndex;
+    clearImages(); loadedImages = [];
+    return dialogResult == 1 ? selectedIndex : -1;
 }
 
 function gfpRecordPreference(payload, index) {
@@ -1466,7 +1525,7 @@ function gfpDefaultConfig() {
     return {
         server_host: GFP_DEFAULT_HOST,
         server_port: GFP_DEFAULT_PORT_SEND,
-        preview_size: 96,
+        preview_size: 184,
         cache_ttl_hours: 48,
         match_threshold: 0.28,
         compute_mode: "auto",
@@ -1550,7 +1609,7 @@ function gfpNormalizeConfig(raw) {
     if (!isFinite(cfg.server_port) || cfg.server_port < 1 || cfg.server_port > 65535) {
         cfg.server_port = GFP_DEFAULT_PORT_SEND;
     }
-    cfg.preview_size = Number(cfg.preview_size || 96);
+    cfg.preview_size = Number(cfg.preview_size || 184);
     cfg.preview_size = Math.max(64, Math.min(320, Math.round(cfg.preview_size / 8) * 8));
     cfg.cache_ttl_hours = Number(cfg.cache_ttl_hours || 48);
     cfg.cache_ttl_hours = Math.max(12, Math.min(168, Math.round(cfg.cache_ttl_hours)));
@@ -1896,47 +1955,41 @@ function gfpShowSettingsDialog() {
         engineStatus.preferredSize = [470, 20];
     }
 
-    var previewPanel = w.add("panel", undefined, "Интерфейс");
-    previewPanel.orientation = "column";
-    previewPanel.alignChildren = ["fill", "top"];
-    previewPanel.margins = 8;
-    previewPanel.spacing = 5;
-    var previewRow = previewPanel.add("group");
-    previewRow.orientation = "row";
-    previewRow.alignChildren = ["fill", "center"];
-    var previewLabel = previewRow.add("statictext", undefined, "Размер превью");
-    previewLabel.preferredSize = [230, 20];
-    var slPreview = previewRow.add("slider", undefined, Number(current.preview_size), 64, 320);
-    slPreview.preferredSize = [180, 20];
-    var stPreview = previewRow.add("statictext", undefined, String(current.preview_size) + " px");
-    stPreview.preferredSize = [60, 20];
-    function updatePreviewLabel() {
-        var v = Math.max(64, Math.min(320, Math.round(Number(slPreview.value) / 8) * 8));
-        slPreview.value = v;
-        stPreview.text = String(v) + " px";
+    var cachePanel = w.add("panel", undefined, "Поиск");
+    cachePanel.orientation = "column";
+    cachePanel.alignChildren = ["fill", "top"];
+    cachePanel.margins = 8;
+    cachePanel.spacing = 5;
+    var chGroupBoundarySearch = cachePanel.add("checkbox", undefined, "Поиск границ группы");
+    chGroupBoundarySearch.value = current.group_boundary_search === true;
+    chGroupBoundarySearch.helpTip = "Включено: анализ начинается от открытого кадра и останавливается после уверенной смены состава группы. Выключено: все поддерживаемые файлы папки считаются одной группой.";
+    chGroupBoundarySearch.helpTip += " Если в папке только одна группа, отключение немного ускоряет первичный анализ.";
+    var thresholdRow = cachePanel.add("group");
+    thresholdRow.orientation = "row";
+    thresholdRow.alignChildren = ["fill", "center"];
+    var thresholdText = thresholdRow.add("statictext", undefined, "Порог совпадения лица");
+    thresholdText.preferredSize = [230, 20];
+    var slThreshold = thresholdRow.add("slider", undefined, Math.round(Number(current.match_threshold) * 100), 10, 60);
+    slThreshold.preferredSize = [180, 20];
+    var stThreshold = thresholdRow.add("statictext", undefined, String(Math.round(Number(current.match_threshold) * 100)) + "%");
+    stThreshold.preferredSize = [60, 20];
+    function updateThresholdLabel() {
+        var v = Math.round(Number(slThreshold.value));
+        slThreshold.value = v;
+        stThreshold.text = String(v) + "%";
     }
-    slPreview.onChanging = updatePreviewLabel;
-    slPreview.onChange = updatePreviewLabel;
-    updatePreviewLabel();
+    slThreshold.onChanging = updateThresholdLabel;
+    slThreshold.onChange = updateThresholdLabel;
+    updateThresholdLabel();
 
-    var insertPanel = w.add("panel", undefined, "Превью и рекомендации");
+
+    var edCacheTtl = addLabeledEdit(performancePanel, "Срок жизни кэша анализа, часов", String(current.cache_ttl_hours), 80);
+
+    var insertPanel = w.add("panel", undefined, "Рекомендации");
     insertPanel.orientation = "column";
     insertPanel.alignChildren = ["fill", "top"];
     insertPanel.margins = 8;
     insertPanel.spacing = 5;
-    var sortRow = insertPanel.add("group");
-    sortRow.orientation = "row";
-    var sortLabel = sortRow.add("statictext", undefined, "Порядок превью");
-    sortLabel.preferredSize = [230, 20];
-    var dlPreviewSort = sortRow.add("dropdownlist", undefined);
-    dlPreviewSort.preferredSize = [220, 24];
-    gfpPopulateValueDropdown(dlPreviewSort, [
-        { label: "По порядку файлов", value: "filename" },
-        { label: "По степени похожести", value: "similarity" },
-        { label: "По оценке удачности", value: "attractiveness" }
-    ]);
-    gfpRestoreValueDropdown(dlPreviewSort, current.preview_sort, "filename");
-    dlPreviewSort.helpTip = "Порядок файлов — естественная сортировка имён, текущий кадр на своём месте. Похожесть — сходство с выбранным лицом. Удачность — оценка модели, выбранной ниже; без доступных оценок используется порядок файлов.";
     var recommendationRow = insertPanel.add("group");
     recommendationRow.orientation = "row";
     recommendationRow.alignChildren = ["left", "center"];
@@ -1965,34 +2018,6 @@ function gfpShowSettingsDialog() {
     chCollectStatistics.value = current.collect_statistics === true;
     chCollectStatistics.helpTip = "После успешной вставки сохраняется базовая пара: выбранное лицо > текущее лицо. Если вы заменили автоматически предложенный кадр, обучатель дополнительно использует: выбранное лицо > отвергнутая рекомендация. Данные находятся в training_data рядом с Python-сервером.";
 
-    var cachePanel = w.add("panel", undefined, "Кэш и поиск");
-    cachePanel.orientation = "column";
-    cachePanel.alignChildren = ["fill", "top"];
-    cachePanel.margins = 8;
-    cachePanel.spacing = 5;
-    var edCacheTtl = addLabeledEdit(cachePanel, "Срок жизни кэша анализа, часов", String(current.cache_ttl_hours), 80);
-    var chGroupBoundarySearch = cachePanel.add("checkbox", undefined, "Поиск границ группы");
-    chGroupBoundarySearch.value = current.group_boundary_search === true;
-    chGroupBoundarySearch.helpTip = "Включено: анализ начинается от открытого кадра и останавливается после уверенной смены состава группы. Выключено: все поддерживаемые файлы папки считаются одной группой.";
-    chGroupBoundarySearch.helpTip += " Если в папке только одна группа, отключение немного ускоряет первичный анализ.";
-    var thresholdRow = cachePanel.add("group");
-    thresholdRow.orientation = "row";
-    thresholdRow.alignChildren = ["fill", "center"];
-    var thresholdText = thresholdRow.add("statictext", undefined, "Порог совпадения лица");
-    thresholdText.preferredSize = [230, 20];
-    var slThreshold = thresholdRow.add("slider", undefined, Math.round(Number(current.match_threshold) * 100), 10, 60);
-    slThreshold.preferredSize = [180, 20];
-    var stThreshold = thresholdRow.add("statictext", undefined, String(Math.round(Number(current.match_threshold) * 100)) + "%");
-    stThreshold.preferredSize = [60, 20];
-    function updateThresholdLabel() {
-        var v = Math.round(Number(slThreshold.value));
-        slThreshold.value = v;
-        stThreshold.text = String(v) + "%";
-    }
-    slThreshold.onChanging = updateThresholdLabel;
-    slThreshold.onChange = updateThresholdLabel;
-    updateThresholdLabel();
-
     var buttons = w.add("group");
     buttons.orientation = "row";
     buttons.alignment = ["center", "top"];
@@ -2006,7 +2031,7 @@ function gfpShowSettingsDialog() {
         resultConfig = gfpNormalizeConfig({
             server_host: edServerHost.text,
             server_port: Number(edPort.text),
-            preview_size: Number(slPreview.value),
+            preview_size: current.preview_size,
             cache_ttl_hours: Number(edCacheTtl.text),
             match_threshold: Number(slThreshold.value) / 100.0,
             compute_mode: selectedComputeMode,
@@ -2016,7 +2041,7 @@ function gfpShowSettingsDialog() {
             group_boundary_search: chGroupBoundarySearch.value === true,
             face_scale_match: current.face_scale_match === true,
             collect_statistics: chCollectStatistics.value === true,
-            preview_sort: gfpReadValueDropdown(dlPreviewSort, current.preview_sort || "filename"),
+            preview_sort: current.preview_sort,
             recommendation_model: gfpReadValueDropdown(dlRecommendation, current.recommendation_model || "public")
         });
         w.close(1);

@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 APP_NAME = "Group Face Picker"
-VERSION = "0.6.36"
+VERSION = "0.6.42"
 SETTINGS_SCHEMA_VERSION = 10
 SERVER_INSTANCE_ID = uuid.uuid4().hex[:12]
 CACHE_VERSION = 13
@@ -34,7 +34,7 @@ CACHE_CLEANUP_INTERVAL_SECONDS = 15 * 60
 STATE_CLEANUP_INTERVAL_SECONDS = 60
 DEFAULT_CACHE_TTL_HOURS = 48
 DEFAULT_MATCH_THRESHOLD = 0.28
-DEFAULT_PREVIEW_SIZE = 96
+DEFAULT_PREVIEW_SIZE = 184
 DEFAULT_SERVER_HOST = "127.0.0.1"
 DEFAULT_SERVER_PORT = 6420
 DEFAULT_COMPUTE_MODE = "auto"
@@ -199,7 +199,7 @@ def _config_with_defaults(data: Optional[Dict[str, Any]] = None) -> Dict[str, An
         preview_size = int(raw.get("preview_size") or DEFAULT_PREVIEW_SIZE)
     except Exception:
         preview_size = DEFAULT_PREVIEW_SIZE
-    preview_size = max(64, min(320, int(round(preview_size / 8.0) * 8)))
+    preview_size = max(64, min(320, int(math.floor(preview_size / 8.0 + 0.5) * 8)))
     try:
         cache_ttl_hours = int(raw.get("cache_ttl_hours") or DEFAULT_CACHE_TTL_HOURS)
     except Exception:
@@ -472,6 +472,7 @@ class QueryContext:
     target_face_height: float
     candidates: List[QueryCandidate]
     recommendation: Dict[str, Any]
+    preview_scores: List[Dict[str, Any]]
 
 
 class PublicPreferenceScorer:
@@ -2033,7 +2034,7 @@ def _write_framed_preview(source_path: Path, target_path: Path, color: Tuple[int
         os.replace(str(temp), str(target_path))
 
 
-def _write_badged_preview(source_path: Path, target_path: Path, current: bool, recommended: bool) -> None:
+def _write_badged_preview(source_path: Path, target_path: Path, current: bool, recommended: bool, similarity: Optional[float] = None) -> None:
     from PIL import Image, ImageDraw, ImageFont
 
     with Image.open(source_path) as source:
@@ -2062,6 +2063,14 @@ def _write_badged_preview(source_path: Path, target_path: Path, current: bool, r
         draw.rounded_rectangle((6, y, 6 + width, y + height), radius=3, fill=(*color, 255))
         draw.text((9 - left, y + 2 - top), label, font=font, fill=(226, 230, 232, 235))
         y += height + 3
+    if similarity is not None and math.isfinite(similarity):
+        # Cosine similarity is a score, not a probability or percentage.
+        label = "%.3f" % similarity
+        left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
+        width, height = right - left + 8, bottom - top + 4
+        x, y = preview.width - width - 6, preview.height - height - 6
+        draw.rounded_rectangle((x, y, x + width, y + height), radius=3, fill=(65, 68, 71, 235))
+        draw.text((x + 4 - left, y + 2 - top), label, font=font, fill=(226, 230, 232, 255))
     temp = target_path.with_suffix(target_path.suffix + ".tmp")
     preview.save(temp, format="PNG", compress_level=1)
     preview.close()
@@ -3313,14 +3322,16 @@ def _sort_preview_candidates(candidates: List[QueryCandidate], recommendation: D
     recommendation["recommended_index"] = indices.index(old_best) if old_best in indices else -1
 
 
-def _render_previews(candidates: List[QueryCandidate], job_id: Optional[str] = None) -> Dict[str, Any]:
+def _render_previews(candidates: List[QueryCandidate], job_id: Optional[str] = None,
+                     preview_size: Optional[int] = None,
+                     recommendation_snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     from PIL import Image, ImageOps
 
     count = len(candidates)
     if count <= 0:
         raise UserVisibleError("No matching child was found in other images in this group.")
 
-    thumb = _preview_size()
+    thumb = _preview_size() if preview_size is None else int(preview_size)
     if count <= 12:
         columns = min(6, count)
     elif count <= 24:
@@ -3329,16 +3340,19 @@ def _render_previews(candidates: List[QueryCandidate], job_id: Optional[str] = N
         columns = min(8, count)
     elif count <= 60:
         columns = min(10, count)
-        thumb = max(72, min(thumb, 120))
     else:
         columns = min(12, count)
-        thumb = max(64, min(thumb, 104))
 
     if job_id:
         _update_job(job_id, progress=0.90, status="running", text="Оценка лучших дублей...")
     _check_job_cancelled(job_id)
-    recommendation = _score_candidates_for_recommendation(candidates, job_id=job_id)
-    _sort_preview_candidates(candidates, recommendation, str(_get_runtime_config().get("preview_sort", "filename")))
+    if recommendation_snapshot is None:
+        recommendation = _score_candidates_for_recommendation(candidates, job_id=job_id)
+        _sort_preview_candidates(candidates, recommendation, str(_get_runtime_config().get("preview_sort", "filename")))
+    else:
+        # An existing query owns immutable insertion indices. Refresh only PNGs;
+        # do not run recognition/scoring or reorder its candidates.
+        recommendation = recommendation_snapshot
     recommended_index = int(recommendation.get("recommended_index", -1))
     _check_job_cancelled(job_id)
     if job_id:
@@ -3367,11 +3381,14 @@ def _render_previews(candidates: List[QueryCandidate], job_id: Optional[str] = N
         # Status badges are part of both variants; selection only adds blue.
         normal_path = base_path
         is_recommended = bool(item_recommendation.get("is_recommended"))
-        if candidate.is_active or is_recommended:
-            suffix = "_badges_v3_%d%d" % (bool(candidate.is_active), is_recommended)
+        similarity = float(candidate.similarity)
+        if candidate.is_active or is_recommended or math.isfinite(similarity):
+            # The score depends on the selected reference face. Include its
+            # displayed value in the cache key, not just the candidate identity.
+            suffix = "_badges_v4_%d%d_%s" % (bool(candidate.is_active), is_recommended, "%.3f" % similarity)
             normal_path = base_path.with_name(base_path.stem + suffix + ".png")
             if not normal_path.is_file():
-                _write_badged_preview(base_path, normal_path, candidate.is_active, is_recommended)
+                _write_badged_preview(base_path, normal_path, candidate.is_active, is_recommended, similarity)
         if candidate.is_active:
             framed_path = normal_path.with_name(normal_path.stem + "_current_green_v2.png")
             if not framed_path.is_file():
@@ -3428,6 +3445,8 @@ def _render_previews(candidates: List[QueryCandidate], job_id: Optional[str] = N
         "thumb_height": int(thumb),
         "columns": int(columns),
         "count": int(count),
+        "preview_size": int(_preview_size() if preview_size is None else preview_size),
+        "preview_sort": str(_get_runtime_config().get("preview_sort", "filename")),
         "recommendation": {
             "mode": str(recommendation.get("mode") or "off"),
             "effective_mode": str(recommendation.get("effective_mode") or "off"),
@@ -3590,6 +3609,12 @@ def _select_child(payload: Dict[str, Any], job_id: Optional[str] = None) -> Dict
             target_face_height=float(target_face_dims[1]),
             candidates=candidates,
             recommendation=dict(previews.get("recommendation") or {}),
+            preview_scores=[
+                {"is_recommended": item["is_recommended"],
+                 "effective_score": item["recommendation_score"],
+                 "public_score": item["public_score"], "personal_score": item["personal_score"]}
+                for item in previews["items"]
+            ],
         )
         with QUERY_LOCK:
             QUERIES[query_id] = context
@@ -3610,6 +3635,33 @@ def _select_child(payload: Dict[str, Any], job_id: Optional[str] = None) -> Dict
             "threshold": match_threshold,
             "provider": ENGINE.provider_name(),
         }
+
+
+def _refresh_previews(payload: Dict[str, Any]) -> Dict[str, Any]:
+    query_id = str(payload.get("query_id") or "")
+    with SETTINGS_APPLY_LOCK:
+        with QUERY_LOCK:
+            context = QUERIES.get(query_id)
+        if context is None:
+            raise UserVisibleError("This preview set has expired. Select the face again and run the JSX script.")
+        settings = _get_runtime_config()
+        updated = dict(settings)
+        for key in ("preview_size", "preview_sort"):
+            if key in payload:
+                updated[key] = payload[key]
+        updated = _config_with_defaults(updated)
+        previews = None
+        if _config_bool(payload.get("render", False), False):
+            snapshot = dict(context.recommendation)
+            snapshot["items"] = context.preview_scores
+            previews = _render_previews(list(context.candidates), preview_size=updated["preview_size"],
+                                       recommendation_snapshot=snapshot)
+        # Persist only after successful preparation. Other settings are retained.
+        saved = _save_runtime_config(updated)
+        if previews is not None:
+            previews["preview_sort"] = saved["preview_sort"]
+        return {"previews": previews, "preview_size": saved["preview_size"],
+                "preview_sort": saved["preview_sort"]}
 
 
 def _prepare_crop(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -4098,6 +4150,8 @@ def _handle_command(payload: Dict[str, Any]) -> Dict[str, Any]:
         return _job_status(payload)
     if command == "cancel_job":
         return _json_response("answer", _cancel_job(payload))
+    if command == "refresh_previews":
+        return _json_response("answer", _refresh_previews(payload))
     if command == "prepare_crop":
         return _json_response("answer", _prepare_crop(payload))
     if command == "record_preference":
