@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 APP_NAME = "Group Face Picker"
-VERSION = "0.6.42"
+VERSION = "0.6.43"
 SETTINGS_SCHEMA_VERSION = 10
 SERVER_INSTANCE_ID = uuid.uuid4().hex[:12]
 CACHE_VERSION = 13
@@ -2034,7 +2034,7 @@ def _write_framed_preview(source_path: Path, target_path: Path, color: Tuple[int
         os.replace(str(temp), str(target_path))
 
 
-def _write_badged_preview(source_path: Path, target_path: Path, current: bool, recommended: bool, similarity: Optional[float] = None) -> None:
+def _write_badged_preview(source_path: Path, target_path: Path, current: bool, recommended: bool) -> None:
     from PIL import Image, ImageDraw, ImageFont
 
     with Image.open(source_path) as source:
@@ -2063,14 +2063,6 @@ def _write_badged_preview(source_path: Path, target_path: Path, current: bool, r
         draw.rounded_rectangle((6, y, 6 + width, y + height), radius=3, fill=(*color, 255))
         draw.text((9 - left, y + 2 - top), label, font=font, fill=(226, 230, 232, 235))
         y += height + 3
-    if similarity is not None and math.isfinite(similarity):
-        # Cosine similarity is a score, not a probability or percentage.
-        label = "%.3f" % similarity
-        left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
-        width, height = right - left + 8, bottom - top + 4
-        x, y = preview.width - width - 6, preview.height - height - 6
-        draw.rounded_rectangle((x, y, x + width, y + height), radius=3, fill=(65, 68, 71, 235))
-        draw.text((x + 4 - left, y + 2 - top), label, font=font, fill=(226, 230, 232, 255))
     temp = target_path.with_suffix(target_path.suffix + ".tmp")
     preview.save(temp, format="PNG", compress_level=1)
     preview.close()
@@ -3381,14 +3373,11 @@ def _render_previews(candidates: List[QueryCandidate], job_id: Optional[str] = N
         # Status badges are part of both variants; selection only adds blue.
         normal_path = base_path
         is_recommended = bool(item_recommendation.get("is_recommended"))
-        similarity = float(candidate.similarity)
-        if candidate.is_active or is_recommended or math.isfinite(similarity):
-            # The score depends on the selected reference face. Include its
-            # displayed value in the cache key, not just the candidate identity.
-            suffix = "_badges_v4_%d%d_%s" % (bool(candidate.is_active), is_recommended, "%.3f" % similarity)
+        if candidate.is_active or is_recommended:
+            suffix = "_badges_v5_%d%d" % (bool(candidate.is_active), is_recommended)
             normal_path = base_path.with_name(base_path.stem + suffix + ".png")
             if not normal_path.is_file():
-                _write_badged_preview(base_path, normal_path, candidate.is_active, is_recommended, similarity)
+                _write_badged_preview(base_path, normal_path, candidate.is_active, is_recommended)
         if candidate.is_active:
             framed_path = normal_path.with_name(normal_path.stem + "_current_green_v2.png")
             if not framed_path.is_file():

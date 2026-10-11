@@ -18,7 +18,7 @@ var GFP_SHIFT_LAUNCH = !!ScriptUI.environment.keyboardState.shiftKey;
 
 var GFP_NAME = "Group Face Picker";
 var GFP_UUID = "9a189321-e07f-40ff-8394-156a4bd48cf5";
-var GFP_VERSION = "0.6.42";
+var GFP_VERSION = "0.6.43";
 var GFP_DEFAULT_HOST = "127.0.0.1";
 var GFP_DEFAULT_PORT_SEND = 6420;
 var GFP_DEFAULT_PORT_LISTEN = 6421;
@@ -606,6 +606,9 @@ function gfpShowDialog(payload) {
     for (var ri = 0; ri < items.length; ri++) if (items[ri].is_recommended === true) { initialIndex = ri; break; }
 
     function fixedSize(control, width, height) {
+        // Release old constraints before increasing or decreasing a control.
+        control.minimumSize = [0, 0];
+        control.maximumSize = [100000, 100000];
         control.preferredSize = [width, height];
         control.minimumSize = [width, height];
         control.maximumSize = [width, height];
@@ -706,6 +709,16 @@ function gfpShowDialog(payload) {
             }
         }
     }
+    function pinSettingsButton() {
+        // Apply the final position after ScriptUI's automatic layout. Using
+        // the actual client width avoids retaining the previous grid width.
+        var available = Math.max(0, Number(w.size.width || w.size[0]) - 24);
+        topRow.size = [available, 24];
+        header.size = [Math.max(0, available - 42), 20];
+        header.location = [0, 2];
+        settingsButton.size = [34, 24];
+        settingsButton.location = [Math.max(0, available - 34), 0];
+    }
     function rebuildGrid(followSelection) {
         clearImages();
         while (grid.children.length) grid.remove(grid.children[0]);
@@ -755,6 +768,7 @@ function gfpShowDialog(payload) {
         var visibleRows = Math.ceil((end - start) / columns);
         w.size = [width + 24, visibleRows * (cellSize + 28) + 180 + (pageCount > 1 ? 28 : 0)];
         w.layout.resize();
+        pinSettingsButton();
         if (!initializing) { w.center(); w.update(); }
     }
     function selectIndex(index) {
@@ -871,7 +885,8 @@ function gfpShowDialog(payload) {
     displayOrder = gfpPreviewOrder(payload.matches, items, sortMode);
     selectedIndex = initialIndex;
     rebuildGrid(true); initializing = false;
-    w.onShow = function () { selectIndex(initialIndex); };
+    w.onShow = function () { pinSettingsButton(); selectIndex(initialIndex); };
+    w.onResize = w.onResizing = function () { w.layout.resize(); pinSettingsButton(); };
     w.center();
     var dialogResult = w.show();
     payload.collect_statistics = GFP_SETTINGS.collect_statistics === true;
