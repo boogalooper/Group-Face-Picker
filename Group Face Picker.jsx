@@ -18,7 +18,7 @@ var GFP_SHIFT_LAUNCH = !!ScriptUI.environment.keyboardState.shiftKey;
 
 var GFP_NAME = "Group Face Picker";
 var GFP_UUID = "9a189321-e07f-40ff-8394-156a4bd48cf5";
-var GFP_VERSION = "0.6.46";
+var GFP_VERSION = "0.6.49";
 var GFP_DEFAULT_HOST = "127.0.0.1";
 var GFP_DEFAULT_PORT_SEND = 6420;
 var GFP_DEFAULT_PORT_LISTEN = 6421;
@@ -189,7 +189,7 @@ function gfpMain() {
                 }
             }
         } finally {
-            gfpApiFire({ command: "release_query", query_id: payload.query_id, insert_timings: payload.insert_timings || null });
+            gfpApiFire({ command: "release_query", query_id: payload.query_id });
         }
 
         // Отмена главного окна всегда оставляет целевой документ в нейтральном
@@ -1001,12 +1001,6 @@ function gfpInsertCandidate(payload, index) {
     var sourceWasAlreadyOpen = false;
     var sourceOpenedByScript = false;
 
-    var insertionStarted = (new Date()).getTime(), stageStarted = insertionStarted;
-    var timings = {clothing_enabled:GFP_SETTINGS.align_clothing === true, rotation_enabled:GFP_SETTINGS.allow_rotation === true};
-    payload.insert_timings = timings;
-    function finishStage(name) {
-        var now = (new Date()).getTime(); timings[name] = now-stageStarted; stageStarted=now;
-    }
     try {
         var response = gfpApiRequest({
             command: "prepare_crop",
@@ -1020,7 +1014,6 @@ function gfpInsertCandidate(payload, index) {
             throw new Error("Python-сервер не вернул координаты исходного фрагмента.");
         }
 
-        finishStage("server_prepare_ms");
         var item = response.message;
         var target = gfpSelectDocumentById(payload.target.document_id);
         targetHistory = target.activeHistoryState;
@@ -1047,7 +1040,6 @@ function gfpInsertCandidate(payload, index) {
 
         app.activeDocument = sourceDocument;
         sourceHistory = sourceDocument.activeHistoryState;
-        finishStage("donor_open_ms");
 
         var expectedWidth = Number(payload.target.selection.right) - Number(payload.target.selection.left);
         var expectedHeight = Number(payload.target.selection.bottom) - Number(payload.target.selection.top);
@@ -1191,7 +1183,6 @@ function gfpInsertCandidate(payload, index) {
         app.activeDocument = target;
         target.activeLayer = insertedLayer;
 
-        finishStage("extract_ms");
         var layerBounds = insertedLayer.bounds;
         var layerLeft = gfpPx(layerBounds[0]);
         var layerTop = gfpPx(layerBounds[1]);
@@ -1242,9 +1233,6 @@ function gfpInsertCandidate(payload, index) {
                 );
             }
         }
-        timings.rotation_degrees = rotationDegrees;
-        timings.combined_transform = !!combinedAffine;
-        finishStage("transform_ms");
         insertedLayer.name = "Face from " + String(item.name);
 
         if (payload.target.selection_mask) {
@@ -1262,13 +1250,8 @@ function gfpInsertCandidate(payload, index) {
             target.activeLayer = insertedLayer;
             gfpMakeSelectionMask();
         }
-        finishStage("mask_ms");
-        timings.total_ms = (new Date()).getTime()-insertionStarted;
-        timings.success = true;
         return true;
     } catch (insertError) {
-        timings.total_ms = (new Date()).getTime()-insertionStarted;
-        timings.success = false;
         try {
             if (sourceDocument) {
                 app.activeDocument = sourceDocument;

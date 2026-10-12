@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 APP_NAME = "Group Face Picker"
-VERSION = "0.6.46"
+VERSION = "0.6.49"
 SETTINGS_SCHEMA_VERSION = 10
 SERVER_INSTANCE_ID = uuid.uuid4().hex[:12]
 CACHE_VERSION = 13
@@ -1675,13 +1675,15 @@ def _fit_detector_size(width: int, height: int, det_size: int) -> Tuple[int, int
     return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
 
 
-def _read_detector_rgb(path: Path) -> Tuple[Any, int, int]:
+def _read_detector_rgb(path: Path, retain_source: bool = False) -> Tuple[Any, ...]:
     """Decode only a detector-sized frame and return its full oriented dimensions.
 
     JPEG uses libjpeg's draft/downsample-on-load path whenever available. Other
     formats are reduced before conversion to NumPy, which still avoids the old
     full-resolution RGB + BGR ndarray duplication. PSD may still need to decode
     its merged composite at native size, but SCRFD never sees that native array.
+    retain_source transfers ownership of the PIL source to the caller, which
+    must close it after per-file recognition (also on errors and no-face exits).
     """
     import numpy as np
     from PIL import Image
@@ -1726,6 +1728,10 @@ def _read_detector_rgb(path: Path) -> Tuple[Any, int, int]:
         finally:
             if resized is not source:
                 resized.close()
+        if retain_source:
+            retained = source
+            source = None  # Ownership passes to the per-file analyzer.
+            return rgb, int(full_w), int(full_h), retained
         return rgb, int(full_w), int(full_h)
     except Exception as exc:
         pillow_error = exc
@@ -1749,15 +1755,21 @@ def _read_detector_rgb(path: Path) -> Tuple[Any, int, int]:
                 raise RuntimeError("PSD has no readable merged composite")
             target_w, target_h = _fit_detector_size(full_w, full_h, det_size)
             resized = image.resize((target_w, target_h), resample=Image.Resampling.BILINEAR)
+            retained = False
             try:
                 converted = resized.convert("RGB")
                 try:
-                    return np.array(converted, dtype=np.uint8, copy=True), full_w, full_h
+                    rgb = np.array(converted, dtype=np.uint8, copy=True)
+                    if retain_source:
+                        retained = True
+                        return rgb, full_w, full_h, image
+                    return rgb, full_w, full_h
                 finally:
                     converted.close()
             finally:
                 resized.close()
-                image.close()
+                if not retained:
+                    image.close()
         except Exception as exc:
             detail = "%s; psd-tools fallback: %s" % (pillow_error, exc) if pillow_error else str(exc)
             raise UserVisibleError("Cannot read PSD %s: %s" % (path.name, detail)) from exc
@@ -2477,10 +2489,87 @@ def _analyze_image_record(path: Path) -> ImageRecord:
             faces=faces,
         )
 
-    detector_rgb, full_w, full_h = _read_detector_rgb(path)
-    det_h, det_w = detector_rgb.shape[:2]
-    geometries = ENGINE.detect_geometry(detector_rgb)
-    if not geometries:
+    source = None
+    if path.suffix.lower() == ".psd":
+        detector_rgb, full_w, full_h, source = _read_detector_rgb(path, retain_source=True)
+    else:
+        detector_rgb, full_w, full_h = _read_detector_rgb(path)
+    try:
+        det_h, det_w = detector_rgb.shape[:2]
+        geometries = ENGINE.detect_geometry(detector_rgb)
+        if not geometries:
+            return ImageRecord(
+                path=str(path),
+                name=path.name,
+                width=int(full_w),
+                height=int(full_h),
+                source_width=int(full_w),
+                source_height=int(full_h),
+                faces=[],
+            )
+
+        sx = float(full_w) / float(max(1, det_w))
+        sy = float(full_h) / float(max(1, det_h))
+        mapped: List[DetectedFaceGeometry] = []
+        for geometry in geometries:
+            bx1, by1, bx2, by2 = geometry.bbox
+            mapped.append(
+                DetectedFaceGeometry(
+                    bbox=(bx1 * sx, by1 * sy, bx2 * sx, by2 * sy),
+                    kps=[[point[0] * sx, point[1] * sy] for point in geometry.kps],
+                )
+            )
+
+        # ArcFace needs only a small aligned face. For JPEG ask libjpeg for the
+        # smallest native downsample that still leaves the smallest detected face
+        # around RECOGNITION_MIN_FACE_PIXELS. PNG/TIFF/PSD may decode natively, but
+        # they still never become a full-frame NumPy/BGR array.
+        smallest_face = min(
+            max(1.0, max(item.bbox[2] - item.bbox[0], item.bbox[3] - item.bbox[1]))
+            for item in mapped
+        )
+        recognition_scale = min(1.0, float(RECOGNITION_MIN_FACE_PIXELS) / float(smallest_face))
+        if source is None:
+            source, source_full_w, source_full_h = _open_region_source(path, recognition_scale)
+        else:
+            # PSD has already been decoded at native size for detection. Keep that
+            # exact PIL composite only for this file; no second disk read/decode.
+            source_full_w, source_full_h = full_w, full_h
+        recognition_w, recognition_h = int(source.width), int(source.height)
+        try:
+            # The two readers should describe the same oriented document. If a rare
+            # metadata path disagrees, remap the already detected geometry rather
+            # than silently shifting faces.
+            if (int(source_full_w), int(source_full_h)) != (int(full_w), int(full_h)):
+                LOGGER.warning(
+                    "[INDEX] Geometry size mismatch for %s: detector=%dx%d region=%dx%d",
+                    path.name, full_w, full_h, source_full_w, source_full_h,
+                )
+                adjust_x = float(source_full_w) / float(max(1, full_w))
+                adjust_y = float(source_full_h) / float(max(1, full_h))
+                remapped: List[DetectedFaceGeometry] = []
+                for geometry in mapped:
+                    bx1, by1, bx2, by2 = geometry.bbox
+                    remapped.append(DetectedFaceGeometry(
+                        bbox=(bx1 * adjust_x, by1 * adjust_y, bx2 * adjust_x, by2 * adjust_y),
+                        kps=[[point[0] * adjust_x, point[1] * adjust_y] for point in geometry.kps],
+                    ))
+                mapped = remapped
+                full_w, full_h = int(source_full_w), int(source_full_h)
+
+            faces = _recognize_image_faces(source, mapped, int(full_w), int(full_h), path)
+        finally:
+            try:
+                source.close()
+            except Exception:
+                pass
+            source = None
+
+        LOGGER.info(
+            "[INDEX] %s detector-frame=%dx%d native=%dx%d recognition-source=%dx%d",
+            path.name, det_w, det_h, full_w, full_h,
+            recognition_w, recognition_h,
+        )
         return ImageRecord(
             path=str(path),
             name=path.name,
@@ -2488,74 +2577,15 @@ def _analyze_image_record(path: Path) -> ImageRecord:
             height=int(full_h),
             source_width=int(full_w),
             source_height=int(full_h),
-            faces=[],
+            faces=faces,
         )
-
-    sx = float(full_w) / float(max(1, det_w))
-    sy = float(full_h) / float(max(1, det_h))
-    mapped: List[DetectedFaceGeometry] = []
-    for geometry in geometries:
-        bx1, by1, bx2, by2 = geometry.bbox
-        mapped.append(
-            DetectedFaceGeometry(
-                bbox=(bx1 * sx, by1 * sy, bx2 * sx, by2 * sy),
-                kps=[[point[0] * sx, point[1] * sy] for point in geometry.kps],
-            )
-        )
-
-    # ArcFace needs only a small aligned face. For JPEG ask libjpeg for the
-    # smallest native downsample that still leaves the smallest detected face
-    # around RECOGNITION_MIN_FACE_PIXELS. PNG/TIFF/PSD may decode natively, but
-    # they still never become a full-frame NumPy/BGR array.
-    smallest_face = min(
-        max(1.0, max(item.bbox[2] - item.bbox[0], item.bbox[3] - item.bbox[1]))
-        for item in mapped
-    )
-    recognition_scale = min(1.0, float(RECOGNITION_MIN_FACE_PIXELS) / float(smallest_face))
-    source, source_full_w, source_full_h = _open_region_source(path, recognition_scale)
-    recognition_w, recognition_h = int(source.width), int(source.height)
-    try:
-        # The two readers should describe the same oriented document. If a rare
-        # metadata path disagrees, remap the already detected geometry rather
-        # than silently shifting faces.
-        if (int(source_full_w), int(source_full_h)) != (int(full_w), int(full_h)):
-            LOGGER.warning(
-                "[INDEX] Geometry size mismatch for %s: detector=%dx%d region=%dx%d",
-                path.name, full_w, full_h, source_full_w, source_full_h,
-            )
-            adjust_x = float(source_full_w) / float(max(1, full_w))
-            adjust_y = float(source_full_h) / float(max(1, full_h))
-            remapped: List[DetectedFaceGeometry] = []
-            for geometry in mapped:
-                bx1, by1, bx2, by2 = geometry.bbox
-                remapped.append(DetectedFaceGeometry(
-                    bbox=(bx1 * adjust_x, by1 * adjust_y, bx2 * adjust_x, by2 * adjust_y),
-                    kps=[[point[0] * adjust_x, point[1] * adjust_y] for point in geometry.kps],
-                ))
-            mapped = remapped
-            full_w, full_h = int(source_full_w), int(source_full_h)
-
-        faces = _recognize_image_faces(source, mapped, int(full_w), int(full_h), path)
     finally:
-        try:
-            source.close()
-        except Exception:
-            pass
+        if source is not None:
+            try:
+                source.close()
+            except Exception:
+                pass
 
-    LOGGER.info(
-        "[INDEX] %s detector-frame=%dx%d native=%dx%d recognition-source=%dx%d",
-        path.name, det_w, det_h, full_w, full_h,
-        recognition_w, recognition_h,
-    )
-    return ImageRecord(
-        path=str(path),
-        name=path.name,
-        width=int(full_w),
-        height=int(full_h),
-        source_width=int(full_w),
-        source_height=int(full_h),
-        faces=faces,
-    )
 
 
 def _embedding_similarity_matrix(
@@ -3850,15 +3880,9 @@ def _clothing_correspondences(candidate: QueryCandidate, context: QueryContext) 
             mask[~inside] = 0
         return out, mask, midpoint, factor
 
-    started = time.perf_counter()
-    matched_at = None
-    refine_started = None
-    timings = {"read_ms": 0.0, "match_ms": 0.0, "refine_ms": 0.0}
     try:
         src, src_mask, src_mid, src_factor = patch(candidate)
         dst, dst_mask, dst_mid, dst_factor = patch(reference)
-        matched_at = time.perf_counter()
-        timings["read_ms"] = (matched_at-started)*1000
         orb = cv2.ORB_create(nfeatures=1000, fastThreshold=10, edgeThreshold=15)
         sk, sd = orb.detectAndCompute(src, src_mask)
         tk, td = orb.detectAndCompute(dst, dst_mask)
@@ -3889,10 +3913,7 @@ def _clothing_correspondences(candidate: QueryCandidate, context: QueryContext) 
                 not .90 <= scale <= 1.10 or abs(angle) > 8 or displacement > 24 or
                 float(np.ptp(a[:, 0])) < 40 or float(np.ptp(a[:, 1])) < 20):
             return None
-        refine_started = time.perf_counter()
-        timings["match_ms"] = (refine_started-matched_at)*1000
         refined = _refine_clothing_points(src, dst, src_mask, dst_mask, a, b, affine)
-        timings["refine_ms"] = (time.perf_counter()-refine_started)*1000
         refined_used = refined is not None
         if refined_used:
             a, b = refined
@@ -3916,15 +3937,7 @@ def _clothing_correspondences(candidate: QueryCandidate, context: QueryContext) 
         # Alignment is optional; texture/decoder errors must not block insertion.
         LOGGER.warning("[ALIGN] Clothing refinement unavailable: %s", exc)
         return None
-    finally:
-        finished = time.perf_counter()
-        if matched_at is None:
-            timings["read_ms"] = (finished-started)*1000
-        elif refine_started is None:
-            timings["match_ms"] = (finished-matched_at)*1000
-        LOGGER.info("[ALIGN_TIME] read=%.1fms match=%.1fms refine=%.1fms total=%.1fms",
-                    timings["read_ms"], timings["match_ms"], timings["refine_ms"],
-                    (time.perf_counter()-started)*1000)
+
 
 
 def _training_face_asset(candidate: QueryCandidate, faces_dir: Path) -> Dict[str, Any]:
@@ -4370,12 +4383,6 @@ def _handle_command(payload: Dict[str, Any]) -> Dict[str, Any]:
     if command == "record_preference":
         return _json_response("answer", _record_preference(payload))
     if command == "release_query":
-        timing = payload.get("insert_timings")
-        if isinstance(timing, dict):
-            allowed = ("server_prepare_ms", "donor_open_ms", "extract_ms", "transform_ms", "mask_ms", "total_ms", "rotation_degrees", "clothing_enabled", "rotation_enabled", "combined_transform", "success")
-            numeric = {key: value for key, value in timing.items() if key in allowed
-                       and isinstance(value, (int, float, bool)) and math.isfinite(float(value))}
-            LOGGER.info("[INSERT_TIME] %s", json.dumps(numeric, ensure_ascii=True, sort_keys=True))
         query_id = str(payload.get("query_id") or "")
         with QUERY_LOCK:
             QUERIES.pop(query_id, None)
