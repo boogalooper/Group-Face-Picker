@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 APP_NAME = "Group Face Picker"
-VERSION = "0.6.43"
+VERSION = "0.6.46"
 SETTINGS_SCHEMA_VERSION = 10
 SERVER_INSTANCE_ID = uuid.uuid4().hex[:12]
 CACHE_VERSION = 13
@@ -473,6 +473,8 @@ class QueryContext:
     candidates: List[QueryCandidate]
     recommendation: Dict[str, Any]
     preview_scores: List[Dict[str, Any]]
+    target_selection: Dict[str, int]
+    target_doc_size: Tuple[int, int]
 
 
 class PublicPreferenceScorer:
@@ -3589,6 +3591,7 @@ def _select_child(payload: Dict[str, Any], job_id: Optional[str] = None) -> Dict
         query_id = uuid.uuid4().hex
         context = QueryContext(
             created_at=time.time(),
+            target_selection=dict(selection), target_doc_size=(doc_width, doc_height),
             target_eye_offsets=target_eye_offsets,
             target_kps_offsets=[
                 [point[0] * ref_sx - selection["left"], point[1] * ref_sy - selection["top"]]
@@ -3690,6 +3693,7 @@ def _prepare_crop(payload: Dict[str, Any]) -> Dict[str, Any]:
         "target_eye_offsets": context.target_eye_offsets,
         "target_kps_offsets": context.target_kps_offsets,
         "face_scale_match": bool(live_scale_match),
+        "clothing_alignment": _clothing_correspondences(candidate, context) if _config_bool(payload.get("align_clothing", False), False) else None,
         "target_face_width": float(context.target_face_width),
         "target_face_height": float(context.target_face_height),
         "crop": {
@@ -3701,6 +3705,226 @@ def _prepare_crop(payload: Dict[str, Any]) -> Dict[str, Any]:
         "name": candidate.name,
     }
 
+
+
+def _refine_clothing_points(src: Any, dst: Any, src_mask: Any, dst_mask: Any,
+                            a: Any, b: Any, affine: Any) -> Optional[Tuple[Any, Any]]:
+    """Refine a verified clothing match, never bootstrap from unrelated texture."""
+    import cv2
+    import numpy as np
+
+    try:
+        # Follow the coarse transform first, so LK only estimates subpixel
+        # residual motion and does not confuse rotation with translation.
+        mask = cv2.erode(src_mask, np.ones((9, 9), np.uint8))
+        corners = cv2.goodFeaturesToTrack(src, maxCorners=100, qualityLevel=.02,
+                                         minDistance=7, mask=mask, blockSize=5)
+        extra = corners.reshape(-1, 2) if corners is not None else np.empty((0, 2), np.float32)
+        points = np.concatenate((a, extra)).astype(np.float32)
+        predicted = (points @ affine[:, :2].T + affine[:, 2]).astype(np.float32)
+        height, width = dst.shape
+        inside = ((predicted[:, 0] >= 12) & (predicted[:, 0] < width - 12) &
+                  (predicted[:, 1] >= 12) & (predicted[:, 1] < height - 12))
+        points, predicted = points[inside], predicted[inside]
+        if len(points) < 10:
+            return None
+        xy = np.rint(predicted).astype(int)
+        valid = dst_mask[xy[:, 1], xy[:, 0]] > 0
+        points, predicted = points[valid], predicted[valid]
+        if len(points) < 10:
+            return None
+        warped = cv2.warpAffine(src, affine, (width, height))
+        initial = predicted.reshape(-1, 1, 2)
+        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, .005)
+        tracked, forward, _ = cv2.calcOpticalFlowPyrLK(
+            warped, dst, initial, initial.copy(), winSize=(21, 21), maxLevel=1,
+            criteria=criteria, flags=cv2.OPTFLOW_USE_INITIAL_FLOW)
+        if tracked is None or forward is None:
+            return None
+        back, reverse, _ = cv2.calcOpticalFlowPyrLK(
+            dst, warped, tracked, initial.copy(), winSize=(21, 21), maxLevel=1,
+            criteria=criteria, flags=cv2.OPTFLOW_USE_INITIAL_FLOW)
+        if back is None or reverse is None:
+            return None
+        tracked = tracked.reshape(-1, 2)
+        keep = (forward.ravel() > 0) & (reverse.ravel() > 0)
+        keep &= np.isfinite(tracked).all(axis=1) & np.isfinite(back.reshape(-1, 2)).all(axis=1)
+        keep &= np.linalg.norm(back.reshape(-1, 2) - predicted, axis=1) <= .5
+        keep &= np.linalg.norm(tracked - predicted, axis=1) <= 3
+        keep &= ((tracked[:, 0] >= 12) & (tracked[:, 0] < width - 12) &
+                 (tracked[:, 1] >= 12) & (tracked[:, 1] < height - 12))
+        # Contrast-normalized texture comparison rejects moving folds and
+        # false locally consistent tracks; a brightness offset is allowed.
+        for i in np.flatnonzero(keep):
+            x, y = tracked[i]
+            if dst_mask[int(round(y)), int(round(x))] == 0:
+                keep[i] = False
+                continue
+            first = cv2.getRectSubPix(warped, (11, 11), tuple(float(v) for v in predicted[i])).astype(np.float32)
+            second = cv2.getRectSubPix(dst, (11, 11), (float(x), float(y))).astype(np.float32)
+            first -= first.mean()
+            second -= second.mean()
+            norm = float(np.linalg.norm(first) * np.linalg.norm(second))
+            if norm < 25 or float(np.sum(first * second)) / norm < .85:
+                keep[i] = False
+        points, tracked = points[keep], tracked[keep]
+        if len(points) < 10:
+            return None
+        refined, inliers = cv2.estimateAffinePartial2D(points, tracked, method=cv2.RANSAC,
+                                                       ransacReprojThreshold=1.0, maxIters=1000)
+        if refined is None or inliers is None:
+            return None
+        good = inliers.ravel().astype(bool)
+        points, tracked = points[good], tracked[good]
+        if len(points) < 10 or good.mean() < .75:
+            return None
+        refined_scale = float(np.hypot(refined[0, 0], refined[1, 0]))
+        refined_angle = math.degrees(math.atan2(refined[1, 0], refined[0, 0]))
+        if not .90 <= refined_scale <= 1.10 or abs(refined_angle) > 8:
+            return None
+        change = refined[:, :2] @ np.array([192., 92.]) + refined[:, 2] - (
+            affine[:, :2] @ np.array([192., 92.]) + affine[:, 2])
+        if float(np.linalg.norm(change)) > 2 or float(np.ptp(points[:, 0])) < 40 or float(np.ptp(points[:, 1])) < 20:
+            return None
+        residual = points @ refined[:, :2].T + refined[:, 2] - tracked
+        # Keep the verified ORB fit unless the denser fit is also more precise.
+        old_residual = a @ affine[:, :2].T + affine[:, 2] - b
+        if float(np.median(np.linalg.norm(residual, axis=1))) > min(.6, float(np.median(np.linalg.norm(old_residual, axis=1))) + .05):
+            return None
+        return points, tracked
+    except Exception as exc:
+        LOGGER.debug("[ALIGN] Subpixel refinement skipped: %s", exc)
+        return None
+
+
+def _clothing_correspondences(candidate: QueryCandidate, context: QueryContext) -> Optional[Dict[str, Any]]:
+    """Match only neck/clothing texture; no extra neural inference."""
+    import cv2
+    import numpy as np
+    reference = next((item for item in context.candidates if item.is_active), None)
+    if reference is None:
+        return None
+
+    def patch(item: QueryCandidate):
+        eye = np.asarray(item.face.kps[:2], dtype=np.float64)
+        distance = float(np.linalg.norm(eye[1] - eye[0]))
+        if distance < 4:
+            raise ValueError("eyes too small")
+        midpoint = eye.mean(axis=0)
+        source, _, _ = _open_region_source(Path(item.source_path), min(1.0, 160.0 / distance))
+        try:
+            # Larger than the face preview: includes neckline and shoulders.
+            sx, sy = source.width / item.analysis_width, source.height / item.analysis_height
+            factor = 80.0 / distance
+            # Crop in PIL before converting to NumPy: never allocate a full
+            # photograph as RGB/BGR just for the clothing matcher.
+            left = max(0, int(math.floor((midpoint[0] - 192 / factor) * sx)))
+            top = max(0, int(math.floor((midpoint[1] - 92 / factor) * sy)))
+            right = min(source.width, int(math.ceil((midpoint[0] + 192 / factor) * sx)))
+            bottom = min(source.height, int(math.ceil((midpoint[1] + 292 / factor) * sy)))
+            if right <= left or bottom <= top:
+                raise ValueError("clothing region outside image")
+            matrix = np.array([[factor / sx, 0, 192 - midpoint[0] * factor + left * factor / sx],
+                               [0, factor / sy, 92 - midpoint[1] * factor + top * factor / sy]], dtype=np.float32)
+            with source.crop((left, top, right, bottom)) as piece:
+                with piece.convert("L") as converted:
+                    gray = np.asarray(converted).copy()
+            out = cv2.warpAffine(gray, matrix, (384, 384))
+            valid = cv2.warpAffine(np.full(gray.shape, 255, dtype=np.uint8), matrix, (384, 384))
+        finally:
+            source.close()
+        mask = np.zeros((384, 384), dtype=np.uint8)
+        chin = int(92 + (item.face.bbox[3] - midpoint[1]) * factor + 4)
+        mask[max(145, chin):350, 65:319] = 255
+        mask = cv2.bitwise_and(mask, valid)
+        if item.is_active:
+            # Clothing outside the actual insertion selection cannot help its seam.
+            sel = context.target_selection
+            doc_w, doc_h = context.target_doc_size
+            x = (np.arange(384) - 192) / factor + midpoint[0]
+            y = (np.arange(384) - 92) / factor + midpoint[1]
+            inside = ((x * doc_w / item.analysis_width >= sel["left"]) &
+                      (x * doc_w / item.analysis_width <= sel["right"]))[None, :] & (
+                      (y * doc_h / item.analysis_height >= sel["top"]) &
+                      (y * doc_h / item.analysis_height <= sel["bottom"]))[:, None]
+            mask[~inside] = 0
+        return out, mask, midpoint, factor
+
+    started = time.perf_counter()
+    matched_at = None
+    refine_started = None
+    timings = {"read_ms": 0.0, "match_ms": 0.0, "refine_ms": 0.0}
+    try:
+        src, src_mask, src_mid, src_factor = patch(candidate)
+        dst, dst_mask, dst_mid, dst_factor = patch(reference)
+        matched_at = time.perf_counter()
+        timings["read_ms"] = (matched_at-started)*1000
+        orb = cv2.ORB_create(nfeatures=1000, fastThreshold=10, edgeThreshold=15)
+        sk, sd = orb.detectAndCompute(src, src_mask)
+        tk, td = orb.detectAndCompute(dst, dst_mask)
+        if sd is None or td is None:
+            return None
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+        forward = matcher.knnMatch(sd, td, k=2)
+        reverse = matcher.knnMatch(td, sd, k=2)
+        back = {pair[0].queryIdx: pair[0].trainIdx for pair in reverse
+                if len(pair) == 2 and pair[0].distance < .75 * pair[1].distance}
+        matches = [pair[0] for pair in forward if len(pair) == 2
+                   and pair[0].distance < .75 * pair[1].distance
+                   and back.get(pair[0].trainIdx) == pair[0].queryIdx]
+        if len(matches) < 12:
+            return None
+        a = np.float32([sk[m.queryIdx].pt for m in matches])
+        b = np.float32([tk[m.trainIdx].pt for m in matches])
+        affine, inliers = cv2.estimateAffinePartial2D(a, b, method=cv2.RANSAC,
+                                                     ransacReprojThreshold=2.5, maxIters=1000)
+        if affine is None or inliers is None:
+            return None
+        keep = inliers.ravel().astype(bool)
+        a, b = a[keep], b[keep]
+        scale = float(np.hypot(affine[0, 0], affine[1, 0]))
+        angle = math.degrees(math.atan2(affine[1, 0], affine[0, 0]))
+        displacement = np.linalg.norm(affine[:, :2] @ np.array([192., 92.]) + affine[:, 2] - [192., 92.])
+        if (len(a) < 10 or len(a) / len(matches) < .65 or
+                not .90 <= scale <= 1.10 or abs(angle) > 8 or displacement > 24 or
+                float(np.ptp(a[:, 0])) < 40 or float(np.ptp(a[:, 1])) < 20):
+            return None
+        refine_started = time.perf_counter()
+        timings["match_ms"] = (refine_started-matched_at)*1000
+        refined = _refine_clothing_points(src, dst, src_mask, dst_mask, a, b, affine)
+        timings["refine_ms"] = (time.perf_counter()-refine_started)*1000
+        refined_used = refined is not None
+        if refined_used:
+            a, b = refined
+        # Prefer neckline details without excluding supporting shoulder points.
+        # Spatial sampling avoids taking only the first cluster of ORB points.
+        chin = 92 + (candidate.face.bbox[3] - src_mid[1]) * src_factor + 4
+        weights = 1 + 2 * np.exp(-np.square((a[:, 1] - chin) / 65.0))
+        if len(a) > 80:
+            chosen = np.linspace(0, len(a) - 1, 80).astype(int)
+            a, b, weights = a[chosen], b[chosen], weights[chosen]
+        source_points = (a - [192., 92.]) / src_factor + src_mid
+        target_points = (b - [192., 92.]) / dst_factor + dst_mid
+        dw, dh = context.target_doc_size
+        target_points *= [dw / reference.analysis_width, dh / reference.analysis_height]
+        target_points -= [context.target_selection["left"], context.target_selection["top"]]
+        LOGGER.info("[ALIGN] Clothing match: %d points, coarse=%d matches, angle=%.2f, subpixel=%s", len(a), len(matches), angle, refined_used)
+        return {"source_normalized": (source_points / [candidate.analysis_width, candidate.analysis_height]).tolist(),
+                "target_offsets": target_points.tolist(), "weights": weights.tolist(),
+                "subpixel_refined": refined_used}
+    except Exception as exc:
+        # Alignment is optional; texture/decoder errors must not block insertion.
+        LOGGER.warning("[ALIGN] Clothing refinement unavailable: %s", exc)
+        return None
+    finally:
+        finished = time.perf_counter()
+        if matched_at is None:
+            timings["read_ms"] = (finished-started)*1000
+        elif refine_started is None:
+            timings["match_ms"] = (finished-matched_at)*1000
+        LOGGER.info("[ALIGN_TIME] read=%.1fms match=%.1fms refine=%.1fms total=%.1fms",
+                    timings["read_ms"], timings["match_ms"], timings["refine_ms"],
+                    (time.perf_counter()-started)*1000)
 
 
 def _training_face_asset(candidate: QueryCandidate, faces_dir: Path) -> Dict[str, Any]:
@@ -4146,6 +4370,12 @@ def _handle_command(payload: Dict[str, Any]) -> Dict[str, Any]:
     if command == "record_preference":
         return _json_response("answer", _record_preference(payload))
     if command == "release_query":
+        timing = payload.get("insert_timings")
+        if isinstance(timing, dict):
+            allowed = ("server_prepare_ms", "donor_open_ms", "extract_ms", "transform_ms", "mask_ms", "total_ms", "rotation_degrees", "clothing_enabled", "rotation_enabled", "combined_transform", "success")
+            numeric = {key: value for key, value in timing.items() if key in allowed
+                       and isinstance(value, (int, float, bool)) and math.isfinite(float(value))}
+            LOGGER.info("[INSERT_TIME] %s", json.dumps(numeric, ensure_ascii=True, sort_keys=True))
         query_id = str(payload.get("query_id") or "")
         with QUERY_LOCK:
             QUERIES.pop(query_id, None)

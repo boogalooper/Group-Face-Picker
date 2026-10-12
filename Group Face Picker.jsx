@@ -18,7 +18,7 @@ var GFP_SHIFT_LAUNCH = !!ScriptUI.environment.keyboardState.shiftKey;
 
 var GFP_NAME = "Group Face Picker";
 var GFP_UUID = "9a189321-e07f-40ff-8394-156a4bd48cf5";
-var GFP_VERSION = "0.6.43";
+var GFP_VERSION = "0.6.46";
 var GFP_DEFAULT_HOST = "127.0.0.1";
 var GFP_DEFAULT_PORT_SEND = 6420;
 var GFP_DEFAULT_PORT_LISTEN = 6421;
@@ -189,7 +189,7 @@ function gfpMain() {
                 }
             }
         } finally {
-            gfpApiFire({ command: "release_query", query_id: payload.query_id });
+            gfpApiFire({ command: "release_query", query_id: payload.query_id, insert_timings: payload.insert_timings || null });
         }
 
         // Отмена главного окна всегда оставляет целевой документ в нейтральном
@@ -546,6 +546,63 @@ function gfpFacePlacement(eyeX, eyeY, targetX, targetY, scale, width, height, so
     var bottom = Math.min(sourceHeight, Math.ceil(y + height / scale) + margin);
     return {left: left, top: top, right: right, bottom: bottom,
         offsetX: (left - x) * scale, offsetY: (top - y) * scale};
+}
+
+function gfpFitClothing(points, targets, scale, allowScale, allowRotation, eyes, targetEyes, weights) {
+    if (points.length < 10 || points.length != targets.length) return null;
+    for(var valid=0;valid<points.length;valid++){
+        if(!points[valid]||!targets[valid]||!isFinite(points[valid][0]+points[valid][1]+targets[valid][0]+targets[valid][1]))return null;
+    }
+    var sx=0, sy=0, tx=0, ty=0, totalWeight=0, i;
+    function weight(index) {
+        var value=weights && weights.length==points.length ? Number(weights[index]) : 1;
+        return isFinite(value) && value>0 ? Math.min(3,value) : 1;
+    }
+    for(i=0;i<points.length;i++){
+        var wi=weight(i); totalWeight+=wi;
+        sx+=wi*points[i][0];sy+=wi*points[i][1];tx+=wi*targets[i][0];ty+=wi*targets[i][1];
+    }
+    sx/=totalWeight;sy/=totalWeight;tx/=totalWeight;ty/=totalWeight;
+    var dot=0,cross=0,den=0;
+    for(i=0;i<points.length;i++){
+        var x=points[i][0]-sx,y=points[i][1]-sy,u=targets[i][0]-tx,v=targets[i][1]-ty;
+        var wi=weight(i); dot+=wi*(x*u+y*v);cross+=wi*(x*v-y*u);den+=wi*(x*x+y*y);
+    }
+    if(!(den>1))return null;
+    var angle=allowRotation?Math.atan2(cross,dot):0;
+    var fittedScale=allowScale?(dot*Math.cos(angle)+cross*Math.sin(angle))/den:scale;
+    if(!isFinite(fittedScale)||fittedScale<scale*.95||fittedScale>scale*1.05||Math.abs(angle)>8*Math.PI/180)return null;
+    var c=Math.cos(angle)*fittedScale,s=Math.sin(angle)*fittedScale,error=0;
+    for(i=0;i<points.length;i++){
+        var dx=tx+c*(points[i][0]-sx)-s*(points[i][1]-sy)-targets[i][0];
+        var dy=ty+s*(points[i][0]-sx)+c*(points[i][1]-sy)-targets[i][1];
+        error+=weight(i)*(dx*dx+dy*dy);
+    }
+    var d=gfpDistance(targetEyes[0][0],targetEyes[0][1],targetEyes[1][0],targetEyes[1][1]);
+    if(!(d>1)||Math.sqrt(error/totalWeight)>.05*d)return null;
+    for(i=0;i<2;i++){
+        var ex=tx+c*(eyes[i][0]-sx)-s*(eyes[i][1]-sy);
+        var ey=ty+s*(eyes[i][0]-sx)+c*(eyes[i][1]-sy);
+        if(gfpDistance(ex,ey,targetEyes[i][0],targetEyes[i][1])>.30*d)return null;
+    }
+    return {sourceX:sx,sourceY:sy,targetX:tx,targetY:ty,scale:fittedScale,angle:angle};
+}
+
+function gfpAffinePlacement(transform, width, height, sourceWidth, sourceHeight) {
+    var c=Math.cos(transform.angle),s=Math.sin(transform.angle),scale=transform.scale;
+    var corners=[[0,0],[width,0],[width,height],[0,height]],left=sourceWidth,top=sourceHeight,right=0,bottom=0;
+    for(var i=0;i<4;i++){
+        var dx=(corners[i][0]-transform.targetX)/scale,dy=(corners[i][1]-transform.targetY)/scale;
+        var x=transform.sourceX+c*dx+s*dy,y=transform.sourceY-s*dx+c*dy;
+        left=Math.min(left,x);top=Math.min(top,y);right=Math.max(right,x);bottom=Math.max(bottom,y);
+    }
+    if(!isFinite(left+top+right+bottom)||left<0||top<0||right>sourceWidth||bottom>sourceHeight)throw new Error("Поворот или уточнение по одежде выводит фрагмент за границы исходного кадра.");
+    var margin=Math.ceil(2/Math.min(1,scale));
+    left=Math.max(0,Math.floor(left)-margin);top=Math.max(0,Math.floor(top)-margin);
+    right=Math.min(sourceWidth,Math.ceil(right)+margin);bottom=Math.min(sourceHeight,Math.ceil(bottom)+margin);
+    var cx=(left+right)*.5-transform.sourceX,cy=(top+bottom)*.5-transform.sourceY;
+    return {left:left,top:top,right:right,bottom:bottom,
+        centerX:transform.targetX+scale*(c*cx-s*cy),centerY:transform.targetY+scale*(s*cx+c*cy)};
 }
 
 function gfpPreviewOrder(matches, items, mode) {
@@ -918,6 +975,21 @@ function gfpRecordPreference(payload, index) {
     }
 }
 
+function gfpTransformLayer(scale, angle, offsetX, offsetY) {
+    // Same center convention as Layer.transform in img2img helper.
+    // One resampling pass for scale/rotation/translation together.
+    var desc = new ActionDescriptor();
+    desc.putEnumerated(GFP_S2T("freeTransformCenterState"), GFP_S2T("quadCenterState"), GFP_S2T("QCSAverage"));
+    var offset = new ActionDescriptor();
+    offset.putUnitDouble(GFP_S2T("horizontal"), GFP_S2T("pixelsUnit"), offsetX);
+    offset.putUnitDouble(GFP_S2T("vertical"), GFP_S2T("pixelsUnit"), offsetY);
+    desc.putObject(GFP_S2T("offset"), GFP_S2T("offset"), offset);
+    desc.putUnitDouble(GFP_S2T("width"), GFP_S2T("percentUnit"), scale*100);
+    desc.putUnitDouble(GFP_S2T("height"), GFP_S2T("percentUnit"), scale*100);
+    desc.putUnitDouble(GFP_S2T("angle"), GFP_S2T("angleUnit"), angle);
+    executeAction(GFP_S2T("transform"), desc, DialogModes.NO);
+}
+
 function gfpInsertCandidate(payload, index) {
     if (index < 0 || index >= payload.matches.length) {
         return false;
@@ -929,9 +1001,16 @@ function gfpInsertCandidate(payload, index) {
     var sourceWasAlreadyOpen = false;
     var sourceOpenedByScript = false;
 
+    var insertionStarted = (new Date()).getTime(), stageStarted = insertionStarted;
+    var timings = {clothing_enabled:GFP_SETTINGS.align_clothing === true, rotation_enabled:GFP_SETTINGS.allow_rotation === true};
+    payload.insert_timings = timings;
+    function finishStage(name) {
+        var now = (new Date()).getTime(); timings[name] = now-stageStarted; stageStarted=now;
+    }
     try {
         var response = gfpApiRequest({
             command: "prepare_crop",
+            align_clothing: GFP_SETTINGS.align_clothing === true,
             query_id: payload.query_id,
             index: index,
             face_scale_match: payload.face_scale_match === true
@@ -941,6 +1020,7 @@ function gfpInsertCandidate(payload, index) {
             throw new Error("Python-сервер не вернул координаты исходного фрагмента.");
         }
 
+        finishStage("server_prepare_ms");
         var item = response.message;
         var target = gfpSelectDocumentById(payload.target.document_id);
         targetHistory = target.activeHistoryState;
@@ -967,6 +1047,7 @@ function gfpInsertCandidate(payload, index) {
 
         app.activeDocument = sourceDocument;
         sourceHistory = sourceDocument.activeHistoryState;
+        finishStage("donor_open_ms");
 
         var expectedWidth = Number(payload.target.selection.right) - Number(payload.target.selection.left);
         var expectedHeight = Number(payload.target.selection.bottom) - Number(payload.target.selection.top);
@@ -983,6 +1064,7 @@ function gfpInsertCandidate(payload, index) {
         if (!item.is_raw && (openedSourceWidth != analysisSourceWidth || openedSourceHeight != analysisSourceHeight)) {
             throw new Error("Размер открытого исходного кадра не совпадает с размером, использованным распознаванием.");
         }
+        var affinePlacement = null, rotationDegrees = 0;
         var placementOffsetX = 0;
         var placementOffsetY = 0;
         // Recompute from actual document dimensions in both insertion modes.
@@ -1049,14 +1131,36 @@ function gfpInsertCandidate(payload, index) {
                 placement = gfpFacePlacement(sourceAnchorX, sourceAnchorY, targetAnchorX, targetAnchorY,
                     faceScale, expectedWidth, expectedHeight, openedSourceWidth, openedSourceHeight);
             }
+            var transform = null;
+            if (item.clothing_alignment) {
+                var clothingPoints = [], clothing = item.clothing_alignment;
+                for (var ci=0; ci<clothing.source_normalized.length; ci++) clothingPoints.push([
+                    Number(clothing.source_normalized[ci][0])*openedSourceWidth,
+                    Number(clothing.source_normalized[ci][1])*openedSourceHeight]);
+                transform = gfpFitClothing(clothingPoints, clothing.target_offsets, faceScale,
+                    faceScaleEnabled, GFP_SETTINGS.allow_rotation === true, sourcePoints, offsets, clothing.weights);
+            }
+            if (!transform && GFP_SETTINGS.allow_rotation === true) {
+                var angle = Math.atan2(Number(offsets[1][1])-Number(offsets[0][1]), Number(offsets[1][0])-Number(offsets[0][0])) - Math.atan2(eye1y-eye0y,eye1x-eye0x);
+                if (Math.abs(angle)<=5*Math.PI/180) transform = {sourceX:sourceAnchorX,sourceY:sourceAnchorY,
+                    targetX:targetAnchorX+fit.offsetX,targetY:targetAnchorY+fit.offsetY,scale:faceScale,angle:angle};
+            }
+            if (transform) {
+                try {
+                    affinePlacement = gfpAffinePlacement(transform,expectedWidth,expectedHeight,openedSourceWidth,openedSourceHeight);
+                    placement = affinePlacement; faceScale = transform.scale; rotationDegrees = transform.angle*180/Math.PI;
+                } catch (optionalPlacementError) {
+                    affinePlacement = null; rotationDegrees = 0; // retain the reliable face-only crop
+                }
+            }
             cropLeft = placement.left;
             cropTop = placement.top;
             cropRight = placement.right;
             cropBottom = placement.bottom;
             sourceCropWidth = cropRight - cropLeft;
             sourceCropHeight = cropBottom - cropTop;
-            placementOffsetX = placement.offsetX;
-            placementOffsetY = placement.offsetY;
+            placementOffsetX = affinePlacement ? 0 : placement.offsetX;
+            placementOffsetY = affinePlacement ? 0 : placement.offsetY;
         }
 
         sourceDocument.crop([
@@ -1087,6 +1191,7 @@ function gfpInsertCandidate(payload, index) {
         app.activeDocument = target;
         target.activeLayer = insertedLayer;
 
+        finishStage("extract_ms");
         var layerBounds = insertedLayer.bounds;
         var layerLeft = gfpPx(layerBounds[0]);
         var layerTop = gfpPx(layerBounds[1]);
@@ -1095,35 +1200,51 @@ function gfpInsertCandidate(payload, index) {
         var layerWidth = Math.round(layerRight - layerLeft);
         var layerHeight = Math.round(layerBottom - layerTop);
 
-        if (faceScaleEnabled && faceScale != 1.0) {
-            // Равномерный масштаб — единственная дополнительная трансформация.
-            // Поворот не выполняется. TOPLEFT соответствует геометрии crop:
-            // offsets/scale были рассчитаны относительно его верхнего левого угла.
-            insertedLayer.resize(faceScale * 100.0, faceScale * 100.0, AnchorPosition.TOPLEFT);
-            layerBounds = insertedLayer.bounds;
-            layerLeft = gfpPx(layerBounds[0]);
-            layerTop = gfpPx(layerBounds[1]);
-            layerRight = gfpPx(layerBounds[2]);
-            layerBottom = gfpPx(layerBounds[3]);
-            layerWidth = Math.round(layerRight - layerLeft);
-            layerHeight = Math.round(layerBottom - layerTop);
-            // crop использует ceil(target/scale), поэтому после равномерного
-            // увеличения слой должен полностью перекрывать исходное выделение.
-            if (layerWidth < expectedWidth || layerHeight < expectedHeight) {
+        var combinedAffine = affinePlacement && (Math.abs(rotationDegrees)>0.0001 || faceScaleEnabled && faceScale!=1.0);
+        if (combinedAffine) {
+            gfpTransformLayer(faceScale, rotationDegrees,
+                Number(payload.target.selection.left)+affinePlacement.centerX-(layerLeft+layerRight)*.5,
+                Number(payload.target.selection.top)+affinePlacement.centerY-(layerTop+layerBottom)*.5);
+        } else {
+            if (faceScaleEnabled && faceScale != 1.0) {
+                // Resize the extracted source before optional rotation.
+                insertedLayer.resize(faceScale * 100.0, faceScale * 100.0, AnchorPosition.TOPLEFT);
+                layerBounds = insertedLayer.bounds;
+                layerLeft = gfpPx(layerBounds[0]);
+                layerTop = gfpPx(layerBounds[1]);
+                layerRight = gfpPx(layerBounds[2]);
+                layerBottom = gfpPx(layerBounds[3]);
+                layerWidth = Math.round(layerRight - layerLeft);
+                layerHeight = Math.round(layerBottom - layerTop);
+                // crop использует ceil(target/scale), поэтому после равномерного
+                // увеличения слой должен полностью перекрывать исходное выделение.
+                if (!affinePlacement && (layerWidth < expectedWidth || layerHeight < expectedHeight)) {
+                    target.activeHistoryState = targetHistory;
+                    targetHistory = null;
+                    throw new Error("Photoshop округлил масштабированный слой меньше целевой области. Операция отменена.");
+                }
+            } else if (layerWidth != sourceCropWidth || layerHeight != sourceCropHeight) {
                 target.activeHistoryState = targetHistory;
                 targetHistory = null;
-                throw new Error("Photoshop округлил масштабированный слой меньше целевой области. Операция отменена.");
+                throw new Error("Photoshop изменил размер вставленного слоя. Операция отменена: масштабирование выключено.");
             }
-        } else if (layerWidth != sourceCropWidth || layerHeight != sourceCropHeight) {
-            target.activeHistoryState = targetHistory;
-            targetHistory = null;
-            throw new Error("Photoshop изменил размер вставленного слоя. Операция отменена: масштабирование выключено.");
-        }
 
-        insertedLayer.translate(
-            UnitValue(Number(payload.target.selection.left) + placementOffsetX - layerLeft, "px"),
-            UnitValue(Number(payload.target.selection.top) + placementOffsetY - layerTop, "px")
-        );
+            if (affinePlacement) {
+                layerBounds = insertedLayer.bounds;
+                var centerX=(gfpPx(layerBounds[0])+gfpPx(layerBounds[2]))*.5;
+                var centerY=(gfpPx(layerBounds[1])+gfpPx(layerBounds[3]))*.5;
+                insertedLayer.translate(UnitValue(Number(payload.target.selection.left)+affinePlacement.centerX-centerX,"px"),
+                    UnitValue(Number(payload.target.selection.top)+affinePlacement.centerY-centerY,"px"));
+            } else {
+                insertedLayer.translate(
+                    UnitValue(Number(payload.target.selection.left) + placementOffsetX - layerLeft, "px"),
+                    UnitValue(Number(payload.target.selection.top) + placementOffsetY - layerTop, "px")
+                );
+            }
+        }
+        timings.rotation_degrees = rotationDegrees;
+        timings.combined_transform = !!combinedAffine;
+        finishStage("transform_ms");
         insertedLayer.name = "Face from " + String(item.name);
 
         if (payload.target.selection_mask) {
@@ -1141,8 +1262,13 @@ function gfpInsertCandidate(payload, index) {
             target.activeLayer = insertedLayer;
             gfpMakeSelectionMask();
         }
+        finishStage("mask_ms");
+        timings.total_ms = (new Date()).getTime()-insertionStarted;
+        timings.success = true;
         return true;
     } catch (insertError) {
+        timings.total_ms = (new Date()).getTime()-insertionStarted;
+        timings.success = false;
         try {
             if (sourceDocument) {
                 app.activeDocument = sourceDocument;
@@ -1549,6 +1675,8 @@ function gfpDefaultConfig() {
         analysis_quality: "balanced",
         group_boundary_search: false,
         face_scale_match: false,
+        align_clothing: false,
+        allow_rotation: false,
         collect_statistics: false,
         preview_sort: "filename",
         recommendation_model: "public"
@@ -1644,6 +1772,8 @@ function gfpNormalizeConfig(raw) {
     }
     cfg.group_boundary_search = gfpBooleanValue(cfg.group_boundary_search, false);
     cfg.face_scale_match = gfpBooleanValue(cfg.face_scale_match, false);
+    cfg.align_clothing = gfpBooleanValue(cfg.align_clothing, false);
+    cfg.allow_rotation = gfpBooleanValue(cfg.allow_rotation, false);
     cfg.collect_statistics = gfpBooleanValue(cfg.collect_statistics, false);
     cfg.preview_sort = gfpTrimString(cfg.preview_sort || "filename").toLowerCase();
     if (cfg.preview_sort != "filename" && cfg.preview_sort != "similarity" && cfg.preview_sort != "attractiveness") {
@@ -1834,6 +1964,8 @@ function gfpShowSettingsDialog() {
             // face_scale_match is an operational Photoshop-side option shown in
             // the chooser, not a server setting. Preserve the client value.
             serverSettings.face_scale_match = localCurrent.face_scale_match === true;
+            serverSettings.align_clothing = localCurrent.align_clothing === true;
+            serverSettings.allow_rotation = localCurrent.allow_rotation === true;
             current = gfpNormalizeConfig(serverSettings);
             liveEngine = live.message.engine || null;
             liveRecommendationBackends = live.message.recommendation_backends || null;
@@ -2029,6 +2161,15 @@ function gfpShowSettingsDialog() {
     }
     dlRecommendation.helpTip += "\n" + recommendationStatusText;
 
+    var placementPanel = w.add("panel", undefined, "Совмещение при вставке");
+    placementPanel.orientation = "column"; placementPanel.alignChildren = ["left", "top"]; placementPanel.margins = 8; placementPanel.spacing = 4;
+    var chClothing = placementPanel.add("checkbox", undefined, "Уточнять по шее и одежде");
+    chClothing.value = current.align_clothing === true;
+    chClothing.helpTip = "Сопоставляет детали воротника и плеч выбранного дубля. При неуверенном совпадении используется лицо. Читает два кадра перед вставкой.";
+    var chRotation = placementPanel.add("checkbox", undefined, "Разрешить небольшой поворот");
+    chRotation.value = current.allow_rotation === true;
+    chRotation.helpTip = "До 8° по одежде при уверенном совпадении, иначе до 5° по линии глаз. Если не хватает краёв исходного кадра, используется совмещение без поворота.";
+
     var chCollectStatistics = w.add("checkbox", undefined, "Собирать статистику для обучения");
     chCollectStatistics.value = current.collect_statistics === true;
     chCollectStatistics.helpTip = "После успешной вставки сохраняется базовая пара: выбранное лицо > текущее лицо. Если вы заменили автоматически предложенный кадр, обучатель дополнительно использует: выбранное лицо > отвергнутая рекомендация. Данные находятся в training_data рядом с Python-сервером.";
@@ -2055,6 +2196,8 @@ function gfpShowSettingsDialog() {
             analysis_quality: selectedAnalysisQuality,
             group_boundary_search: chGroupBoundarySearch.value === true,
             face_scale_match: current.face_scale_match === true,
+            align_clothing: chClothing.value === true,
+            allow_rotation: chRotation.value === true,
             collect_statistics: chCollectStatistics.value === true,
             preview_sort: current.preview_sort,
             recommendation_model: gfpReadValueDropdown(dlRecommendation, current.recommendation_model || "public")
@@ -2077,7 +2220,7 @@ function gfpShowSettingsDialog() {
     // These are Photoshop-side options. Never send shadow copies into the
     // Python server config: their values travel only with the operation that
     // uses them.
-    try { delete configForServer.face_scale_match; } catch (_) {}
+    try { delete configForServer.face_scale_match; delete configForServer.align_clothing; delete configForServer.allow_rotation; } catch (_) {}
     try { delete configForServer.collect_statistics; } catch (_) {}
     // get_settings already proved that the current server is reachable. Avoid
     // an immediate second ping on every Settings save. Only re-probe if the
@@ -2138,6 +2281,8 @@ function gfpShowSettingsDialog() {
                             rollbackConfig.server_host = localCurrent.server_host;
                             rollbackConfig.server_port = localCurrent.server_port;
                             rollbackConfig.face_scale_match = localCurrent.face_scale_match === true;
+                            rollbackConfig.align_clothing = localCurrent.align_clothing === true;
+                            rollbackConfig.allow_rotation = localCurrent.allow_rotation === true;
                             // collect_statistics is a Photoshop-side option and is
                             // absent from server settings. Preserve it explicitly
                             // during rollback, just like face_scale_match.
@@ -2189,6 +2334,8 @@ function gfpShowSettingsDialog() {
         localAuthoritative.server_host = resultConfig.server_host;
         localAuthoritative.server_port = resultConfig.server_port;
         localAuthoritative.face_scale_match = resultConfig.face_scale_match === true;
+        localAuthoritative.align_clothing = resultConfig.align_clothing === true;
+        localAuthoritative.allow_rotation = resultConfig.allow_rotation === true;
         localAuthoritative.collect_statistics = resultConfig.collect_statistics === true;
         gfpSaveConfig(localAuthoritative);
         var restartRequired = !!(serverResponse && serverResponse.type == "answer" && serverResponse.message && serverResponse.message.restart_required);
@@ -2215,9 +2362,11 @@ function gfpShowSettingsDialog() {
     offlineConfig.server_host = resultConfig.server_host;
     offlineConfig.server_port = resultConfig.server_port;
     offlineConfig.collect_statistics = resultConfig.collect_statistics === true;
+    offlineConfig.align_clothing = resultConfig.align_clothing === true;
+    offlineConfig.allow_rotation = resultConfig.allow_rotation === true;
     gfpSaveConfig(offlineConfig);
     gfpApplyConfig(offlineConfig);
-    alert("Python-сервер сейчас недоступен. Сохранены адрес/порт подключения Photoshop и локальная галочка сбора статистики.\n\nОстальные параметры не изменены: откройте настройки после восстановления соединения и сохраните их на работающем сервере.", GFP_NAME, true);
+    alert("Python-сервер сейчас недоступен. Сохранены адрес/порт подключения Photoshop, параметры совмещения и галочка сбора статистики.\n\nОстальные параметры не изменены: откройте настройки после восстановления соединения и сохраните их на работающем сервере.", GFP_NAME, true);
     return true;
 }
 
