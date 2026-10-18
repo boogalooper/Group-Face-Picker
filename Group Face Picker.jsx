@@ -18,7 +18,7 @@ var GFP_SHIFT_LAUNCH = !!ScriptUI.environment.keyboardState.shiftKey;
 
 var GFP_NAME = "Group Face Picker";
 var GFP_UUID = "9a189321-e07f-40ff-8394-156a4bd48cf5";
-var GFP_VERSION = "0.6.49";
+var GFP_VERSION = "0.6.52";
 var GFP_DEFAULT_HOST = "127.0.0.1";
 var GFP_DEFAULT_PORT_SEND = 6420;
 var GFP_DEFAULT_PORT_LISTEN = 6421;
@@ -44,6 +44,7 @@ var GFP_SERVER_START_CANCELLED = false;
 var GFP_SERVER_START_TIMEOUT = 120000;
 var GFP_LAST_SERVER_LAUNCHER = "";
 var GFP_S2T = stringIDToTypeID;
+var GFP_AM = new GFPActionManager();
 var GFP_SETTINGS = gfpLoadConfig();
 gfpApplyConfig(GFP_SETTINGS);
 
@@ -51,7 +52,7 @@ try {
     // Как в img2img helper: Shift действует только на текущий запуск.
     // Для Group Face Picker это короткий путь непосредственно к настройкам;
     // основной поиск/вставка в этот запуск не выполняются.
-    if (GFP_SHIFT_LAUNCH || ScriptUI.environment.keyboardState.shiftKey || !app.documents.length) {
+    if (GFP_SHIFT_LAUNCH || ScriptUI.environment.keyboardState.shiftKey || !GFP_AM.documentCount()) {
         gfpShowSettingsDialog();
     } else {
         gfpMain();
@@ -80,7 +81,7 @@ function gfpWritePlaybackParameters() {
 }
 
 function gfpMain() {
-    if (!app.documents.length) {
+    if (!GFP_AM.documentCount()) {
         throw new Error("Откройте групповую фотографию и выделите лицо ребёнка.");
     }
 
@@ -269,81 +270,38 @@ function gfpPollSelectionJob() {
 }
 
 function gfpReadPhotoshopState() {
-    var doc = app.activeDocument;
-
-    if (doc.mode != DocumentMode.RGB) {
+    var info = GFP_AM.documentInfo(), descriptor = info.descriptor;
+    var mode = descriptor.getEnumerationValue(GFP_S2T("mode"));
+    if (mode != GFP_S2T("RGBColor") && mode != GFP_S2T("RGBColorMode")) {
         throw new Error("Активный документ должен быть в режиме RGB.");
     }
-
-    var sourceFile = null;
-
-    try {
-        sourceFile = doc.fullName;
-    } catch (e) {
-        sourceFile = null;
-    }
-
+    var sourceFile = info.file;
     if (!sourceFile || !sourceFile.exists) {
         throw new Error("Активный документ должен быть открыт из существующего файла на диске.");
     }
-
-    var quickMaskActive = gfpGetBooleanDocumentProperty("quickMask");
-    var quickMaskOuterBounds = null;
-    var quickMaskWasCleared = false;
+    var quickMaskActive = descriptor.hasKey(GFP_S2T("quickMask")) ? descriptor.getBoolean(GFP_S2T("quickMask")) : gfpGetBooleanDocumentProperty("quickMask");
+    var quickMaskOuterBounds = null, quickMaskWasCleared = false;
     try {
         if (quickMaskActive) {
-            // Поведение повторяет img2img helper: если Quick Mask была включена
-            // поверх исходного выделения, до clearEvent её bounds задают внешний
-            // прямоугольник фрагмента. После clearEvent текущая selection содержит
-            // уже фактическую (в том числе непрямоугольную) форму маски слоя.
-            try {
-                quickMaskOuterBounds = doc.selection.bounds;
-            } catch (quickMaskBoundsError) {
-                quickMaskOuterBounds = null;
-            }
+            try { quickMaskOuterBounds = GFP_AM.selectionBounds(descriptor); } catch (quickMaskBoundsError) {}
             gfpQuickMask("clearEvent");
             quickMaskWasCleared = true;
         }
-
         var actualBounds = null;
-        try {
-            actualBounds = doc.selection.bounds;
-        } catch (selectionBoundsError) {
-            actualBounds = null;
-        }
-
-        if (!actualBounds || actualBounds.length < 4) {
-            throw new Error("Сначала выделите лицо прямоугольным выделением или через быструю маску.");
-        }
-
-        var bounds = quickMaskOuterBounds && quickMaskOuterBounds.length >= 4 ? quickMaskOuterBounds : actualBounds;
-        var selection = {
-            left: Math.round(bounds[0].as("px")),
-            top: Math.round(bounds[1].as("px")),
-            right: Math.round(bounds[2].as("px")),
-            bottom: Math.round(bounds[3].as("px"))
-        };
-
-        if (selection.right <= selection.left || selection.bottom <= selection.top) {
-            throw new Error("Выделение пустое.");
-        }
-
-        return {
-            documentId: gfpGetDocumentId(),
-            sourcePath: sourceFile.fsName,
-            sourceXmp: gfpIsRawPath(sourceFile.fsName) ? gfpReadDocumentXmp(doc) : "",
-            docWidth: Math.round(doc.width.as("px")),
-            docHeight: Math.round(doc.height.as("px")),
-            selection: selection,
-            selectionMask: true,
-            quickMask: quickMaskActive
-        };
+        try { actualBounds = GFP_AM.selectionBounds(quickMaskWasCleared ? null : descriptor); }
+        catch (selectionBoundsError) {}
+        if (!actualBounds) throw new Error("Сначала выделите лицо прямоугольным выделением или через быструю маску.");
+        var bounds = quickMaskOuterBounds || actualBounds;
+        var selection = {left:Math.round(bounds.left), top:Math.round(bounds.top),
+                         right:Math.round(bounds.right), bottom:Math.round(bounds.bottom)};
+        if (selection.right <= selection.left || selection.bottom <= selection.top) throw new Error("Выделение пустое.");
+        return {documentId:info.id, sourcePath:sourceFile.fsName,
+                sourceXmp:gfpIsRawPath(sourceFile.fsName) ? GFP_AM.documentXmp(descriptor) : "",
+                docWidth:info.width, docHeight:info.height, selection:selection,
+                selectionMask:true, quickMask:quickMaskActive};
     } catch (stateError) {
         if (quickMaskWasCleared) {
-            try {
-                gfpQuickMask("set");
-            } catch (restoreQuickMaskError) {
-            }
+            try { gfpQuickMask("set"); } catch (restoreQuickMaskError) {}
         }
         throw stateError;
     }
@@ -354,23 +312,7 @@ function gfpIsRawPath(path) {
     return /\.(cr2|cr3|nef|arw|dng|raf|rw2|orf)$/.test(name);
 }
 
-function gfpReadDocumentXmp(doc) {
-    try {
-        if (doc && doc.xmpMetadata && doc.xmpMetadata.rawData) {
-            return String(doc.xmpMetadata.rawData);
-        }
-    } catch (e) {
-    }
-    return "";
-}
 
-function gfpGetDocumentId() {
-    var property = GFP_S2T("documentID");
-    var ref = new ActionReference();
-    ref.putProperty(GFP_S2T("property"), property);
-    ref.putEnumerated(GFP_S2T("document"), GFP_S2T("ordinal"), GFP_S2T("targetEnum"));
-    return executeActionGet(ref).getInteger(property);
-}
 
 function gfpGetBooleanDocumentProperty(name) {
     var property = GFP_S2T(name);
@@ -399,8 +341,7 @@ function gfpRestoreQuickMaskState(state) {
         return;
     }
     try {
-        var target = gfpSelectDocumentById(state.documentId);
-        app.activeDocument = target;
+        gfpSelectDocumentById(state.documentId);
         if (!gfpGetBooleanDocumentProperty("quickMask")) {
             gfpQuickMask("set");
         }
@@ -414,8 +355,7 @@ function gfpClearSelectionAfterCancel(state) {
         return;
     }
     try {
-        var target = gfpSelectDocumentById(state.documentId);
-        app.activeDocument = target;
+        gfpSelectDocumentById(state.documentId);
 
         // На момент показа главного окна Quick Mask обычно уже временно снята
         // gfpReadPhotoshopState(). Проверяем состояние повторно на случай, если
@@ -424,7 +364,7 @@ function gfpClearSelectionAfterCancel(state) {
             gfpQuickMask("clearEvent");
         }
 
-        target.selection.deselect();
+        GFP_AM.deselect();
     } catch (e) {
         // Отмена не должна порождать вторичную ошибку, если документ успели
         // закрыть или изменить его состояние во время показа окна.
@@ -978,7 +918,13 @@ function gfpRecordPreference(payload, index) {
 function gfpTransformLayer(scale, angle, offsetX, offsetY) {
     // Same center convention as Layer.transform in img2img helper.
     // One resampling pass for scale/rotation/translation together.
+    if (!isFinite(scale) || scale <= 0 || !isFinite(angle) || !isFinite(offsetX) || !isFinite(offsetY)) {
+        throw new Error("Недопустимые параметры трансформации слоя.");
+    }
     var desc = new ActionDescriptor();
+    var ref = new ActionReference();
+    ref.putEnumerated(GFP_S2T("layer"), GFP_S2T("ordinal"), GFP_S2T("targetEnum"));
+    desc.putReference(GFP_S2T("null"), ref);
     desc.putEnumerated(GFP_S2T("freeTransformCenterState"), GFP_S2T("quadCenterState"), GFP_S2T("QCSAverage"));
     var offset = new ActionDescriptor();
     offset.putUnitDouble(GFP_S2T("horizontal"), GFP_S2T("pixelsUnit"), offsetX);
@@ -988,6 +934,224 @@ function gfpTransformLayer(scale, angle, offsetX, offsetY) {
     desc.putUnitDouble(GFP_S2T("height"), GFP_S2T("percentUnit"), scale*100);
     desc.putUnitDouble(GFP_S2T("angle"), GFP_S2T("angleUnit"), angle);
     executeAction(GFP_S2T("transform"), desc, DialogModes.NO);
+}
+
+// Photoshop access is isolated here, in the same AM-wrapper style as the
+// accompanying Face alignment / Align and fit layers scripts. References are
+// numeric IDs, never Photoshop DOM Document/Layer/Channel/HistoryState objects.
+function GFPActionManager() {
+    var s2t = GFP_S2T;
+    this.getDescriptor = function (target, id, byIndex) {
+        var r = new ActionReference();
+        if (id !== undefined && id !== null) {
+            if (byIndex) r.putIndex(s2t(target), Number(id));
+            else r.putIdentifier(s2t(target), Number(id));
+        } else r.putEnumerated(s2t(target), s2t("ordinal"), s2t("targetEnum"));
+        return executeActionGet(r);
+    };
+    this.getProperty = function (target, property) {
+        var r = new ActionReference();
+        r.putProperty(s2t("property"), s2t(property));
+        r.putEnumerated(s2t(target), s2t("ordinal"), s2t("targetEnum"));
+        return executeActionGet(r);
+    };
+    this.documentCount = function () {
+        return this.getProperty("application", "numberOfDocuments").getInteger(s2t("numberOfDocuments"));
+    };
+    this.documentInfo = function (descriptor) {
+        var d = descriptor || this.getDescriptor("document");
+        var resolution = d.getUnitDoubleValue(s2t("resolution"));
+        function pixels(property) {
+            var key = s2t(property), value = d.getUnitDoubleValue(key);
+            return d.getUnitDoubleType(key) == s2t("pixelsUnit") ? value : value * resolution / 72;
+        }
+        var width = pixels("width"), height = pixels("height");
+        if (!(resolution > 0) || !(width > 0) || !(height > 0) || !isFinite(width) || !isFinite(height)) {
+            throw new Error("Не удалось прочитать геометрию документа через AM.");
+        }
+        var file = d.hasKey(s2t("fileReference")) ? d.getPath(s2t("fileReference")) : null;
+        return {id:d.getInteger(s2t("documentID")), width:Math.round(width), height:Math.round(height),
+                file:file, descriptor:d};
+    };
+    this.selectionBounds = function (descriptor) {
+        var key = s2t("selection"), d = descriptor;
+        if (!d || !d.hasKey(key)) d = this.getProperty("document", "selection");
+        if (!d.hasKey(key)) return null;
+        var b = d.getObjectValue(key);
+        return {left:b.getUnitDoubleValue(s2t("left")), top:b.getUnitDoubleValue(s2t("top")),
+                right:b.getUnitDoubleValue(s2t("right")), bottom:b.getUnitDoubleValue(s2t("bottom"))};
+    };
+    this.findDocument = function (path) {
+        var count = this.documentCount();
+        for (var i = 1; i <= count; i++) {
+            var d = this.getDescriptor("document", i, true);
+            if (d.hasKey(s2t("fileReference")) && gfpSamePath(d.getPath(s2t("fileReference")).fsName, path)) {
+                return this.documentInfo(d);
+            }
+        }
+        return null;
+    };
+    this.selectDocument = function (id) {
+        var r = new ActionReference(), d = new ActionDescriptor();
+        r.putIdentifier(s2t("document"), Number(id));
+        d.putReference(s2t("null"), r);
+        executeAction(s2t("select"), d, DialogModes.NO);
+        return Number(id);
+    };
+    this.open = function (file) {
+        var d = new ActionDescriptor();
+        d.putPath(s2t("target"), file);
+        d.putBoolean(s2t("forceNotify"), false);
+        executeAction(s2t("open"), d, DialogModes.NO);
+        return this.documentInfo();
+    };
+    this.historyID = function () {
+        var d = this.getDescriptor("historyState");
+        return d.getInteger(s2t("ID"));
+    };
+    this.restoreHistory = function (id) {
+        var r = new ActionReference(), d = new ActionDescriptor();
+        r.putIdentifier(s2t("historyState"), Number(id));
+        d.putReference(s2t("null"), r);
+        executeAction(s2t("select"), d, DialogModes.NO);
+    };
+    this.crop = function (left, top, right, bottom) {
+        var d = new ActionDescriptor(), b = new ActionDescriptor();
+        b.putUnitDouble(s2t("left"), s2t("pixelsUnit"), left);
+        b.putUnitDouble(s2t("top"), s2t("pixelsUnit"), top);
+        b.putUnitDouble(s2t("right"), s2t("pixelsUnit"), right);
+        b.putUnitDouble(s2t("bottom"), s2t("pixelsUnit"), bottom);
+        d.putObject(s2t("to"), s2t("rectangle"), b);
+        d.putUnitDouble(s2t("angle"), s2t("angleUnit"), 0);
+        d.putBoolean(s2t("delete"), true);
+        d.putEnumerated(s2t("cropAspectRatioModeKey"), s2t("cropAspectRatioModeClass"), s2t("pureAspectRatio"));
+        executeAction(s2t("crop"), d, DialogModes.NO);
+    };
+    this.duplicateLayerTo = function (documentID) {
+        var r = new ActionReference(), to = new ActionReference(), d = new ActionDescriptor();
+        r.putEnumerated(s2t("layer"), s2t("ordinal"), s2t("targetEnum"));
+        to.putIdentifier(s2t("document"), Number(documentID));
+        d.putReference(s2t("null"), r);
+        d.putReference(s2t("to"), to);
+        d.putInteger(s2t("version"), 5);
+        var result = executeAction(s2t("duplicate"), d, DialogModes.NO), key = s2t("layerID");
+        if (result && result.hasKey(key)) {
+            try { return result.getInteger(key); }
+            catch (integerIDError) {
+                var ids = result.getList(key);
+                if (ids.count == 1) return ids.getInteger(0);
+            }
+        }
+        // Photoshop activates a layer duplicated into the destination document.
+        // Older builds do not return layerID in the action result.
+        return null;
+    };
+    this.selectLayer = function (id) {
+        var r = new ActionReference(), d = new ActionDescriptor();
+        r.putIdentifier(s2t("layer"), Number(id));
+        d.putReference(s2t("null"), r);
+        d.putBoolean(s2t("makeVisible"), false);
+        executeAction(s2t("select"), d, DialogModes.NO);
+    };
+    this.layerToFront = function () {
+        var r = new ActionReference(), to = new ActionReference(), d = new ActionDescriptor();
+        r.putEnumerated(s2t("layer"), s2t("ordinal"), s2t("targetEnum"));
+        to.putEnumerated(s2t("layer"), s2t("ordinal"), s2t("front"));
+        d.putReference(s2t("null"), r);
+        d.putReference(s2t("to"), to);
+        d.putBoolean(s2t("adjustment"), false);
+        d.putInteger(s2t("version"), 5);
+        executeAction(s2t("move"), d, DialogModes.NO);
+    };
+    this.close = function () {
+        var d = new ActionDescriptor();
+        d.putEnumerated(s2t("saving"), s2t("yesNo"), s2t("no"));
+        executeAction(s2t("close"), d, DialogModes.NO);
+    };
+    this.deselect = function () {
+        var r = new ActionReference(), d = new ActionDescriptor();
+        r.putProperty(s2t("channel"), s2t("selection"));
+        d.putReference(s2t("null"), r);
+        d.putEnumerated(s2t("to"), s2t("ordinal"), s2t("none"));
+        executeAction(s2t("set"), d, DialogModes.NO);
+    };
+    this.saveSelection = function (name) {
+        var r = new ActionReference(), d = new ActionDescriptor();
+        r.putProperty(s2t("channel"), s2t("selection"));
+        d.putReference(s2t("null"), r);
+        d.putString(s2t("name"), name);
+        executeAction(s2t("duplicate"), d, DialogModes.NO);
+        return name;
+    };
+    this.loadSelection = function (name) {
+        var r = new ActionReference(), from = new ActionReference(), d = new ActionDescriptor();
+        r.putProperty(s2t("channel"), s2t("selection"));
+        from.putName(s2t("channel"), name);
+        d.putReference(s2t("null"), r);
+        d.putReference(s2t("to"), from);
+        executeAction(s2t("set"), d, DialogModes.NO);
+    };
+    this.deleteChannel = function (name) {
+        var r = new ActionReference(), d = new ActionDescriptor();
+        r.putName(s2t("channel"), name);
+        d.putReference(s2t("null"), r);
+        executeAction(s2t("delete"), d, DialogModes.NO);
+    };
+    this.selectRGB = function () {
+        var r = new ActionReference(), d = new ActionDescriptor();
+        r.putEnumerated(s2t("channel"), s2t("channel"), charIDToTypeID("RGB "));
+        d.putReference(s2t("null"), r);
+        d.putBoolean(s2t("makeVisible"), false);
+        executeAction(s2t("select"), d, DialogModes.NO);
+    };
+    this.documentXmp = function (descriptor) {
+        var key = s2t("XMPMetadataAsUTF8"), d = descriptor;
+        try {
+            if (!d || !d.hasKey(key)) d = this.getProperty("document", "XMPMetadataAsUTF8");
+            return d.hasKey(key) ? d.getString(key) : "";
+        } catch (xmpError) { return ""; }
+    };
+}
+
+function gfpReadDocumentGeometry() {
+    return GFP_AM.documentInfo();
+}
+
+function gfpReadLayerBounds() {
+    var key = GFP_S2T("bounds"), ref = new ActionReference();
+    ref.putProperty(GFP_S2T("property"), key);
+    ref.putEnumerated(GFP_S2T("layer"), GFP_S2T("ordinal"), GFP_S2T("targetEnum"));
+    var bounds = executeActionGet(ref).getObjectValue(key);
+    return {left:bounds.getUnitDoubleValue(GFP_S2T("left")),
+            top:bounds.getUnitDoubleValue(GFP_S2T("top")),
+            right:bounds.getUnitDoubleValue(GFP_S2T("right")),
+            bottom:bounds.getUnitDoubleValue(GFP_S2T("bottom"))};
+}
+
+function gfpMoveLayer(offsetX, offsetY) {
+    if (!isFinite(offsetX) || !isFinite(offsetY)) throw new Error("Недопустимое смещение слоя.");
+    if (offsetX == 0 && offsetY == 0) return;
+    var ref = new ActionReference(), desc = new ActionDescriptor(), offset = new ActionDescriptor();
+    ref.putEnumerated(GFP_S2T("layer"), GFP_S2T("ordinal"), GFP_S2T("targetEnum"));
+    desc.putReference(GFP_S2T("null"), ref);
+    offset.putUnitDouble(GFP_S2T("horizontal"), GFP_S2T("pixelsUnit"), offsetX);
+    offset.putUnitDouble(GFP_S2T("vertical"), GFP_S2T("pixelsUnit"), offsetY);
+    desc.putObject(GFP_S2T("to"), GFP_S2T("offset"), offset);
+    executeAction(GFP_S2T("move"), desc, DialogModes.NO);
+}
+
+function gfpRenameLayer(name) {
+    var ref = new ActionReference(), desc = new ActionDescriptor(), layer = new ActionDescriptor();
+    ref.putEnumerated(GFP_S2T("layer"), GFP_S2T("ordinal"), GFP_S2T("targetEnum"));
+    desc.putReference(GFP_S2T("null"), ref);
+    layer.putString(GFP_S2T("name"), name);
+    desc.putObject(GFP_S2T("to"), GFP_S2T("layer"), layer);
+    executeAction(GFP_S2T("set"), desc, DialogModes.NO);
+}
+
+function gfpCloseSourceDocument(doc) {
+    GFP_AM.selectDocument(doc);
+    GFP_AM.close();
 }
 
 function gfpInsertCandidate(payload, index) {
@@ -1000,6 +1164,8 @@ function gfpInsertCandidate(payload, index) {
     var sourceHistory = null;
     var sourceWasAlreadyOpen = false;
     var sourceOpenedByScript = false;
+    var savedTargetSelection = null;
+    var insertStage = "подготовка фрагмента";
 
     try {
         var response = gfpApiRequest({
@@ -1016,9 +1182,10 @@ function gfpInsertCandidate(payload, index) {
 
         var item = response.message;
         var target = gfpSelectDocumentById(payload.target.document_id);
-        targetHistory = target.activeHistoryState;
+        targetHistory = GFP_AM.historyID();
 
-        if (Math.round(target.width.as("px")) != Number(payload.target.doc_width) || Math.round(target.height.as("px")) != Number(payload.target.doc_height)) {
+        var targetGeometry = gfpReadDocumentGeometry();
+        if (targetGeometry.width != Number(payload.target.doc_width) || targetGeometry.height != Number(payload.target.doc_height)) {
             throw new Error("Размер целевого документа изменился после анализа. Сделайте выделение заново и снова запустите JSX.");
         }
 
@@ -1026,20 +1193,23 @@ function gfpInsertCandidate(payload, index) {
         // дополнительным документом: для уже открытого донора состояние истории
         // восстанавливается после crop/flatten, а открытый скриптом донор закрывается
         // без сохранения сразу после копирования слоя в целевой документ.
-        sourceDocument = gfpFindOpenDocument(item.source_path);
-        sourceWasAlreadyOpen = !!sourceDocument;
-        if (!sourceDocument) {
-            sourceDocument = gfpOpenFile(new File(item.source_path));
+        var sourceInfo = GFP_AM.findDocument(item.source_path);
+        sourceWasAlreadyOpen = !!sourceInfo;
+        if (!sourceInfo) {
+            sourceInfo = GFP_AM.open(new File(item.source_path));
             sourceOpenedByScript = true;
+        } else GFP_AM.selectDocument(sourceInfo.id);
+        sourceDocument = sourceInfo.id;
+        if (sourceDocument == target) {
+            sourceDocument = null;
+            sourceOpenedByScript = false;
+            throw new Error("Нельзя использовать целевой документ как файл-донор.");
         }
-
-        var openedSourceWidth = Math.round(sourceDocument.width.as("px"));
-        var openedSourceHeight = Math.round(sourceDocument.height.as("px"));
+        var openedSourceWidth = sourceInfo.width;
+        var openedSourceHeight = sourceInfo.height;
         var analysisSourceWidth = Number(item.source_width);
         var analysisSourceHeight = Number(item.source_height);
-
-        app.activeDocument = sourceDocument;
-        sourceHistory = sourceDocument.activeHistoryState;
+        sourceHistory = GFP_AM.historyID();
 
         var expectedWidth = Number(payload.target.selection.right) - Number(payload.target.selection.left);
         var expectedHeight = Number(payload.target.selection.bottom) - Number(payload.target.selection.top);
@@ -1155,133 +1325,141 @@ function gfpInsertCandidate(payload, index) {
             placementOffsetY = affinePlacement ? 0 : placement.offsetY;
         }
 
-        sourceDocument.crop([
-            UnitValue(cropLeft, "px"),
-            UnitValue(cropTop, "px"),
-            UnitValue(cropRight, "px"),
-            UnitValue(cropBottom, "px")
-        ]);
+        insertStage = "обрезка исходного фрагмента";
+        GFP_AM.crop(cropLeft, cropTop, cropRight, cropBottom);
 
-        if (Math.round(sourceDocument.width.as("px")) != sourceCropWidth || Math.round(sourceDocument.height.as("px")) != sourceCropHeight) {
+        var croppedGeometry = gfpReadDocumentGeometry();
+        if (croppedGeometry.width != sourceCropWidth || croppedGeometry.height != sourceCropHeight) {
             throw new Error("Внутренняя проверка crop не пройдена: Photoshop изменил размер исходного фрагмента.");
         }
 
-        sourceDocument.flatten();
-        var insertedLayer = sourceDocument.activeLayer.duplicate(target, ElementPlacement.PLACEATBEGINNING);
+        executeAction(GFP_S2T("flattenImage"), undefined, DialogModes.NO);
+        insertStage = "копирование слоя в целевой документ";
+        var insertedLayerID = GFP_AM.duplicateLayerTo(target);
 
         if (sourceWasAlreadyOpen) {
-            sourceDocument.activeHistoryState = sourceHistory;
+            GFP_AM.selectDocument(sourceDocument);
+            GFP_AM.restoreHistory(sourceHistory);
             sourceHistory = null;
             sourceDocument = null;
         } else {
-            sourceDocument.close(SaveOptions.DONOTSAVECHANGES);
+            gfpCloseSourceDocument(sourceDocument);
             sourceDocument = null;
             sourceOpenedByScript = false;
             sourceHistory = null;
         }
 
-        app.activeDocument = target;
-        target.activeLayer = insertedLayer;
+        GFP_AM.selectDocument(target);
+        if (insertedLayerID !== null) GFP_AM.selectLayer(insertedLayerID);
+        GFP_AM.layerToFront();
 
-        var layerBounds = insertedLayer.bounds;
-        var layerLeft = gfpPx(layerBounds[0]);
-        var layerTop = gfpPx(layerBounds[1]);
-        var layerRight = gfpPx(layerBounds[2]);
-        var layerBottom = gfpPx(layerBounds[3]);
-        var layerWidth = Math.round(layerRight - layerLeft);
-        var layerHeight = Math.round(layerBottom - layerTop);
+        // Transform the whole donor layer, not only pixels currently inside
+        // the original face selection. The donor may initially be elsewhere
+        // on the canvas, so Photoshop would report an empty selected area.
+        // Keep the actual selection (including Quick Mask/feathering) in a
+        // temporary alpha channel, then restore it before creating the mask.
+        insertStage = "сохранение выделения перед трансформацией";
+        if (gfpHasSelection()) {
+            var selectionName = "GFP selection " + (new Date()).getTime() + " " + Math.round(Math.random() * 1000000000);
+            savedTargetSelection = GFP_AM.saveSelection(selectionName);
+            GFP_AM.deselect();
+        }
+        GFP_AM.selectRGB();
 
-        var combinedAffine = affinePlacement && (Math.abs(rotationDegrees)>0.0001 || faceScaleEnabled && faceScale!=1.0);
-        if (combinedAffine) {
-            gfpTransformLayer(faceScale, rotationDegrees,
-                Number(payload.target.selection.left)+affinePlacement.centerX-(layerLeft+layerRight)*.5,
-                Number(payload.target.selection.top)+affinePlacement.centerY-(layerTop+layerBottom)*.5);
+        var layerBounds = gfpReadLayerBounds();
+        var layerWidth = layerBounds.right - layerBounds.left;
+        var layerHeight = layerBounds.bottom - layerBounds.top;
+        var actualScale = faceScaleEnabled ? faceScale : 1.0;
+        var initialCenterX = (layerBounds.left + layerBounds.right) * 0.5;
+        var initialCenterY = (layerBounds.top + layerBounds.bottom) * 0.5;
+        var finalCenterX, finalCenterY;
+        if (affinePlacement) {
+            finalCenterX = Number(payload.target.selection.left) + affinePlacement.centerX;
+            finalCenterY = Number(payload.target.selection.top) + affinePlacement.centerY;
         } else {
-            if (faceScaleEnabled && faceScale != 1.0) {
-                // Resize the extracted source before optional rotation.
-                insertedLayer.resize(faceScale * 100.0, faceScale * 100.0, AnchorPosition.TOPLEFT);
-                layerBounds = insertedLayer.bounds;
-                layerLeft = gfpPx(layerBounds[0]);
-                layerTop = gfpPx(layerBounds[1]);
-                layerRight = gfpPx(layerBounds[2]);
-                layerBottom = gfpPx(layerBounds[3]);
-                layerWidth = Math.round(layerRight - layerLeft);
-                layerHeight = Math.round(layerBottom - layerTop);
-                // crop использует ceil(target/scale), поэтому после равномерного
-                // увеличения слой должен полностью перекрывать исходное выделение.
-                if (!affinePlacement && (layerWidth < expectedWidth || layerHeight < expectedHeight)) {
-                    target.activeHistoryState = targetHistory;
-                    targetHistory = null;
-                    throw new Error("Photoshop округлил масштабированный слой меньше целевой области. Операция отменена.");
-                }
-            } else if (layerWidth != sourceCropWidth || layerHeight != sourceCropHeight) {
-                target.activeHistoryState = targetHistory;
-                targetHistory = null;
+            // Equivalent to the old TOPLEFT resize followed by translation,
+            // but calculated from the original bounds before a single transform.
+            finalCenterX = Number(payload.target.selection.left) + placementOffsetX + layerWidth * actualScale * 0.5;
+            finalCenterY = Number(payload.target.selection.top) + placementOffsetY + layerHeight * actualScale * 0.5;
+        }
+        if (actualScale == 1.0 && rotationDegrees == 0) {
+            if (Math.round(layerWidth) != sourceCropWidth || Math.round(layerHeight) != sourceCropHeight) {
                 throw new Error("Photoshop изменил размер вставленного слоя. Операция отменена: масштабирование выключено.");
             }
-
-            if (affinePlacement) {
-                layerBounds = insertedLayer.bounds;
-                var centerX=(gfpPx(layerBounds[0])+gfpPx(layerBounds[2]))*.5;
-                var centerY=(gfpPx(layerBounds[1])+gfpPx(layerBounds[3]))*.5;
-                insertedLayer.translate(UnitValue(Number(payload.target.selection.left)+affinePlacement.centerX-centerX,"px"),
-                    UnitValue(Number(payload.target.selection.top)+affinePlacement.centerY-centerY,"px"));
-            } else {
-                insertedLayer.translate(
-                    UnitValue(Number(payload.target.selection.left) + placementOffsetX - layerLeft, "px"),
-                    UnitValue(Number(payload.target.selection.top) + placementOffsetY - layerTop, "px")
-                );
+            insertStage = "позиционирование фрагмента";
+            // Translation only: avoid a resampling transform at 100% scale.
+            gfpMoveLayer(finalCenterX - initialCenterX, finalCenterY - initialCenterY);
+        } else {
+            insertStage = "масштабирование, поворот и позиционирование фрагмента";
+            gfpTransformLayer(actualScale, rotationDegrees,
+                finalCenterX - initialCenterX, finalCenterY - initialCenterY);
+            if (!affinePlacement) {
+                // A post-scale coverage check remains necessary. Translation
+                // does not affect dimensions, so no further bounds read is needed.
+                var transformedBounds = gfpReadLayerBounds();
+                if (Math.round(transformedBounds.right - transformedBounds.left) < expectedWidth ||
+                        Math.round(transformedBounds.bottom - transformedBounds.top) < expectedHeight) {
+                    throw new Error("Photoshop округлил масштабированный слой меньше целевой области. Операция отменена.");
+                }
             }
         }
-        insertedLayer.name = "Face from " + String(item.name);
+        gfpRenameLayer("Face from " + String(item.name));
 
+        insertStage = "восстановление выделения для маски";
+        if (savedTargetSelection) {
+            GFP_AM.loadSelection(savedTargetSelection);
+            GFP_AM.deleteChannel(savedTargetSelection);
+            savedTargetSelection = null;
+            GFP_AM.selectRGB();
+        }
         if (payload.target.selection_mask) {
+            insertStage = "создание маски слоя";
             // Маска создаётся для любого исходного выделения. Для Quick Mask
             // в целевом документе сохраняется точная непрямоугольная selection;
             // для обычного marquee это прямоугольная selection. Переключение
             // документов обычно её не меняет, но прямоугольник можно безопасно
             // восстановить по сохранённым bounds, если Photoshop её потерял.
-            if (!gfpHasSelection(target)) {
+            if (!gfpHasSelection()) {
                 if (payload.target.quick_mask) {
                     throw new Error("Форма выделения Quick Mask была потеряна до создания маски слоя.");
                 }
-                gfpSetRectangleSelection(target, payload.target.selection);
+                gfpSetRectangleSelection(payload.target.selection);
             }
-            target.activeLayer = insertedLayer;
             gfpMakeSelectionMask();
         }
         return true;
     } catch (insertError) {
         try {
             if (sourceDocument) {
-                app.activeDocument = sourceDocument;
-                if (sourceWasAlreadyOpen && sourceHistory) {
-                    sourceDocument.activeHistoryState = sourceHistory;
+                if (sourceWasAlreadyOpen && sourceHistory !== null) {
+                    GFP_AM.selectDocument(sourceDocument);
+                    GFP_AM.restoreHistory(sourceHistory);
                 } else if (sourceOpenedByScript) {
-                    sourceDocument.close(SaveOptions.DONOTSAVECHANGES);
+                    gfpCloseSourceDocument(sourceDocument);
                 }
             }
         } catch (restoreSourceError) {
         }
         try {
-            if (targetHistory) {
-                var restoreTarget = gfpSelectDocumentById(payload.target.document_id);
-                restoreTarget.activeHistoryState = targetHistory;
+            if (targetHistory !== null) {
+                GFP_AM.selectDocument(payload.target.document_id);
+                GFP_AM.restoreHistory(targetHistory);
             }
         } catch (restoreTargetError) {
         }
-        throw insertError;
+        // Normally restoring targetHistory removes the temporary channel too.
+        // If history restoration failed, still try to remove our channel only.
+        if (savedTargetSelection) {
+            try {
+                GFP_AM.selectDocument(payload.target.document_id);
+                GFP_AM.deleteChannel(savedTargetSelection);
+            } catch (removeSavedSelectionError) {
+            }
+        }
+        throw new Error("Этап вставки: " + insertStage + ".\n" + gfpErrorText(insertError));
     }
 }
 
-function gfpOpenFile(pth) {
-    var file = pth instanceof File ? pth : new File(String(pth));
-    var desc = new ActionDescriptor();
-    desc.putPath(GFP_S2T("target"), file);
-    desc.putBoolean(GFP_S2T("forceNotify"), false);
-    executeAction(GFP_S2T("open"), desc, DialogModes.NO);
-    return app.activeDocument;
-}
 
 function gfpDistance(x1, y1, x2, y2) {
     var dx = Number(x2) - Number(x1);
@@ -1289,11 +1467,13 @@ function gfpDistance(x1, y1, x2, y2) {
     return Math.sqrt(dx * dx + dy * dy);
 }
 
-function gfpHasSelection(doc) {
-    app.activeDocument = doc;
+// Caller already selected the target document. Do not activate it a second time.
+function gfpHasSelection() {
+    var property = GFP_S2T("selection"), ref = new ActionReference();
+    ref.putProperty(GFP_S2T("property"), property);
+    ref.putEnumerated(GFP_S2T("document"), GFP_S2T("ordinal"), GFP_S2T("targetEnum"));
     try {
-        var bounds = doc.selection.bounds;
-        return !!(bounds && bounds.length >= 4);
+        return executeActionGet(ref).hasKey(property);
     } catch (e) {
         return false;
     }
@@ -1310,22 +1490,19 @@ function gfpMakeSelectionMask() {
 }
 
 function gfpSelectDocumentById(documentId) {
-    var ref = new ActionReference();
-    ref.putIdentifier(GFP_S2T("document"), Number(documentId));
-    var desc = new ActionDescriptor();
-    desc.putReference(GFP_S2T("null"), ref);
-    executeAction(GFP_S2T("select"), desc, DialogModes.NO);
-    return app.activeDocument;
+    return GFP_AM.selectDocument(documentId);
 }
 
-function gfpSetRectangleSelection(doc, rect) {
-    app.activeDocument = doc;
-    doc.selection.select([
-        [Number(rect.left), Number(rect.top)],
-        [Number(rect.right), Number(rect.top)],
-        [Number(rect.right), Number(rect.bottom)],
-        [Number(rect.left), Number(rect.bottom)]
-    ], SelectionType.REPLACE, 0, false);
+function gfpSetRectangleSelection(rect) {
+    var ref = new ActionReference(), desc = new ActionDescriptor(), bounds = new ActionDescriptor();
+    ref.putProperty(GFP_S2T("channel"), GFP_S2T("selection"));
+    desc.putReference(GFP_S2T("null"), ref);
+    bounds.putUnitDouble(GFP_S2T("left"), GFP_S2T("pixelsUnit"), Number(rect.left));
+    bounds.putUnitDouble(GFP_S2T("top"), GFP_S2T("pixelsUnit"), Number(rect.top));
+    bounds.putUnitDouble(GFP_S2T("right"), GFP_S2T("pixelsUnit"), Number(rect.right));
+    bounds.putUnitDouble(GFP_S2T("bottom"), GFP_S2T("pixelsUnit"), Number(rect.bottom));
+    desc.putObject(GFP_S2T("to"), GFP_S2T("rectangle"), bounds);
+    executeAction(GFP_S2T("set"), desc, DialogModes.NO);
 }
 
 function gfpSamePath(left, right) {
@@ -1336,25 +1513,6 @@ function gfpSamePath(left, right) {
     }
 }
 
-function gfpFindOpenDocument(path) {
-    for (var di = 0; di < app.documents.length; di++) {
-        try {
-            if (gfpSamePath(app.documents[di].fullName.fsName, path)) {
-                return app.documents[di];
-            }
-        } catch (docPathError) {
-        }
-    }
-    return null;
-}
-
-function gfpPx(value) {
-    try {
-        return Number(value.as("px"));
-    } catch (unitError) {
-        return Number(value);
-    }
-}
 
 function gfpApiRequest(payload, timeout) {
     return gfpApiRequestTo(GFP_API_HOST, GFP_API_PORT_SEND, payload, timeout);
