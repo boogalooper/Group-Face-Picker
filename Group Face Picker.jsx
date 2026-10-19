@@ -18,7 +18,7 @@ var GFP_SHIFT_LAUNCH = !!ScriptUI.environment.keyboardState.shiftKey;
 
 var GFP_NAME = "Group Face Picker";
 var GFP_UUID = "9a189321-e07f-40ff-8394-156a4bd48cf5";
-var GFP_VERSION = "0.6.52";
+var GFP_VERSION = "0.6.53";
 var GFP_DEFAULT_HOST = "127.0.0.1";
 var GFP_DEFAULT_PORT_SEND = 6420;
 var GFP_DEFAULT_PORT_LISTEN = 6421;
@@ -26,6 +26,8 @@ var GFP_API_HOST = GFP_DEFAULT_HOST;
 var GFP_API_PORT_SEND = GFP_DEFAULT_PORT_SEND;
 var GFP_API_PORT_LISTEN = GFP_DEFAULT_PORT_LISTEN;
 var GFP_API_TIMEOUT = 10000;
+var GFP_REQUEST_PREFIX = String((new Date()).getTime()) + "-" + String(Math.round(Math.random() * 1000000000));
+var GFP_REQUEST_SEQUENCE = 0;
 var GFP_JOB_TIMEOUT = 60 * 60 * 1000;
 var GFP_PENDING_JOB_ID = "";
 var GFP_PENDING_JOB_RESULT = null;
@@ -81,10 +83,6 @@ function gfpWritePlaybackParameters() {
 }
 
 function gfpMain() {
-    if (!GFP_AM.documentCount()) {
-        throw new Error("Откройте групповую фотографию и выделите лицо ребёнка.");
-    }
-
     // Полностью проверяем документ ДО любого обращения к Python-серверу.
     // gfpReadPhotoshopState() проверяет RGB, существующий исходный файл и
     // реальное активное выделение (включая случай Quick Mask).
@@ -655,7 +653,7 @@ function gfpShowDialog(payload) {
     var chFaceScaleMatch = bottom.add("checkbox", undefined, "Подгонять масштаб лица");
     fixedSize(chFaceScaleMatch, 240, 24);
     chFaceScaleMatch.value = initialFaceScaleMatch;
-    chFaceScaleMatch.helpTip = "Равномерная подгонка масштаба без поворота. Запоминается для следующих вставок.";
+    chFaceScaleMatch.helpTip = "Равномерная подгонка масштаба лица. Поворот включается отдельно в глобальных настройках. Запоминается для следующих вставок.";
     var bottomSpacer = bottom.add("group"); bottomSpacer.alignment = ["fill", "center"];
     var actionButtons = bottom.add("group");
     actionButtons.orientation = "row"; actionButtons.alignChildren = ["left", "center"];
@@ -1174,10 +1172,11 @@ function gfpInsertCandidate(payload, index) {
             query_id: payload.query_id,
             index: index,
             face_scale_match: payload.face_scale_match === true
-        }, 15000);
+        }, 120000);
 
         if (!response || response.type != "answer" || !response.message) {
-            throw new Error("Python-сервер не вернул координаты исходного фрагмента.");
+            throw new Error(response && response.type == "error" ? String(response.message) :
+                "Python-сервер не ответил при подготовке фрагмента за 120 секунд. Повторите поиск лица.");
         }
 
         var item = response.message;
@@ -1209,19 +1208,14 @@ function gfpInsertCandidate(payload, index) {
         var openedSourceHeight = sourceInfo.height;
         var analysisSourceWidth = Number(item.source_width);
         var analysisSourceHeight = Number(item.source_height);
-        sourceHistory = GFP_AM.historyID();
+        if (sourceWasAlreadyOpen) sourceHistory = GFP_AM.historyID();
 
         var expectedWidth = Number(payload.target.selection.right) - Number(payload.target.selection.left);
         var expectedHeight = Number(payload.target.selection.bottom) - Number(payload.target.selection.top);
-        var crop = item.crop;
-        var cropLeft = Number(crop.left);
-        var cropTop = Number(crop.top);
-        var cropRight = Number(crop.right);
-        var cropBottom = Number(crop.bottom);
+        var cropLeft, cropTop, cropRight, cropBottom;
         var faceScaleEnabled = item.face_scale_match === true;
         var faceScale = 1.0;
-        var sourceCropWidth = expectedWidth;
-        var sourceCropHeight = expectedHeight;
+        var sourceCropWidth, sourceCropHeight;
 
         if (!item.is_raw && (openedSourceWidth != analysisSourceWidth || openedSourceHeight != analysisSourceHeight)) {
             throw new Error("Размер открытого исходного кадра не совпадает с размером, использованным распознаванием.");
@@ -1429,6 +1423,7 @@ function gfpInsertCandidate(payload, index) {
         }
         return true;
     } catch (insertError) {
+        var recoveryErrors = [], targetRestored = false;
         try {
             if (sourceDocument) {
                 if (sourceWasAlreadyOpen && sourceHistory !== null) {
@@ -1439,24 +1434,31 @@ function gfpInsertCandidate(payload, index) {
                 }
             }
         } catch (restoreSourceError) {
+            recoveryErrors.push("Не удалось восстановить или закрыть донор: " + gfpErrorText(restoreSourceError));
         }
         try {
             if (targetHistory !== null) {
                 GFP_AM.selectDocument(payload.target.document_id);
                 GFP_AM.restoreHistory(targetHistory);
+                targetRestored = true;
             }
         } catch (restoreTargetError) {
+            recoveryErrors.push("Не удалось откатить целевой документ: " + gfpErrorText(restoreTargetError));
         }
-        // Normally restoring targetHistory removes the temporary channel too.
-        // If history restoration failed, still try to remove our channel only.
-        if (savedTargetSelection) {
+        // A successful history rollback already removed this channel. If the
+        // rollback failed, recover the exact selection before deleting its copy.
+        if (savedTargetSelection && !targetRestored) {
             try {
                 GFP_AM.selectDocument(payload.target.document_id);
+                GFP_AM.loadSelection(savedTargetSelection);
                 GFP_AM.deleteChannel(savedTargetSelection);
+                GFP_AM.selectRGB();
             } catch (removeSavedSelectionError) {
+                recoveryErrors.push("Не удалось восстановить выделение; временный канал сохранён, если он ещё существует: " + savedTargetSelection);
             }
         }
-        throw new Error("Этап вставки: " + insertStage + ".\n" + gfpErrorText(insertError));
+        throw new Error("Этап вставки: " + insertStage + ".\n" + gfpErrorText(insertError) +
+            (recoveryErrors.length ? "\n\n" + recoveryErrors.join("\n") : ""));
     }
 }
 
@@ -1519,40 +1521,44 @@ function gfpApiRequest(payload, timeout) {
 }
 
 function gfpApiRequestTo(host, port, payload, timeout) {
+    var requestId = GFP_REQUEST_PREFIX + "-" + (++GFP_REQUEST_SEQUENCE);
     payload.reply_port = GFP_API_PORT_LISTEN;
-    var listener = new Socket();
-    if (!listener.listen(GFP_API_PORT_LISTEN, "UTF-8")) {
-        throw new Error("Не удалось открыть локальный порт ответа " + GFP_API_PORT_LISTEN + ". Возможно, другой экземпляр скрипта ещё выполняется.");
-    }
-
-    var sender = new Socket();
-    if (!sender.open(String(host) + ":" + String(port), "UTF-8")) {
-        listener.close();
-        return null;
-    }
-
-    sender.writeln(gfpObjectToJSON(payload));
-    sender.close();
-
+    payload.request_id = requestId;
+    var listener = new Socket(), sender = new Socket(), answer = null;
     var started = (new Date()).getTime();
-    for (;;) {
-        if ((new Date()).getTime() - started > timeout) {
-            listener.close();
-            return null;
+    try {
+        if (!listener.listen(GFP_API_PORT_LISTEN, "UTF-8")) {
+            throw new Error("Не удалось открыть локальный порт ответа " + GFP_API_PORT_LISTEN + ". Возможно, другой экземпляр скрипта ещё выполняется.");
         }
-
-        var answer = listener.poll();
-        if (answer != null) {
-            var line = answer.readln();
-            answer.close();
-            listener.close();
-            try {
-                return eval("(" + line + ")");
-            } catch (e) {
-                throw new Error("Некорректный ответ Python-сервера: " + e.message);
+        sender.timeout = Math.max(1, Math.min(3, Math.ceil(timeout / 1000)));
+        if (!sender.open(String(host) + ":" + String(port), "UTF-8")) return null;
+        if (!sender.writeln(gfpObjectToJSON(payload))) throw new Error("Не удалось отправить запрос Python-серверу.");
+        sender.close();
+        for (;;) {
+            var remaining = timeout - ((new Date()).getTime() - started);
+            if (remaining <= 0) return null;
+            answer = listener.poll();
+            if (answer != null) {
+                answer.timeout = Math.max(1, Math.min(10, Math.ceil(remaining / 1000)));
+                var line = answer.readln();
+                answer.close(); answer = null;
+                var response;
+                try { response = eval("(" + line + ")"); }
+                catch (e) { throw new Error("Некорректный ответ Python-сервера: " + e.message); }
+                if (response && String(response.request_id || "") == requestId) return response;
+                // Legacy servers can still identify themselves so the caller
+                // can explain a version mismatch. Operational replies require
+                // a matching ID; a delayed callback must not become a new answer.
+                if (response && !response.request_id &&
+                    (payload.command == "ping" || payload.command == "get_settings") &&
+                    response.type == "answer" && response.message && response.message.version) return response;
             }
+            $.sleep(5);
         }
-        $.sleep(5);
+    } finally {
+        try { if (answer) answer.close(); } catch (answerCloseError) {}
+        try { sender.close(); } catch (senderCloseError) {}
+        try { listener.close(); } catch (listenerCloseError) {}
     }
 }
 
@@ -1889,23 +1895,28 @@ function gfpNormalizeConfig(raw) {
         }
     }
     cfg.server_host = gfpTrimString(cfg.server_host || GFP_DEFAULT_HOST) || GFP_DEFAULT_HOST;
-    cfg.server_port = Number(cfg.server_port || GFP_DEFAULT_PORT_SEND);
+    cfg.server_port = Math.floor(Number(cfg.server_port || GFP_DEFAULT_PORT_SEND));
     if (!isFinite(cfg.server_port) || cfg.server_port < 1 || cfg.server_port > 65535) {
         cfg.server_port = GFP_DEFAULT_PORT_SEND;
     }
     cfg.preview_size = Number(cfg.preview_size || 184);
+    if (!isFinite(cfg.preview_size)) cfg.preview_size = 184;
     cfg.preview_size = Math.max(64, Math.min(320, Math.round(cfg.preview_size / 8) * 8));
     cfg.cache_ttl_hours = Number(cfg.cache_ttl_hours || 48);
+    if (!isFinite(cfg.cache_ttl_hours)) cfg.cache_ttl_hours = 48;
     cfg.cache_ttl_hours = Math.max(12, Math.min(168, Math.round(cfg.cache_ttl_hours)));
     cfg.match_threshold = Number(cfg.match_threshold || 0.28);
+    if (!isFinite(cfg.match_threshold)) cfg.match_threshold = 0.28;
     cfg.match_threshold = Math.max(0.10, Math.min(0.60, cfg.match_threshold));
     cfg.compute_mode = gfpTrimString(cfg.compute_mode || "auto").toLowerCase();
     if (cfg.compute_mode != "auto" && cfg.compute_mode != "cpu" && cfg.compute_mode != "gpu") {
         cfg.compute_mode = "auto";
     }
     cfg.scan_threads = Math.round(Number(cfg.scan_threads || 2));
+    if (!isFinite(cfg.scan_threads)) cfg.scan_threads = 2;
     cfg.scan_threads = Math.max(1, Math.min(4, cfg.scan_threads));
     cfg.preview_threads = Math.round(Number(cfg.preview_threads || 2));
+    if (!isFinite(cfg.preview_threads)) cfg.preview_threads = 2;
     cfg.preview_threads = Math.max(1, Math.min(8, cfg.preview_threads));
     cfg.analysis_quality = gfpTrimString(cfg.analysis_quality || "balanced").toLowerCase();
     if (cfg.analysis_quality != "fast" && cfg.analysis_quality != "balanced" && cfg.analysis_quality != "accurate") {
@@ -2012,7 +2023,7 @@ function gfpSaveConfig(config) {
     }
 
     var verified = gfpReadConfigFile(file);
-    if (!verified || !gfpSameConfigValues(cfg, verified)) {
+    if (!verified || !gfpSameConfigValues(cfg, verified, true)) {
         try {
             if (file.exists) file.remove();
             if (backup.exists) backup.copy(file.fsName);
@@ -2511,10 +2522,11 @@ function gfpShowSettingsDialog() {
     return true;
 }
 
-function gfpSameConfigValues(a, b) {
+function gfpSameConfigValues(a, b, includeClientOptions) {
     var left = gfpNormalizeConfig(a);
     var right = gfpNormalizeConfig(b);
     var keys = ["server_host", "server_port", "preview_size", "cache_ttl_hours", "match_threshold", "compute_mode", "scan_threads", "preview_threads", "analysis_quality", "group_boundary_search", "recommendation_model", "preview_sort"];
+    if (includeClientOptions) keys = keys.concat(["face_scale_match", "align_clothing", "allow_rotation", "collect_statistics"]);
     for (var i = 0; i < keys.length; i++) {
         var key = keys[i];
         if (String(left[key]) != String(right[key])) {

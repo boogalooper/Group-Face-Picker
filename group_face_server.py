@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 APP_NAME = "Group Face Picker"
-VERSION = "0.6.52"
+VERSION = "0.6.53"
 SETTINGS_SCHEMA_VERSION = 10
 SERVER_INSTANCE_ID = uuid.uuid4().hex[:12]
 CACHE_VERSION = 13
@@ -208,6 +208,8 @@ def _config_with_defaults(data: Optional[Dict[str, Any]] = None) -> Dict[str, An
     try:
         match_threshold = float(raw.get("match_threshold") or DEFAULT_MATCH_THRESHOLD)
     except Exception:
+        match_threshold = DEFAULT_MATCH_THRESHOLD
+    if not math.isfinite(match_threshold):
         match_threshold = DEFAULT_MATCH_THRESHOLD
     match_threshold = max(0.10, min(0.60, match_threshold))
     compute_mode = str(raw.get("compute_mode") or DEFAULT_COMPUTE_MODE).strip().lower()
@@ -4411,6 +4413,8 @@ class JsonLineHandler(socketserver.StreamRequestHandler):
         except Exception as exc:
             result = _json_response("error", str(exc))
             LOGGER.error("Unhandled request error:\n%s", traceback.format_exc())
+        if isinstance(payload, dict) and payload.get("request_id"):
+            result["request_id"] = str(payload["request_id"])
         if isinstance(payload, dict) and bool(payload.get("no_reply")):
             return
         reply_port = int(payload.get("reply_port") or 0) if isinstance(payload, dict) else 0
