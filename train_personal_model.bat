@@ -64,7 +64,9 @@ if not exist "%READY%" (
   echo.
   echo [3/4] Installing training dependencies...
   echo This is a one-time step and downloads CPU PyTorch / torchvision.
-  "%TRAINPY%" -m pip install --upgrade pip
+  rem Bootstrap pip 24.0 using the Windows certificate store (HTTPS inspection).
+  rem Updated pip uses system certificates by default on Python 3.11.
+  "%TRAINPY%" -m pip install --use-feature=truststore --upgrade pip
   if errorlevel 1 goto :failed
   "%TRAINPY%" -m pip install -r training_requirements.txt
   if errorlevel 1 goto :failed

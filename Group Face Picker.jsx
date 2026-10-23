@@ -19,6 +19,9 @@ var GFP_SHIFT_LAUNCH = !!ScriptUI.environment.keyboardState.shiftKey;
 var GFP_NAME = "Group Face Picker";
 var GFP_UUID = "9a189321-e07f-40ff-8394-156a4bd48cf5";
 var GFP_VERSION = "0.6.53";
+// Experimental fast donor path: unopened files are first tried through Photoshop viewlessDocument.
+// Keep the regular open() path as an automatic fallback and for donors already open by the user.
+var GFP_USE_VIEWLESS_DONOR = true;
 var GFP_DEFAULT_HOST = "127.0.0.1";
 var GFP_DEFAULT_PORT_SEND = 6420;
 var GFP_DEFAULT_PORT_LISTEN = 6421;
@@ -967,9 +970,12 @@ function GFPActionManager() {
         if (!(resolution > 0) || !(width > 0) || !(height > 0) || !isFinite(width) || !isFinite(height)) {
             throw new Error("Не удалось прочитать геометрию документа через AM.");
         }
+        var depth = 8, profile = "";
+        try { if (d.hasKey(s2t("depth"))) depth = Number(d.getInteger(s2t("depth"))) || 8; } catch (_) {}
+        try { if (d.hasKey(s2t("profile"))) profile = String(d.getString(s2t("profile")) || ""); } catch (_) {}
         var file = d.hasKey(s2t("fileReference")) ? d.getPath(s2t("fileReference")) : null;
         return {id:d.getInteger(s2t("documentID")), width:Math.round(width), height:Math.round(height),
-                file:file, descriptor:d};
+                resolution:resolution, depth:depth, profile:profile, file:file, descriptor:d};
     };
     this.selectionBounds = function (descriptor) {
         var key = s2t("selection"), d = descriptor;
@@ -1002,6 +1008,93 @@ function GFPActionManager() {
         d.putBoolean(s2t("forceNotify"), false);
         executeAction(s2t("open"), d, DialogModes.NO);
         return this.documentInfo();
+    };
+    this.openViewless = function (file) {
+        var d = new ActionDescriptor();
+        d.putBoolean(s2t("preferXMPFromACR"), false);
+        d.putPath(charIDToTypeID("File"), file);
+        var result = executeAction(s2t("openViewlessDocument"), d, DialogModes.NO);
+        var ptr = result.getData(s2t("document"));
+        if (!ptr || !ptr.length) throw new Error("Photoshop не вернул viewless document pointer.");
+        return {
+            ptr:ptr,
+            file:file,
+            width:result.getInteger(charIDToTypeID("Wdth")),
+            height:result.getInteger(charIDToTypeID("Hght")),
+            depth:result.hasKey(s2t("depth")) ? result.getInteger(s2t("depth")) : 8,
+            layers:result.hasKey(s2t("layers")) ? result.getInteger(s2t("layers")) : 0,
+            open:true
+        };
+    };
+    this.closeViewless = function (viewless) {
+        if (!viewless || !viewless.open) return;
+        try {
+            var d = new ActionDescriptor();
+            d.putData(s2t("document"), viewless.ptr);
+            executeAction(s2t("closeViewlessDocument"), d, DialogModes.NO);
+        } finally {
+            viewless.open = false;
+        }
+    };
+    this.addViewlessToActiveDocument = function (viewless) {
+        if (!viewless || !viewless.open) throw new Error("Viewless-документ уже закрыт.");
+        var files = new ActionList(), docs = new ActionList(), d = new ActionDescriptor();
+        files.putPath(viewless.file);
+        docs.putData(viewless.ptr);
+        d.putList(s2t("fileList"), files);
+        d.putList(s2t("viewlessDoc"), docs);
+        executeAction(s2t("addLayerFromViewlessDoc"), d, DialogModes.NO);
+        // addLayerFromViewlessDoc consumes/closes the internal TImageDocument.
+        viewless.open = false;
+    };
+    this.makeTemporaryDocument = function (width, height, resolution, depth, profile) {
+        var d = new ActionDescriptor(), doc = new ActionDescriptor();
+        doc.putString(s2t("name"), "__GFP_VIEWLESS_DONOR__");
+        doc.putClass(s2t("mode"), s2t("RGBColorMode"));
+        doc.putUnitDouble(s2t("width"), s2t("pixelsUnit"), Number(width));
+        doc.putUnitDouble(s2t("height"), s2t("pixelsUnit"), Number(height));
+        doc.putUnitDouble(s2t("resolution"), s2t("densityUnit"), Number(resolution) > 0 ? Number(resolution) : 72);
+        doc.putDouble(s2t("pixelScaleFactor"), 1);
+        doc.putEnumerated(s2t("fill"), s2t("fill"), s2t("transparency"));
+        var bits = Number(depth);
+        if (bits != 8 && bits != 16 && bits != 32) bits = 8;
+        doc.putInteger(s2t("depth"), bits);
+        if (profile) doc.putString(s2t("profile"), String(profile));
+        d.putObject(s2t("new"), s2t("document"), doc);
+        executeAction(s2t("make"), d, DialogModes.NO);
+        return this.documentInfo();
+    };
+    this.openViewlessAsTemporaryDocument = function (file, targetInfo) {
+        var viewless = null, temporary = null;
+        try {
+            viewless = this.openViewless(file);
+            temporary = this.makeTemporaryDocument(
+                viewless.width,
+                viewless.height,
+                targetInfo && targetInfo.resolution,
+                targetInfo && targetInfo.depth,
+                targetInfo && targetInfo.profile
+            );
+            this.addViewlessToActiveDocument(viewless);
+            // Do not flatten here. The established GFP order is crop -> flatten;
+            // keeping the same order matters for multilayer files with effects,
+            // adjustments and pixels outside the future crop.
+            var info = this.documentInfo();
+            if (info.width != viewless.width || info.height != viewless.height) {
+                throw new Error("Размер временного viewless-документа изменился после импорта.");
+            }
+            info.viewless = true;
+            return info;
+        } catch (e) {
+            try {
+                if (temporary) {
+                    this.selectDocument(temporary.id);
+                    this.close();
+                }
+            } catch (_) {}
+            try { this.closeViewless(viewless); } catch (_) {}
+            throw e;
+        }
     };
     this.historyID = function () {
         var d = this.getDescriptor("historyState");
@@ -1188,15 +1281,30 @@ function gfpInsertCandidate(payload, index) {
             throw new Error("Размер целевого документа изменился после анализа. Сделайте выделение заново и снова запустите JSX.");
         }
 
-        // Не создаём временный duplicate документа. Донор является единственным
-        // дополнительным документом: для уже открытого донора состояние истории
-        // восстанавливается после crop/flatten, а открытый скриптом донор закрывается
-        // без сохранения сразу после копирования слоя в целевой документ.
+        // Уже открытый пользователем донор должен использовать именно текущее
+        // состояние открытого документа (включая несохранённые правки), поэтому
+        // для него сохраняем прежний history-based путь. Закрытый файл сначала
+        // пробуем загрузить через viewlessDocument во временный документ размера
+        // исходника; если конкретный формат/версия Photoshop это не поддерживает,
+        // автоматически возвращаемся к прежнему обычному open().
         var sourceInfo = GFP_AM.findDocument(item.source_path);
         sourceWasAlreadyOpen = !!sourceInfo;
         if (!sourceInfo) {
-            sourceInfo = GFP_AM.open(new File(item.source_path));
-            sourceOpenedByScript = true;
+            if (GFP_USE_VIEWLESS_DONOR) {
+                try {
+                    sourceInfo = GFP_AM.openViewlessAsTemporaryDocument(new File(item.source_path), targetGeometry);
+                    sourceOpenedByScript = true;
+                } catch (viewlessOpenError) {
+                    // openViewlessAsTemporaryDocument already closes every partial
+                    // temporary/viewless resource. Restore target before fallback.
+                    GFP_AM.selectDocument(target);
+                    sourceInfo = GFP_AM.open(new File(item.source_path));
+                    sourceOpenedByScript = true;
+                }
+            } else {
+                sourceInfo = GFP_AM.open(new File(item.source_path));
+                sourceOpenedByScript = true;
+            }
         } else GFP_AM.selectDocument(sourceInfo.id);
         sourceDocument = sourceInfo.id;
         if (sourceDocument == target) {
@@ -1327,6 +1435,7 @@ function gfpInsertCandidate(payload, index) {
             throw new Error("Внутренняя проверка crop не пройдена: Photoshop изменил размер исходного фрагмента.");
         }
 
+        // Preserve the established semantics exactly: crop first, then flatten.
         executeAction(GFP_S2T("flattenImage"), undefined, DialogModes.NO);
         insertStage = "копирование слоя в целевой документ";
         var insertedLayerID = GFP_AM.duplicateLayerTo(target);
@@ -2324,7 +2433,7 @@ function gfpShowSettingsDialog() {
 
     var chCollectStatistics = w.add("checkbox", undefined, "Собирать статистику для обучения");
     chCollectStatistics.value = current.collect_statistics === true;
-    chCollectStatistics.helpTip = "После успешной вставки сохраняется базовая пара: выбранное лицо > текущее лицо. Если вы заменили автоматически предложенный кадр, обучатель дополнительно использует: выбранное лицо > отвергнутая рекомендация. Данные находятся в training_data рядом с Python-сервером.";
+    chCollectStatistics.helpTip = "После успешной вставки сохраняется базовая пара: выбранное лицо > текущее лицо. Рекомендации модели и остальные кандидаты не считаются проигравшими и не используются для дополнительных сравнений. Данные находятся в training_data рядом с Python-сервером.";
 
     var buttons = w.add("group");
     buttons.orientation = "row";

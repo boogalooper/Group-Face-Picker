@@ -1,0 +1,293 @@
+{
+  "dataset": {
+    "base_pair_observations": 3392,
+    "collectors": 4,
+    "contradictory_pairs_excluded": 0,
+    "data_folders": 2,
+    "development_pairs": 3014,
+    "diagnostic_fraction_requested": 0.1,
+    "diagnostic_guard_pairs_excluded": 21,
+    "diagnostic_holdout": {
+      "created_now": true,
+      "created_utc": "2026-10-23T08:58:33Z",
+      "dataset_unique_pairs_at_creation": 3285,
+      "manifest_file": "diagnostic_holdout.json",
+      "pairs_available": 250,
+      "pairs_in_manifest": 250,
+      "pairs_missing": 0
+    },
+    "diagnostic_pairs": 250,
+    "duplicate_same_direction_events": 107,
+    "events_found": 3392,
+    "events_invalid": 0,
+    "final_refit_pairs": 3285,
+    "preference_policy": "chosen_over_current_only",
+    "selection_splits": [
+      {
+        "seed": 20260908,
+        "split_method": "connected-components-no-face-overlap",
+        "train_pairs": 2411,
+        "validation_pairs": 603
+      },
+      {
+        "seed": 173,
+        "split_method": "connected-components-no-face-overlap",
+        "train_pairs": 2411,
+        "validation_pairs": 603
+      },
+      {
+        "seed": 947,
+        "split_method": "connected-components-no-face-overlap",
+        "train_pairs": 2411,
+        "validation_pairs": 603
+      }
+    ],
+    "split_method": "three-repeated-grouped-splits",
+    "unique_base_pairs": 3285,
+    "unique_pairs": 3285,
+    "validation_fraction_requested": 0.2
+  },
+  "metrics": {
+    "cross_validation": [
+      {
+        "C": 0.1,
+        "folds": [
+          {
+            "accuracy": 0.7363184094429016,
+            "loss": 0.6582976579666138,
+            "mean_margin": 0.07521747052669525,
+            "pairs": 603,
+            "seed": 20260908,
+            "split_method": "connected-components-no-face-overlap",
+            "train_pairs": 2411,
+            "validation_pairs": 603
+          },
+          {
+            "accuracy": 0.7014925479888916,
+            "loss": 0.6611171960830688,
+            "mean_margin": 0.07095728814601898,
+            "pairs": 603,
+            "seed": 173,
+            "split_method": "connected-components-no-face-overlap",
+            "train_pairs": 2411,
+            "validation_pairs": 603
+          },
+          {
+            "accuracy": 0.711442768573761,
+            "loss": 0.6573063135147095,
+            "mean_margin": 0.07785393297672272,
+            "pairs": 603,
+            "seed": 947,
+            "split_method": "connected-components-no-face-overlap",
+            "train_pairs": 2411,
+            "validation_pairs": 603
+          }
+        ],
+        "mean_accuracy": 0.7164179086685181,
+        "mean_loss": 0.6589070558547974
+      },
+      {
+        "C": 1.0,
+        "folds": [
+          {
+            "accuracy": 0.7595356702804565,
+            "loss": 0.572973906993866,
+            "mean_margin": 0.33403682708740234,
+            "pairs": 603,
+            "seed": 20260908,
+            "split_method": "connected-components-no-face-overlap",
+            "train_pairs": 2411,
+            "validation_pairs": 603
+          },
+          {
+            "accuracy": 0.7131011486053467,
+            "loss": 0.5847280621528625,
+            "mean_margin": 0.3336344361305237,
+            "pairs": 603,
+            "seed": 173,
+            "split_method": "connected-components-no-face-overlap",
+            "train_pairs": 2411,
+            "validation_pairs": 603
+          },
+          {
+            "accuracy": 0.7230514287948608,
+            "loss": 0.571060836315155,
+            "mean_margin": 0.3504902720451355,
+            "pairs": 603,
+            "seed": 947,
+            "split_method": "connected-components-no-face-overlap",
+            "train_pairs": 2411,
+            "validation_pairs": 603
+          }
+        ],
+        "mean_accuracy": 0.7318960825602213,
+        "mean_loss": 0.5762542684872946
+      },
+      {
+        "C": 10.0,
+        "folds": [
+          {
+            "accuracy": 0.746268630027771,
+            "loss": 0.5142087936401367,
+            "mean_margin": 0.7425580620765686,
+            "pairs": 603,
+            "seed": 20260908,
+            "split_method": "connected-components-no-face-overlap",
+            "train_pairs": 2411,
+            "validation_pairs": 603
+          },
+          {
+            "accuracy": 0.739635169506073,
+            "loss": 0.5307501554489136,
+            "mean_margin": 0.7940143346786499,
+            "pairs": 603,
+            "seed": 173,
+            "split_method": "connected-components-no-face-overlap",
+            "train_pairs": 2411,
+            "validation_pairs": 603
+          },
+          {
+            "accuracy": 0.7247098088264465,
+            "loss": 0.5097216963768005,
+            "mean_margin": 0.8029179573059082,
+            "pairs": 603,
+            "seed": 947,
+            "split_method": "connected-components-no-face-overlap",
+            "train_pairs": 2411,
+            "validation_pairs": 603
+          }
+        ],
+        "mean_accuracy": 0.7368712027867635,
+        "mean_loss": 0.5182268818219503
+      },
+      {
+        "C": 100.0,
+        "folds": [
+          {
+            "accuracy": 0.7147595286369324,
+            "loss": 0.5829086899757385,
+            "mean_margin": 1.2644479274749756,
+            "pairs": 603,
+            "seed": 20260908,
+            "split_method": "connected-components-no-face-overlap",
+            "train_pairs": 2411,
+            "validation_pairs": 603
+          },
+          {
+            "accuracy": 0.7081260085105896,
+            "loss": 0.5981601476669312,
+            "mean_margin": 1.422629475593567,
+            "pairs": 603,
+            "seed": 173,
+            "split_method": "connected-components-no-face-overlap",
+            "train_pairs": 2411,
+            "validation_pairs": 603
+          },
+          {
+            "accuracy": 0.7164179086685181,
+            "loss": 0.5730991959571838,
+            "mean_margin": 1.4684655666351318,
+            "pairs": 603,
+            "seed": 947,
+            "split_method": "connected-components-no-face-overlap",
+            "train_pairs": 2411,
+            "validation_pairs": 603
+          }
+        ],
+        "mean_accuracy": 0.7131011486053467,
+        "mean_loss": 0.5847226778666178
+      }
+    ],
+    "final_refit": {
+      "all_pairs_accuracy": 0.8301370143890381,
+      "all_pairs_loss": 0.4153648912906647,
+      "base": {
+        "accuracy": 0.8301370143890381,
+        "loss": 0.4153648912906647,
+        "mean_margin": 1.0713906288146973,
+        "pairs": 3285
+      }
+    },
+    "stable_diagnostic": {
+      "all": {
+        "accuracy": 0.7360000014305115,
+        "loss": 0.5067872405052185,
+        "mean_margin": 0.8641238808631897,
+        "pairs": 250
+      },
+      "base": {
+        "accuracy": 0.7360000014305115,
+        "loss": 0.5067872405052185,
+        "mean_margin": 0.8641238808631897,
+        "pairs": 250
+      }
+    },
+    "stable_diagnostic_comparison": {
+      "previous_trained_utc": "2026-10-16T17:31:31Z",
+      "status": "preference_policy_changed"
+    },
+    "validation_pair_accuracy": 0.7368712027867635,
+    "validation_pair_loss": 0.5182268818219503
+  },
+  "model": {
+    "backbone": "torchvision.mobilenet_v3_small",
+    "backbone_weights": "MobileNet_V3_Small_Weights.IMAGENET1K_V1",
+    "embedding_dim": 2304,
+    "face_regions": [
+      [
+        0,
+        0,
+        224,
+        224
+      ],
+      [
+        34,
+        22,
+        190,
+        202
+      ],
+      [
+        22,
+        45,
+        202,
+        134
+      ],
+      [
+        34,
+        112,
+        190,
+        213
+      ]
+    ],
+    "file": "personal_preference.onnx",
+    "input": "float32 RGB NCHW 224x224 in [0,1]",
+    "input_size": 224,
+    "mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "onnx_self_test_max_abs_error": 3.0994415283203125e-06,
+    "output": "preference_score sigmoid in [0,1]",
+    "recommended_use": "compare frames of the same person; higher is preferred",
+    "sha256": "b5972bac7cb427a391c5979f416766957038259e0e7e5da3bd13be365d398dc8",
+    "std": [
+      0.229,
+      0.224,
+      0.225
+    ]
+  },
+  "model_type": "pairwise_personal_portrait_preference",
+  "schema_version": 1,
+  "trained_utc": "2026-10-23T08:59:27Z",
+  "training": {
+    "device": "cpu",
+    "diagnostic_fraction": 0.1,
+    "method": "multiregion_pairwise_logistic_L2",
+    "regularization_C": 10.0,
+    "seed": 20260908,
+    "selection_objective": "mean validation loss over three grouped splits",
+    "torch": "2.14.0+cpu"
+  },
+  "training_data_path": "F:\\AI tools\\Group Face Picker\\training_data"
+}

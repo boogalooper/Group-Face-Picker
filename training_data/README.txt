@@ -7,8 +7,10 @@ When "Собирать статистику для обучения" is enabled,
 - <computer-id>/faces/<sha256>.jpg      - 320x320 cached face crops referenced by events
 
 If Group Face Picker showed an automatic recommendation and you chose a different face, the same
-event also stores the rejected recommended face. The updated trainer can then add one extra explicit
-pair: chosen face > rejected recommendation. No other visible candidates are treated as rejected.
+event also stores the recommended face as metadata. The trainer ignores this metadata, including
+in previously collected events. Only chosen face > current face is used for training. Neither the
+recommendation nor other visible candidates are treated as rejected. Retrain to apply this policy
+to an existing model; no dataset conversion or deletion is needed.
 
 The event schema stays at version 1. Existing datasets need no conversion: old events remain valid,
 and older trainers simply ignore the optional recommendation metadata in newer events.
@@ -46,8 +48,9 @@ Keep this file on the main training computer. It fixes a small diagnostic set so
 measure progress on the same pairs. New events are not added to it automatically. Do not copy diagnostic_holdout.json from other computers.
 
 The trainer removes duplicate exact pairs, excludes contradictory A>B / B>A pairs and tries to split
-validation without sharing the same face crop between train and validation. It reports base
-chosen>current accuracy separately from the harder chosen>rejected-recommendation accuracy. After
+validation without sharing the same face crop between train and validation. All reported comparisons
+use chosen>current only. On the first run with this policy an older diagnostic holdout is recreated
+automatically; its scores cannot be compared directly with older reports. After
 selecting L2 regularization using three grouped splits, the final ONNX head is trained again from scratch on all unique
 non-contradictory pairs, so validation/diagnostic data are not permanently withheld from the working
 model. The model is intended to rank different frames of the same person. See the main README.md

@@ -19,6 +19,7 @@ DEFAULT_OUTPUT = ROOT / "personal_model"
 SCHEMA_VERSION = 1
 MODEL_SCHEMA_VERSION = 1
 DIAGNOSTIC_SCHEMA_VERSION = 1
+PREFERENCE_POLICY = "chosen_over_current_only"
 DEFAULT_SEED = 20260908
 DEFAULT_DIAGNOSTIC_FRACTION = 0.10
 _ML_CACHE = None
@@ -132,10 +133,6 @@ def load_pairs(training_dir: Path) -> tuple[list[PairExample], dict[str, int]]:
     collectors: set[str] = set()
     verified_faces: set[Path] = set()
     base_pair_observations = 0
-    recommendation_overrides = 0
-    recommendation_pair_observations = 0
-    recommendation_same_as_current = 0
-    recommendation_metadata_invalid = 0
 
     def add_pair(
         preferred_id: str,
@@ -189,45 +186,9 @@ def load_pairs(training_dir: Path) -> tuple[list[PairExample], dict[str, int]]:
             add_pair(chosen_id, current_id, chosen_path, current_path, event_id, collector_id, "current")
             base_pair_observations += 1
 
-            # Newer v1 events may additionally carry the automatically recommended
-            # face.  It becomes a second *explicit* preference only if the user
-            # overrode that recommendation.  Merely accepting the initial choice
-            # does not fabricate a new comparison.
-            context = event.get("context") if isinstance(event.get("context"), dict) else {}
-            recommended_asset = event.get("recommended")
-            recommendation_overridden = context.get("recommendation_overridden") is True
-            effective_mode = str(context.get("recommendation_effective_mode") or "off").strip().lower()
-            if isinstance(recommended_asset, dict) and recommendation_overridden and effective_mode in ("public", "personal", "combined"):
-                # Recommendation metadata is an optional extension of the v1 event.
-                # It must never invalidate the canonical chosen > current pair.
-                try:
-                    recommended_id, recommended_path = _face_ref(
-                        event, "recommended", source_dir, verified_faces
-                    )
-                except Exception as exc:
-                    recommendation_metadata_invalid += 1
-                    print(
-                        f"WARNING: событие {path.name}: дополнительная рекомендация пропущена: {exc}",
-                        file=sys.stderr,
-                    )
-                else:
-                    if recommended_id != chosen_id:
-                        recommendation_overrides += 1
-                        if recommended_id == current_id:
-                            # Same information as chosen > current; keep only one raw
-                            # observation so counters and weighting are not inflated.
-                            recommendation_same_as_current += 1
-                        else:
-                            add_pair(
-                                chosen_id,
-                                recommended_id,
-                                chosen_path,
-                                recommended_path,
-                                event_id,
-                                collector_id,
-                                "recommendation",
-                            )
-                            recommendation_pair_observations += 1
+            # Recommendation metadata is deliberately ignored, including in legacy
+            # events. Choosing another donor does not explicitly reject a good
+            # recommendation: suitability can depend on the destination photo.
         except Exception as exc:
             invalid += 1
             print(f"WARNING: пропущено повреждённое событие {path.name}: {exc}", file=sys.stderr)
@@ -259,23 +220,13 @@ def load_pairs(training_dir: Path) -> tuple[list[PairExample], dict[str, int]]:
         ))
 
     unique_base_pairs = sum(1 for pair in pairs if "current" in pair.sources)
-    unique_recommendation_pairs = sum(1 for pair in pairs if "recommendation" in pair.sources)
-    additional_unique_recommendation_pairs = sum(
-        1 for pair in pairs if "recommendation" in pair.sources and "current" not in pair.sources
-    )
     stats = {
         "events_found": event_count,
         "data_folders": len({source for source, _ in event_paths}),
         "events_invalid": invalid,
         "unique_pairs": len(pairs),
         "unique_base_pairs": unique_base_pairs,
-        "unique_recommendation_pairs": unique_recommendation_pairs,
-        "additional_unique_recommendation_pairs": additional_unique_recommendation_pairs,
         "base_pair_observations": base_pair_observations,
-        "recommendation_overrides": recommendation_overrides,
-        "recommendation_pair_observations": recommendation_pair_observations,
-        "recommendation_same_as_current": recommendation_same_as_current,
-        "recommendation_metadata_invalid": recommendation_metadata_invalid,
         "duplicate_same_direction_events": duplicate_events,
         "contradictory_pairs_excluded": len(contradictory_unordered),
         "collectors": len(collectors),
@@ -306,18 +257,11 @@ def split_pairs_no_face_leakage(
     train: list[PairExample] = []
 
     if len(groups) >= 2:
-        # Assign whole face-connected components. Optimize size AND comparison
-        # type counts; the old largest-first fill concentrated hard pairs in val.
-        counts = [(len(g), sum("recommendation" in p.sources for p in g)) for g in groups]
-        totals = (len(pairs), sum(c[1] for c in counts))
-        targets = (target, totals[1] * validation_fraction)
+        # Keep entire face-connected components together; approximate target size.
+        counts = [len(g) for g in groups]
 
-        def cost(n: int, r: int) -> float:
-            base_total = totals[0] - totals[1]
-            return ((n - targets[0]) / max(1, targets[0])) ** 2 + (
-                (r - targets[1]) / max(1, targets[1])) ** 2 + (
-                ((n - r) - (targets[0] - targets[1])) /
-                max(1, base_total * validation_fraction)) ** 2
+        def cost(n: int) -> float:
+            return ((n - target) / max(1, target)) ** 2
 
         best = None
         best_cost = float("inf")
@@ -325,19 +269,18 @@ def split_pairs_no_face_leakage(
             order = list(range(len(groups)))
             rng.shuffle(order)
             selected: set[int] = set()
-            n = r = 0
+            n = 0
             for i in order:
-                dn, dr = counts[i]
-                if n + dn < len(pairs) and cost(n + dn, r + dr) < cost(n, r):
+                dn = counts[i]
+                if n + dn < len(pairs) and cost(n + dn) < cost(n):
                     selected.add(i)
                     n += dn
-                    r += dr
-            if selected and cost(n, r) < best_cost:
-                best, best_cost = selected, cost(n, r)
+            if selected and cost(n) < best_cost:
+                best, best_cost = selected, cost(n)
         if best is not None:
             val = [p for i, group in enumerate(groups) if i in best for p in group]
             train = [p for i, group in enumerate(groups) if i not in best for p in group]
-            return train, val, "stratified-connected-components-no-face-overlap"
+            return train, val, "connected-components-no-face-overlap"
 
     # Rare fallback: all comparisons form one connected graph. We still retain
     # a validation set, but report that face leakage could not be eliminated.
@@ -392,7 +335,10 @@ def load_or_create_diagnostic_holdout(
             keys = loaded.get("pair_keys")
             if not isinstance(keys, list) or not all(isinstance(item, str) for item in keys):
                 raise ValueError("pair_keys is invalid")
-            manifest = loaded
+            if loaded.get("preference_policy") == PREFERENCE_POLICY:
+                manifest = loaded
+            else:
+                print("Diagnostic holdout recreated for chosen > current only; previous scores are not comparable.")
         except Exception as exc:
             raise ValueError(
                 f"Повреждён {manifest_path.name}: {exc}. "
@@ -404,36 +350,15 @@ def load_or_create_diagnostic_holdout(
         target = _diagnostic_target_size(len(pairs), fraction)
         ordered = sorted(pairs, key=lambda p: (_stable_pair_order_key(p.pair_key, seed), p.pair_key))
 
-        # Ensure the fixed anchor contains at least a small useful sample of the
-        # harder rejected-recommendation comparisons when they exist.  Without
-        # this, a 10% random anchor can contain only a handful of them and the
-        # source-specific metric becomes too noisy to be useful.
-        recommendation_candidates = [pair for pair in ordered if "recommendation" in pair.sources]
-        recommendation_target = 0
-        if recommendation_candidates and target > 0:
-            recommendation_target = min(
-                len(recommendation_candidates),
-                max(4 if len(recommendation_candidates) >= 8 else 1,
-                    int(round(len(recommendation_candidates) * 0.15))),
-                max(1, target // 3),
-            )
-        selected = recommendation_candidates[:recommendation_target]
-        selected_keys = {pair.pair_key for pair in selected}
-        for pair in ordered:
-            if len(selected) >= target:
-                break
-            if pair.pair_key not in selected_keys:
-                selected.append(pair)
-                selected_keys.add(pair.pair_key)
+        selected = ordered[:target]
 
         manifest = {
             "schema_version": DIAGNOSTIC_SCHEMA_VERSION,
+            "preference_policy": PREFERENCE_POLICY,
             "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
             "seed": int(seed),
             "fraction_at_creation": float(fraction),
             "dataset_unique_pairs_at_creation": len(pairs),
-            "recommendation_pairs_at_creation": sum(1 for pair in pairs if "recommendation" in pair.sources),
-            "recommendation_pairs_selected": sum(1 for pair in selected if "recommendation" in pair.sources),
             "pair_keys": [pair.pair_key for pair in selected],
         }
         manifest_path.write_text(
@@ -729,12 +654,29 @@ def load_previous_training_metadata(
     fall back to the existing personal_preference.json and migrate on success.
     A missing or damaged history must never prevent a new training run.
     """
+    model_metadata = _read_json_object(output_dir / "personal_preference.json")
     history = _read_json_object(training_dir / "diagnostic_history.json")
     if history and int(history.get("schema_version") or 0) == DIAGNOSTIC_HISTORY_SCHEMA_VERSION:
         snapshot = history.get("latest")
         if isinstance(snapshot, dict):
+            dataset = snapshot.get("dataset") or {}
+            # Earlier chosen>current trainers omitted the policy from history.
+            # Recover it only from metadata for the exact same successful run.
+            # Never assume that an unmarked result used the current policy.
+            if "preference_policy" not in dataset and model_metadata:
+                model_dataset = model_metadata.get("dataset") or {}
+                same_run = bool(snapshot.get("trained_utc")) and (
+                    snapshot.get("trained_utc") == model_metadata.get("trained_utc")
+                    and dataset.get("diagnostic_holdout") == model_dataset.get("diagnostic_holdout")
+                    and (snapshot.get("metrics") or {}).get("stable_diagnostic")
+                    == (model_metadata.get("metrics") or {}).get("stable_diagnostic")
+                )
+                if same_run and "preference_policy" in model_dataset:
+                    snapshot = {**snapshot, "dataset": {
+                        **dataset, "preference_policy": model_dataset["preference_policy"],
+                    }}
             return snapshot
-    return _read_json_object(output_dir / "personal_preference.json")
+    return model_metadata
 
 
 def save_diagnostic_history(training_dir: Path, metadata: dict[str, Any]) -> None:
@@ -742,6 +684,7 @@ def save_diagnostic_history(training_dir: Path, metadata: dict[str, Any]) -> Non
     snapshot = {
         "trained_utc": metadata.get("trained_utc"),
         "dataset": {
+            "preference_policy": (metadata.get("dataset") or {}).get("preference_policy"),
             "diagnostic_holdout": (metadata.get("dataset") or {}).get("diagnostic_holdout") or {},
         },
         "metrics": {
@@ -776,6 +719,9 @@ def stable_diagnostic_comparison(
     result["previous_trained_utc"] = str(previous.get("trained_utc") or "")
     try:
         prev_dataset = previous.get("dataset") or {}
+        if prev_dataset.get("preference_policy") != PREFERENCE_POLICY:
+            result["status"] = "preference_policy_changed"
+            return result
         prev_info = prev_dataset.get("diagnostic_holdout") or {}
         prev_metrics = (previous.get("metrics") or {}).get("stable_diagnostic") or {}
         cur_metrics = current_metrics.get("stable_diagnostic") or {}
@@ -799,7 +745,7 @@ def stable_diagnostic_comparison(
 
         previous_blocks: dict[str, Any] = {}
         changes: dict[str, float | None] = {}
-        for key in ("all", "base", "recommendation"):
+        for key in ("all", "base"):
             prev_block = prev_metrics.get(key) or {}
             cur_block = cur_metrics.get(key) or {}
             prev_pairs = int(prev_block.get("pairs") or 0)
@@ -840,6 +786,7 @@ def write_report(output_dir: Path, metadata: dict[str, Any]) -> None:
              "Дата обучения: " + metadata["trained_utc"], "",
              f"- Событий: {d['events_found']}; пропущено: {d['events_invalid']}",
              f"- Уникальных пар: {d['unique_pairs']}",
+             "- Только выбранное лицо > исходное; рекомендации модели не используются как проигравшие.",
              f"- Папок данных: {d['data_folders']}",
              f"- Development pairs: {d['development_pairs']}",
              f"- Диагностических пар: {d['diagnostic_pairs']}",
@@ -848,7 +795,6 @@ def write_report(output_dir: Path, metadata: dict[str, Any]) -> None:
              f"- Выбранная регуляризация C: {metadata['training']['regularization_C']:g}",
              "- Stable diagnostic — все: " + percent(diag["all"]),
              "- Stable diagnostic — chosen > current: " + percent(diag["base"]),
-             "- Stable diagnostic — chosen > rejected recommendation: " + percent(diag["recommendation"]),
              f"- Финальная ONNX обучена на {d['final_refit_pairs']} парах",
              f"- Точность финальной ONNX на обучающих парах: {m['final_refit']['all_pairs_accuracy']*100:.1f}%", "",
              "## Проверенные варианты", "",
@@ -907,10 +853,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Dataset:      {training_dir}")
         print(f"Data folders: {dataset_stats['data_folders']}")
         print(f"Events:       {dataset_stats['events_found']}")
+        print("Training policy: chosen > current only; recommendations are ignored.")
         print(f"Unique pairs: {dataset_stats['unique_pairs']}")
         print(f"  base chosen>current:                 {dataset_stats['unique_base_pairs']}")
-        print(f"  extra chosen>rejected recommendation:{dataset_stats['additional_unique_recommendation_pairs']}")
-        print(f"Recommendation overrides recorded:     {dataset_stats['recommendation_overrides']}")
         print(f"Collectors:   {dataset_stats['collectors']}")
         if dataset_stats["events_invalid"]:
             print(f"Invalid events skipped: {dataset_stats['events_invalid']}")
@@ -990,7 +935,6 @@ def main(argv: list[str] | None = None) -> int:
             "stable_diagnostic": {
                 "all": subset_pair_metrics(selection_weight, diagnostic_pairs, embeddings),
                 "base": subset_pair_metrics(selection_weight, diagnostic_pairs, embeddings, "current"),
-                "recommendation": subset_pair_metrics(selection_weight, diagnostic_pairs, embeddings, "recommendation"),
             },
         }
         metrics["stable_diagnostic_comparison"] = stable_diagnostic_comparison(previous_training_metadata, diagnostic_info, metrics)
@@ -1004,7 +948,6 @@ def main(argv: list[str] | None = None) -> int:
             "all_pairs_accuracy": full_score["accuracy"],
             "all_pairs_loss": full_score["loss"],
             "base": subset_pair_metrics(final_weight, pairs, embeddings, "current"),
-            "recommendation": subset_pair_metrics(final_weight, pairs, embeddings, "recommendation"),
         }
 
         model_path = output_dir / "personal_preference.onnx"
@@ -1027,6 +970,7 @@ def main(argv: list[str] | None = None) -> int:
             },
             "dataset": {
                 **dataset_stats,
+                "preference_policy": PREFERENCE_POLICY,
                 "diagnostic_pairs": len(diagnostic_pairs),
                 "diagnostic_guard_pairs_excluded": diagnostic_guard_excluded,
                 "development_pairs": len(development_pairs),
